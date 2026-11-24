@@ -1,0 +1,471 @@
+/**
+ * Rückmeldungen der Runner zu Läufen: annehmen, ablehnen, Ereignisse, Verbrauch, Limits, Abschluss – dazu
+ * `loseRun` (Lease abgelaufen, Runner gesperrt). Folgezustände der Aufträge: siehe Kopf von `tasks.service.ts`.
+ */
+import { sql } from 'drizzle-orm';
+import { errors, num, rowsOf, str, toIso, type Row } from '$lib/sdk/server';
+import { clip, jsonb, LEASE_SEC, oneOf, type Tx } from './db';
+import { sendCommand, type Effects } from './effects';
+import { extractPlan } from './prompts';
+import {
+	MAX_EVENT_TEXT,
+	type FinishInput,
+	type LimitInput,
+	type RunEvent,
+	type UsageInput
+} from './protocol';
+import { backoffMs, calibrateBudget, unitsOf, weekStartOf } from './scheduler';
+import type { Limits } from './schemas';
+import {
+	applyOutcome,
+	applyPlan,
+	checkPlan,
+	createResolveTask,
+	excludeAccount,
+	getTask,
+	isFinal,
+	planOf,
+	transition,
+	upsertPull,
+	type PullInfo,
+	type StoredPlan
+} from './tasks.service';
+
+const LEASE = sql`now() + ${LEASE_SEC}::int * interval '1 second'`;
+const ACTIVE = ['offered', 'running'];
+
+/** Lauf dieses Runners (fremde/unbekannte → 404) */
+export async function ownRun(tx: Tx, runnerId: string, runId: string): Promise<Row> {
+	const run = await oneOf(
+		tx,
+		sql`SELECT * FROM run WHERE id = ${runId} AND runner_id = ${runnerId} FOR UPDATE`
+	);
+	if (!run) throw errors.notFound('Lauf nicht gefunden');
+	return run;
+}
+
+/** Reservierung des Laufs: nie gestartet → löschen, sonst als Schätzung behalten (ohne gemeldeten Verbrauch) */
+async function settleReservation(tx: Tx, run: Row, started: boolean): Promise<void> {
+	const reported = await oneOf(
+		tx,
+		sql`SELECT 1 FROM usage_ledger WHERE run_id = ${run.id} AND source = 'reported' LIMIT 1`
+	);
+	if (!started || reported) {
+		await tx.execute(
+			sql`DELETE FROM usage_ledger WHERE run_id = ${run.id} AND source = 'reserved'`
+		);
+	} else {
+		await tx.execute(
+			sql`UPDATE usage_ledger SET source = 'estimated' WHERE run_id = ${run.id} AND source = 'reserved'`
+		);
+	}
+}
+
+/**
+ * Lauf als verloren markieren und den Auftrag zurückstellen. `counted` = Versuch zählt (lief bereits);
+ * sonst wird er zurückgebucht. Ohne verbleibende Versuche → `failed`.
+ */
+export async function loseRun(
+	tx: Tx,
+	fx: Effects,
+	run: Row,
+	message: string,
+	counted: boolean
+): Promise<void> {
+	await tx.execute(
+		sql`UPDATE run SET status = 'lost', finished_at = now(), lease_expires_at = NULL,
+				error_kind = COALESCE(error_kind, 'internal'), error_message = ${message}
+			WHERE id = ${run.id}`
+	);
+	await settleReservation(tx, run, run.status === 'running');
+	sendCommand(fx, str(run.runner_id), { type: 'cancel', runId: String(run.id), reason: message });
+	fx.runs.add(String(run.id));
+	fx.overview = true;
+	fx.dispatch = true;
+	const task = await getTask(tx, String(run.task_id), true);
+	if (!task || (task.status !== 'queued' && task.status !== 'running')) return;
+	if (!counted) {
+		await tx.execute(
+			sql`UPDATE task SET attempts = GREATEST(attempts - 1, 0) WHERE id = ${task.id}`
+		);
+		await transition(tx, fx, String(task.id), 'queued', { error: message });
+		return;
+	}
+	const exhausted = num(task.attempts) >= num(task.max_attempts);
+	await transition(tx, fx, String(task.id), exhausted ? 'failed' : 'queued', { error: message });
+}
+
+// ---------------------------------------------------------------- Annehmen / Ablehnen
+
+export async function acceptRun(tx: Tx, fx: Effects, runnerId: string, runId: string) {
+	const run = await ownRun(tx, runnerId, runId);
+	if (run.status === 'running') return { ok: true };
+	if (run.status !== 'offered') throw errors.conflict('Der Lauf ist nicht mehr angeboten');
+	const task = await getTask(tx, String(run.task_id), true);
+	if (!task || task.status !== 'queued') {
+		await tx.execute(
+			sql`UPDATE run SET status = 'cancelled', finished_at = now(), lease_expires_at = NULL,
+					error_kind = 'cancelled', error_message = 'Auftrag nicht mehr offen'
+				WHERE id = ${run.id}`
+		);
+		await settleReservation(tx, run, false);
+		fx.runs.add(runId);
+		throw errors.conflict('Der Auftrag ist nicht mehr offen');
+	}
+	await tx.execute(
+		sql`UPDATE run SET status = 'running', started_at = now(), lease_expires_at = ${LEASE}
+			WHERE id = ${run.id}`
+	);
+	await tx.execute(
+		sql`UPDATE task SET started_at = COALESCE(started_at, now()) WHERE id = ${task.id}`
+	);
+	await transition(tx, fx, String(task.id), 'running');
+	fx.runs.add(runId);
+	return { ok: true };
+}
+
+export async function rejectRun(
+	tx: Tx,
+	fx: Effects,
+	runnerId: string,
+	runId: string,
+	reason: string
+) {
+	const run = await ownRun(tx, runnerId, runId);
+	if (run.status !== 'offered') return { ok: true };
+	if (run.account_id) await excludeAccount(tx, String(run.task_id), String(run.account_id));
+	await loseRun(tx, fx, run, `Vom Runner abgelehnt: ${reason || 'ohne Grund'}`, false);
+	return { ok: true };
+}
+
+// ---------------------------------------------------------------- Ereignisse
+
+/** Texte kürzen; sehr große Nutzlasten durch eine gekürzte Textform ersetzen */
+export function trimPayload(payload: Record<string, unknown>): Record<string, unknown> {
+	const out: Record<string, unknown> = {};
+	for (const [k, v] of Object.entries(payload)) {
+		out[k] = typeof v === 'string' ? clip(v, MAX_EVENT_TEXT) : v;
+	}
+	const json = JSON.stringify(out);
+	if (json.length <= MAX_EVENT_TEXT * 4) return out;
+	return {
+		...(typeof out.name === 'string' ? { name: out.name } : {}),
+		text: clip(json, MAX_EVENT_TEXT),
+		truncated: true
+	};
+}
+
+export async function recordEvents(
+	tx: Tx,
+	runnerId: string,
+	runId: string,
+	events: RunEvent[],
+	limits: Limits
+): Promise<{ run: Row; inserted: RunEvent[]; dropped: number }> {
+	const run = await ownRun(tx, runnerId, runId);
+	const room = Math.max(0, limits.maxEventsPerRun - num(run.event_count));
+	const unique = [...new Map(events.map((e) => [e.seq, e])).values()].sort((a, b) => a.seq - b.seq);
+	const take = unique.slice(0, room);
+	let inserted: RunEvent[] = [];
+	if (take.length) {
+		const values = sql.join(
+			take.map(
+				(e) =>
+					sql`(${run.id}, ${e.seq}, ${e.ts}::timestamptz, ${e.kind}, ${jsonb(trimPayload(e.payload))})`
+			),
+			sql`, `
+		);
+		const rows = await rowsOf(
+			tx,
+			sql`INSERT INTO run_event (run_id, seq, ts, kind, payload) VALUES ${values}
+				ON CONFLICT (run_id, seq) DO NOTHING
+				RETURNING seq, ts, kind, payload`
+		);
+		inserted = rows
+			.map((r) => ({
+				seq: num(r.seq),
+				ts: toIso(r.ts),
+				kind: String(r.kind) as RunEvent['kind'],
+				payload: (typeof r.payload === 'string' ? JSON.parse(r.payload) : r.payload) as Record<
+					string,
+					unknown
+				>
+			}))
+			.sort((a, b) => a.seq - b.seq);
+	}
+	const bytes = inserted.reduce((n, e) => n + JSON.stringify(e.payload).length, 0);
+	await tx.execute(
+		sql`UPDATE run SET event_count = event_count + ${inserted.length},
+				event_bytes = event_bytes + ${bytes},
+				lease_expires_at = CASE WHEN status = 'running' THEN ${LEASE} ELSE lease_expires_at END
+			WHERE id = ${run.id}`
+	);
+	return { run, inserted, dropped: unique.length - take.length };
+}
+
+// ---------------------------------------------------------------- Verbrauch und Limits
+
+export async function recordUsage(
+	tx: Tx,
+	fx: Effects,
+	runnerId: string,
+	runId: string,
+	input: UsageInput
+): Promise<{ units: number }> {
+	const run = await ownRun(tx, runnerId, runId);
+	const units = unitsOf(input);
+	if (run.account_id) {
+		await tx.execute(
+			sql`INSERT INTO usage_ledger (id, account_id, run_id, model, input_tokens, output_tokens,
+					cache_read_tokens, cache_write_tokens, cost_microusd, units, source)
+				VALUES (${crypto.randomUUID()}, ${run.account_id}, ${run.id}, ${input.model || String(run.model ?? '')},
+					${input.inputTokens}, ${input.outputTokens}, ${input.cacheReadTokens},
+					${input.cacheWriteTokens}, ${Math.round((input.costUsd ?? 0) * 1_000_000)}, ${units}, 'reported')`
+		);
+	}
+	await tx.execute(sql`DELETE FROM usage_ledger WHERE run_id = ${run.id} AND source = 'reserved'`);
+	await tx.execute(sql`UPDATE run SET units = units + ${units} WHERE id = ${run.id}`);
+	fx.overview = true;
+	return { units };
+}
+
+const LIMIT_REASONS: Record<LimitInput['kind'], string> = {
+	rate: 'Rate-Limit des Anbieters',
+	'5h': '5-Stunden-Limit erreicht',
+	week: 'Wochenlimit erreicht',
+	auth: 'Anmeldung beim Anbieter abgelaufen',
+	other: 'Limit des Anbieters erreicht'
+};
+
+async function usedSince(tx: Tx, accountId: string, since: number): Promise<number> {
+	const [r] = await rowsOf(
+		tx,
+		sql`SELECT COALESCE(sum(units), 0) AS used FROM usage_ledger
+			WHERE account_id = ${accountId} AND source <> 'reserved'
+				AND ts >= ${new Date(since).toISOString()}::timestamptz`
+	);
+	return num(r?.used);
+}
+
+export async function recordLimit(
+	tx: Tx,
+	fx: Effects,
+	runnerId: string,
+	runId: string,
+	input: LimitInput
+): Promise<{ cooldownUntil: string | null }> {
+	const run = await ownRun(tx, runnerId, runId);
+	if (!run.account_id) return { cooldownUntil: null };
+	const account = await oneOf(
+		tx,
+		sql`SELECT * FROM provider_account WHERE id = ${run.account_id} FOR UPDATE`
+	);
+	if (!account) return { cooldownUntil: null };
+	const now = Date.now();
+	const anchor = account.week_anchor ? new Date(toIso(account.week_anchor)).getTime() : null;
+	const used5h = await usedSince(tx, String(account.id), now - 5 * 3600 * 1000);
+	const usedWeek = await usedSince(tx, String(account.id), weekStartOf(anchor, now));
+	const resetsAt = input.resetsAt ? new Date(input.resetsAt).getTime() : null;
+	const until = new Date(
+		resetsAt && resetsAt > now ? resetsAt : now + backoffMs(num(account.cooldown_strikes))
+	).toISOString();
+	const prev = (v: unknown) => (v === null || v === undefined ? null : num(v));
+	const cal5h =
+		input.kind === '5h' ? calibrateBudget(prev(account.calibrated_5h_units), used5h) : null;
+	const calWeek =
+		input.kind === 'week' ? calibrateBudget(prev(account.calibrated_week_units), usedWeek) : null;
+	await tx.execute(
+		sql`UPDATE provider_account SET cooldown_until = ${until}::timestamptz,
+				cooldown_reason = ${LIMIT_REASONS[input.kind]},
+				cooldown_strikes = cooldown_strikes + 1,
+				calibrated_5h_units = ${cal5h === null ? sql`calibrated_5h_units` : sql`${cal5h}`},
+				calibrated_week_units = ${calWeek === null ? sql`calibrated_week_units` : sql`${calWeek}`},
+				logged_in = ${input.kind === 'auth' ? sql`false` : sql`logged_in`}
+			WHERE id = ${account.id}`
+	);
+	await tx.execute(
+		sql`INSERT INTO limit_event (id, account_id, run_id, kind, resets_at, units_at_hit, raw)
+			VALUES (${crypto.randomUUID()}, ${account.id}, ${run.id}, ${input.kind},
+				${input.resetsAt}::timestamptz, ${input.kind === 'week' ? usedWeek : used5h}, ${clip(input.raw, 2000)})`
+	);
+	fx.overview = true;
+	fx.dispatch = true;
+	return { cooldownUntil: until };
+}
+
+// ---------------------------------------------------------------- Abschluss
+
+export async function finishRun(
+	tx: Tx,
+	fx: Effects,
+	runnerId: string,
+	runId: string,
+	input: FinishInput
+): Promise<{ ok: true; taskStatus: string | null }> {
+	const run = await ownRun(tx, runnerId, runId);
+	if (!ACTIVE.includes(String(run.status))) {
+		// schon abgeschlossen (Wiederholung des Runners) – nichts mehr ändern
+		const t = await getTask(tx, String(run.task_id));
+		return { ok: true, taskStatus: t ? String(t.status) : null };
+	}
+	await tx.execute(
+		sql`UPDATE run SET status = ${input.status}, finished_at = now(), lease_expires_at = NULL,
+				session_id = COALESCE(${input.sessionId}, session_id),
+				head_sha = COALESCE(${input.headSha}, head_sha),
+				branch = COALESCE(${input.branch}, branch),
+				summary = ${input.summary},
+				error_kind = ${input.errorKind},
+				error_message = ${input.errorMessage},
+				started_at = COALESCE(started_at, now())
+			WHERE id = ${run.id}`
+	);
+	for (const c of input.commits) {
+		await tx.execute(
+			sql`INSERT INTO run_commit (run_id, sha, message, additions, deletions, files)
+				VALUES (${run.id}, ${c.sha}, ${c.message}, ${c.additions}, ${c.deletions}, ${jsonb(c.files)})
+				ON CONFLICT (run_id, sha) DO NOTHING`
+		);
+	}
+	await settleReservation(tx, run, true);
+	fx.runs.add(runId);
+	fx.overview = true;
+	fx.dispatch = true;
+	if (input.status === 'succeeded' && run.account_id) {
+		await tx.execute(
+			sql`UPDATE provider_account SET cooldown_strikes = 0 WHERE id = ${run.account_id}`
+		);
+	}
+
+	const task = await getTask(tx, String(run.task_id), true);
+	if (!task) return { ok: true, taskStatus: null };
+	if (input.sessionId) {
+		await tx.execute(
+			sql`UPDATE task SET session_id = ${input.sessionId}, session_account_id = ${run.account_id}
+				WHERE id = ${task.id}`
+		);
+	}
+	const pr: PullInfo | null = input.pr
+		? {
+				number: input.pr.number,
+				url: input.pr.url,
+				branch: input.branch ?? str(run.branch),
+				merged: input.merged
+			}
+		: null;
+
+	// Auftrag inzwischen beendet (abgebrochen, Elternauftrag gescheitert): nur Ergebnis festhalten
+	if (isFinal(task.status) || (task.status !== 'queued' && task.status !== 'running')) {
+		if (pr)
+			await upsertPull(tx, fx, String(task.project_id), String(task.id), String(task.title), pr);
+		return { ok: true, taskStatus: String(task.status) };
+	}
+
+	switch (input.status) {
+		case 'succeeded':
+			await succeed(tx, fx, task, input, pr);
+			break;
+		case 'failed':
+			await fail(tx, fx, task, run, input);
+			break;
+		case 'limited': {
+			const known = await oneOf(
+				tx,
+				sql`SELECT 1 FROM limit_event WHERE run_id = ${run.id} AND resets_at IS NOT NULL LIMIT 1`
+			);
+			if (!known && run.account_id)
+				await excludeAccount(tx, String(task.id), String(run.account_id));
+			await tx.execute(
+				sql`UPDATE task SET attempts = GREATEST(attempts - 1, 0) WHERE id = ${task.id}`
+			);
+			await transition(tx, fx, String(task.id), 'queued', {
+				error: input.errorMessage ?? 'Limit des Anbieters erreicht – wird neu eingeplant'
+			});
+			break;
+		}
+		case 'cancelled':
+			await tx.execute(
+				sql`UPDATE task SET attempts = GREATEST(attempts - 1, 0) WHERE id = ${task.id}`
+			);
+			await transition(tx, fx, String(task.id), 'queued', {
+				error: input.errorMessage ?? 'Lauf abgebrochen – wird neu eingeplant'
+			});
+			break;
+	}
+	const after = await getTask(tx, String(task.id));
+	return { ok: true, taskStatus: after ? String(after.status) : null };
+}
+
+async function succeed(
+	tx: Tx,
+	fx: Effects,
+	task: Row,
+	input: FinishInput,
+	pr: PullInfo | null
+): Promise<void> {
+	const summary = input.summary;
+	if (task.role === 'orchestrate' && !planOf(task)) {
+		let check = checkPlan(input.plan);
+		if (!check.ok && summary) {
+			const extracted = checkPlan(extractPlan(summary));
+			if (extracted.ok || input.plan === undefined || input.plan === null) check = extracted;
+		}
+		if (!check.ok) {
+			await failAttempt(tx, fx, task, check.error);
+			return;
+		}
+		await applyPlan(tx, fx, task, check.plan, summary);
+		return;
+	}
+	if (task.role === 'resolve' && task.parent_id) {
+		const original = await getTask(tx, String(task.parent_id), true);
+		await transition(tx, fx, String(task.id), 'done', { error: null, summary });
+		if (original && original.status === 'blocked') {
+			await markDelivered(tx, original);
+			await applyOutcome(tx, fx, original, { pr, summary: null });
+		}
+		return;
+	}
+	await markDelivered(tx, task);
+	await applyOutcome(tx, fx, task, { pr, summary });
+}
+
+/** Ausliefern einer Orchestrierung abgeschlossen */
+async function markDelivered(tx: Tx, task: Row): Promise<void> {
+	const plan = planOf(task);
+	if (!plan || plan.delivered) return;
+	const next: StoredPlan = { ...plan, delivered: true };
+	await tx.execute(sql`UPDATE task SET plan = ${jsonb(next)} WHERE id = ${task.id}`);
+}
+
+/** Fehlversuch: weitere Versuche → `queued`, sonst `failed` */
+async function failAttempt(tx: Tx, fx: Effects, task: Row, message: string): Promise<void> {
+	const exhausted = num(task.attempts) >= num(task.max_attempts);
+	await transition(tx, fx, String(task.id), exhausted ? 'failed' : 'queued', { error: message });
+}
+
+async function fail(tx: Tx, fx: Effects, task: Row, run: Row, input: FinishInput): Promise<void> {
+	const message =
+		input.errorMessage ?? `Lauf fehlgeschlagen${input.errorKind ? ` (${input.errorKind})` : ''}`;
+	const writes = !(task.role === 'orchestrate' && !planOf(task));
+	if (input.errorKind === 'conflict' && task.role !== 'resolve' && writes) {
+		const branch = input.branch ?? str(task.branch) ?? str(run.branch);
+		if (branch && !task.branch) {
+			await tx.execute(sql`UPDATE task SET branch = ${branch} WHERE id = ${task.id}`);
+		}
+		await createResolveTask(
+			tx,
+			fx,
+			{ ...task, branch: branch ?? task.branch },
+			input.conflictFiles,
+			branch
+		);
+		await transition(tx, fx, String(task.id), 'blocked', {
+			error: 'Konflikt beim Zusammenführen – Konfliktlösung ist eingeplant'
+		});
+		return;
+	}
+	if ((input.errorKind === 'auth' || input.errorKind === 'limit') && run.account_id) {
+		await excludeAccount(tx, String(task.id), String(run.account_id));
+	}
+	await failAttempt(tx, fx, task, message);
+}

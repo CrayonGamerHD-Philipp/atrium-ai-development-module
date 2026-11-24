@@ -1,0 +1,5 @@
+node_modules/
+dist/
+.work/
+# enthält Geheimnisse (API-Keys)
+runner.config.json

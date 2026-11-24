@@ -1,0 +1,15 @@
+# Build-Kontext für `docker build -f runner/Dockerfile .` – nur runner/ und modules/aidev/protocol.ts werden gebraucht
+node_modules
+**/node_modules
+.core
+.data
+.git
+.idea
+runner/node_modules
+runner/dist
+runner/.work
+runner/runner.config.json
+**/*.local.json
+.env
+test-results
+playwright-report

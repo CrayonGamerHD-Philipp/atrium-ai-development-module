@@ -1,0 +1,172 @@
+# Atrium aidev-Runner
+
+Der Runner führt die Agent-Läufe des Atrium-Moduls **KI-Entwicklung** (`aidev`) aus. Atrium ist die Steuerzentrale;
+der Runner läuft getrennt davon (Docker-Container auf einem Server oder PC), verbindet sich **ausgehend** mit Atrium
+und braucht keine offenen Ports.
+
+- Anmeldung mit einem API-Key, Befehle per Server-Sent Events (`GET /runner/stream`), Rückmeldungen per JSON-POST.
+- Agents: **Claude Code** (`claude`), **Codex** (`codex`), **Gemini CLI** (`gemini`), **OpenAI-kompatible APIs**
+  (über Codex) – jeweils mit den Abo-Logins bzw. Keys, die auf dem Runner hinterlegt sind.
+- Jeder Lauf arbeitet in einem eigenen git-Worktree, committet, testet, pusht und öffnet PRs (`gh`).
+- Für die Browser-Oberfläche: Dateien lesen/schreiben, git-Status/Diff/Log, PR-Liste, Terminals (node-pty).
+
+Der verbindliche Vertrag steht in [`modules/aidev/protocol.ts`](../modules/aidev/protocol.ts) und wird mitgebündelt.
+
+## Einrichtung Schritt für Schritt
+
+### 1. Technischen Benutzer und API-Key in Atrium anlegen
+
+1. In Atrium einen eigenen Benutzer anlegen, z. B. `runner-bot` (kein Mensch, kein Login nötig).
+2. Diesem Benutzer **nur** die Berechtigung `aidev.runner.connect` geben.
+3. Für diesen Benutzer einen API-Key erzeugen. Er wird nur einmal angezeigt – sicher aufbewahren.
+
+### 2. Konfiguration
+
+Umgebungsvariablen (Vorrang) und/oder eine JSON-Datei (`RUNNER_CONFIG`, Standard `./runner.config.json`,
+Vorlage: [`runner.config.example.json`](runner.config.example.json)):
+
+| Variable | Bedeutung | Standard |
+|---|---|---|
+| `ATRIUM_URL` | Adresse von Atrium | – (Pflicht) |
+| `ATRIUM_API_KEY` | API-Key aus Schritt 1 | – (Pflicht) |
+| `RUNNER_NAME` | Anzeigename in Atrium | Rechnername |
+| `WORK_DIR` | Repos, Worktrees, Arbeitskopien | `./.work` (Docker: `/work`) |
+| `MAX_SLOTS` | gleichzeitige Läufe | `2` |
+| `RUNNER_ACCOUNTS` | Konten als JSON (statt `accounts` in der Datei) | – |
+| `GIT_AUTHOR_NAME` / `GIT_AUTHOR_EMAIL` | Commit-Autor | `Atrium Agent` / `agent@atrium.local` |
+| `GH_TOKEN` | GitHub-Token für `gh` und `git push` | – (alternativ `gh auth login`) |
+| `GIT_REMOTE_TEMPLATE` | Remote-URL-Vorlage | `https://github.com/{owner}/{repo}.git` |
+| `LOG_LEVEL` | `debug`, `info`, `warn`, `error` | `info` |
+
+Ein Konto (`accounts[]`):
+
+| Feld | Bedeutung |
+|---|---|
+| `key` | eindeutiger Schlüssel, z. B. `claude-main` (Kleinbuchstaben, Ziffern, `-`) |
+| `provider` | `claude`, `codex`, `gemini`, `openai-api` oder `fake` (Tests/Vorführung) |
+| `label` | Anzeigename in Atrium |
+| `home` | eigenes Login-Verzeichnis je Konto: setzt `HOME`, `CLAUDE_CONFIG_DIR=<home>/.claude`, `CODEX_HOME=<home>/.codex`, `GEMINI_CLI_HOME=<home>` |
+| `env` | zusätzliche Umgebungsvariablen für den Agent (Werte gelten als geheim und werden aus allen Ausgaben entfernt) |
+| `models` | Modelle, die Atrium für das Konto anbieten darf (leer = Standardmodell der CLI) |
+| `command` | Pfad zur CLI, falls nicht im `PATH` |
+| `baseUrl`, `apiKeyEnv`, `model`, `wireApi` | nur `openai-api` (siehe unten) |
+| `reasoningEffort` | nur Codex/`openai-api`: `model_reasoning_effort` |
+
+Konfiguration prüfen: `node dist/main.js probe` (bzw. `docker compose run --rm runner probe`).
+
+### 3. Bei den Agent-CLIs anmelden (je Konto einmal)
+
+Die Logins bleiben auf dem Runner und erreichen Atrium nie. Mit `home` je Konto lassen sich mehrere Abos derselben
+Art nebeneinander betreiben. Der Runner startet die Anmeldung mit der richtigen Umgebung:
+
+```sh
+docker compose run --rm runner login claude-main   # claude auth login
+docker compose run --rm runner login codex-main    # codex login --device-auth
+docker compose run --rm runner login gemini-main   # gemini (interaktive Google-Anmeldung)
+docker compose run --rm --entrypoint gh runner auth login   # oder GH_TOKEN setzen
+docker compose run --rm runner probe
+```
+
+Ohne `home` geht auch direkt: `docker compose run --rm --entrypoint claude runner auth login` bzw. `… codex login`.
+
+### 4. Starten
+
+```sh
+cd runner
+cp docker-compose.example.yml docker-compose.yml   # anpassen
+mkdir -p config && cp runner.config.example.json config/runner.config.json   # anpassen
+docker compose build      # Build-Kontext ist die Repo-Wurzel (protocol.ts wird mitgebündelt)
+docker compose up -d
+docker compose logs -f runner
+```
+
+Ohne Compose: `docker build -f runner/Dockerfile -t atrium-aidev-runner .` (aus der Repo-Wurzel).
+
+Lokal ohne Docker (nur zur Entwicklung, siehe Sicherheit): `npm install && npm run build && npm start`
+bzw. `npm run dev`.
+
+### 5. In Atrium freigeben
+
+Der Runner meldet sich mit Status **pending** an. Unter **Administration → Runner & Konten** freigeben; danach erhält
+der Runner Aufträge. Konten, deren CLI fehlt oder die nicht angemeldet sind, meldet der Runner als `loggedIn: false`
+(Prüfung beim Start und alle 5 Minuten); Angebote für solche Konten lehnt er ab.
+
+## Ablauf eines Laufs
+
+1. **Worktree** `WORK_DIR/wt/<runId>` aus dem Bare-Cache `WORK_DIR/cache/<owner>/<repo>.git` (vorher `fetch --prune`):
+   existiert `origin/<branch>`, wird darauf fortgesetzt; sonst neuer Branch von `origin/<baseRef>`. Fehlt die Basis
+   (Integrations-Branch beim ersten Teilauftrag), wird sie aus dem Haupt-Branch angelegt und gepusht.
+2. **setupCmd** in der Shell im Worktree (Ausgabe als Ereignisse; Fehlschlag → `setup`).
+3. **Agent** mit Auftrag, Systemanweisung, Modell, ggf. Fortsetzung der Sitzung. Limit erkannt → `/limit`, Abbruch,
+   `limited`. Zeitlimit → `timeout`. Abbruch durch Atrium → `cancelled`.
+4. **Nur-Lese-Rollen**: Änderungen verwerfen (`reset --hard`, `clean -fd`), Zusammenfassung = letzte Antwort; bei
+   Orchestrierung wird der Plan (```json-Block) mitgesendet.
+5. **Schreibend**: offene Änderungen committen (Trailer `Aidev-Task: <id>`), **testCmd** (Fehlschlag → nichts
+   pushen), dann Auslieferung: `pr` (Push + `gh pr create`, optional Auto-Merge), `direct` (Rebase + Push auf den
+   Haupt-Branch, bis zu 3 Versuche), `integrate` (Merge `--no-ff` in den Integrations-Branch, bis zu 3 Versuche) oder
+   `none`. Konflikte → `conflict` mit Dateiliste.
+
+Worktrees bleiben nach dem Lauf erhalten (Editor/Terminal „Lauf“), aufgeräumt wird beim Start und stündlich
+(älter als 48 h bzw. mehr als 30). Die Arbeitskopie des Haupt-Branchs je Projekt liegt in
+`WORK_DIR/projects/<projectId>/main`. Repo-Hooks sind für die git-Befehle des Runners abgeschaltet
+(`core.hooksPath` auf ein leeres Verzeichnis).
+
+Beim Beenden (`SIGTERM`/`SIGINT`) nimmt der Runner keine neuen Läufe an, bricht laufende ab und meldet sie als
+`cancelled`; Worktrees bleiben erhalten.
+
+## Annahmen zu den CLIs
+
+| CLI | Aufruf | geprüft |
+|---|---|---|
+| Claude Code 2.1.331 | `claude -p --output-format stream-json --verbose --dangerously-skip-permissions --append-system-prompt-file <datei> [--model m] [--resume id]`, Auftrag über stdin | mit `--help` und echtem Lauf (Windows) |
+| Codex 0.164 | `codex exec --json --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check [-m m] [-c model_reasoning_effort=…] -C <cwd> -`; Fortsetzen `codex exec resume … <thread_id> -` (ohne `-C`, cwd des Prozesses) | mit `--help`, echtem Lauf und Fortsetzung |
+| Gemini CLI | `gemini -p <Hinweis> --output-format stream-json --yolo [-m m]`, Auftrag über stdin | **nur nach öffentlicher Doku** (nicht installiert); Parser defensiv |
+| OpenAI-kompatibel | Codex mit `-c model_provider=…`, `model_providers.<k>.base_url/env_key/wire_api` | Schlüssel im Codex-Binary gefunden; nicht gegen eine echte API getestet |
+
+- Bei Codex und Gemini wird die Systemanweisung dem Auftrag vorangestellt (`<system_instructions>…`), weil mehrzeilige
+  `-c`-Werte über die Kommandozeile (Windows-Shims) nicht zuverlässig sind. Beim Fortsetzen (Codex) entfällt sie.
+- Codex 0.164 lehnt `wire_api = "chat"` ab („no longer supported“); Standard ist daher `responses`. Für APIs, die nur
+  Chat Completions können, ist ein Proxy (z. B. LiteLLM) nötig.
+- Gemini: Fortsetzen von Sitzungen wird nicht genutzt; `GEMINI_CLI_HOME` als Konto-Verzeichnis ist eine Annahme
+  (Login-Datei `<home>/.gemini/oauth_creds.json`), alternativ `GEMINI_API_KEY` in `env`.
+- Login-Status: Claude über `claude auth status --json` (Rückfall: Anmeldedaten im Config-Verzeichnis), Codex über
+  `codex login status` (Rückfall: `auth.json`), Gemini über die OAuth-Datei bzw. `GEMINI_API_KEY`/`GOOGLE_API_KEY`,
+  `openai-api` über die Variable aus `apiKeyEnv`.
+- Verbrauch: Claude aus dem `result`-Ereignis (inkl. Kosten); Codex summiert `turn.completed.usage`
+  (`inputTokens` ohne die gecachten Tokens, diese als `cacheReadTokens`); Gemini aus `result.stats`.
+- Limit-Erkennung: versionierte Muster-Tabelle in `src/providers/limits.ts` (u. a. Claude `rate_limit_event` mit
+  `status: rejected`, „usage limit reached“, „5-hour limit“, „weekly limit“, Codex „You've hit your usage limit“,
+  Gemini `RESOURCE_EXHAUSTED`, 429). Rücksetzzeit aus Unix-Zeit, ISO, „in 2 hours“, „resets 3pm (Zeitzone)“.
+
+## Sicherheit
+
+- **Agents laufen ohne Rückfragen** (`--dangerously-skip-permissions`, `--dangerously-bypass-approvals-and-sandbox`,
+  `--yolo`). Den Runner deshalb **nur im Container** betreiben: Benutzer ohne Root (UID 10002), `cap_drop: ALL`,
+  `no-new-privileges`, eigenes Netz, optional Egress-Allowlist (nur GitHub, Atrium, KI-Anbieter). Niemals auf dem
+  Atrium-Host.
+- **GitHub**: fine-grained Personal Access Token **nur für die gewählten Repos** (Contents, Pull requests, ggf.
+  Workflows: Read & write). Auf dem Haupt-Branch **Branch-Protection** aktivieren (Reviews/Checks), dann kann auch ein
+  fehlerhafter Agent nichts direkt zerstören. Force-Pushes macht der Runner nur `--force-with-lease` auf eigene
+  `aidev/`-Branches.
+- **Zugangsdaten bleiben auf dem Runner**: CLI-Logins, gh-Token und API-Keys werden nie an Atrium übertragen. Der
+  API-Key des Runners wird nicht an Agents, Projektbefehle oder Terminals weitergegeben.
+- **Bereinigung**: Alle hochgeladenen Texte (Ereignisse, Fehlermeldungen, Diffs, Terminal-Ausgabe) werden von Tokens
+  befreit (`ghp_`, `gho_`, `github_pat_`, `sk-`, `sk-ant-`, `AIza…`, `xox…`, `Bearer …`, AWS-Keys, Zugangsdaten in
+  URLs, der eigene API-Key und alle Werte aus `env`/`apiKeyEnv`) → `[entfernt]`. Ausnahme: Dateiinhalte für den Editor
+  (`fs.read`) werden unverändert übertragen, sonst würde Speichern die Datei verändern.
+- **Pfad-Jail** für Editor-RPCs: nur innerhalb des Worktrees bzw. der Arbeitskopie (`realpath`), keine absoluten Pfade,
+  kein `..`, keine Symlinks nach außen, kein Schreiben in `.git`.
+- Externe Empfänger der Daten: GitHub (Code, PRs) und der jeweilige KI-Anbieter (Auftrag, Code-Ausschnitte).
+
+## Entwicklung
+
+```sh
+npm install
+npm run check   # tsc --noEmit
+npm test        # vitest: SSE, Batcher, Redaction, Pfad-Jail, Limits, Parser, Plan, Git-Ablauf, Runner
+npm run build   # esbuild → dist/main.js (bündelt protocol.ts, zod, cross-spawn; node-pty bleibt extern)
+node dist/main.js --help
+```
+
+Die Git-Tests nutzen ein lokales Bare-Remote, den `fake`-Adapter und einen gh-Shim (`test/fixtures/gh-shim`).
+`scripts/smoke-real.ts` ist ein manueller Rauchtest gegen die echten CLIs (`npx tsx scripts/smoke-real.ts claude`).

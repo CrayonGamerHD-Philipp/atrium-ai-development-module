@@ -1,0 +1,22 @@
+{
+	"name": "atrium-ai-development-module",
+	"private": true,
+	"version": "0.1.0",
+	"description": "Kalypzo-Atrium-Modul „KI-Entwicklung“ (aidev): Vibe-Coding im Browser mit Claude Code, Codex, Gemini und OpenAI-kompatiblen Agents auf eigenen Runnern",
+	"type": "module",
+	"scripts": {
+		"setup": "node scripts/setup.mjs",
+		"check": "node scripts/core.mjs check",
+		"test": "node scripts/core.mjs test",
+		"build": "node scripts/core.mjs build",
+		"lint": "node scripts/core.mjs lint",
+		"format:check": "node scripts/core.mjs format",
+		"e2e": "node scripts/core.mjs e2e",
+		"demo": "node scripts/core.mjs demo",
+		"check:catalog": "node scripts/check-catalog.mjs",
+		"check:migrations": "node scripts/check-migrations.mjs",
+		"runner:install": "npm --prefix runner install",
+		"runner:test": "npm --prefix runner test",
+		"runner:check": "npm --prefix runner run check"
+	}
+}

@@ -1,0 +1,40 @@
+{
+	"atriumUrl": "https://atrium.example.org",
+	"name": "runner-1",
+	"workDir": "/work",
+	"maxSlots": 2,
+	"accounts": [
+		{
+			"key": "claude-main",
+			"provider": "claude",
+			"label": "Claude Max (Team)",
+			"home": "/accounts/claude-main",
+			"models": ["sonnet", "opus", "haiku"]
+		},
+		{
+			"key": "codex-main",
+			"provider": "codex",
+			"label": "ChatGPT Pro",
+			"home": "/accounts/codex-main",
+			"models": [],
+			"reasoningEffort": "medium"
+		},
+		{
+			"key": "gemini-main",
+			"provider": "gemini",
+			"label": "Gemini (Google-Konto)",
+			"home": "/accounts/gemini-main",
+			"models": []
+		},
+		{
+			"key": "local-llm",
+			"provider": "openai-api",
+			"label": "Eigenes LLM (vLLM)",
+			"home": "/accounts/local-llm",
+			"baseUrl": "http://vllm:8000/v1",
+			"apiKeyEnv": "LOCAL_LLM_API_KEY",
+			"model": "qwen3-coder",
+			"env": { "LOCAL_LLM_API_KEY": "bitte-ersetzen" }
+		}
+	]
+}

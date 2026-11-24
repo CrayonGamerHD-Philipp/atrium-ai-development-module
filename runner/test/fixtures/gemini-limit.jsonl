@@ -1,0 +1,3 @@
+{"type":"init","timestamp":"2026-11-24T10:00:00.000Z","session_id":"d1","model":"gemini-3-pro"}
+{"type":"error","timestamp":"2026-11-24T10:00:01.000Z","severity":"error","message":"[API Error: {\"error\":{\"code\":429,\"message\":\"Resource has been exhausted (e.g. check quota).\",\"status\":\"RESOURCE_EXHAUSTED\"}}] Please retry in 41s."}
+{"type":"result","timestamp":"2026-11-24T10:00:01.100Z","status":"error","error":{"type":"FatalApiError","message":"RESOURCE_EXHAUSTED: Quota exceeded"},"stats":{"total_tokens":0,"input_tokens":0,"output_tokens":0}}

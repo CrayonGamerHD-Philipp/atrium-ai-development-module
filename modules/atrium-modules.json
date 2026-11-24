@@ -1,0 +1,11 @@
+{
+	"schema": 1,
+	"name": "Atrium KI-Entwicklung",
+	"description": "Vibe-Coding im Browser: mehrere GitHub-Projekte, autonome Coding-Agents (Claude Code, Codex, Gemini, OpenAI-kompatibel) auf eigenen Runnern.",
+	"modules": [
+		{
+			"id": "aidev",
+			"path": "aidev"
+		}
+	]
+}

@@ -1,0 +1,63 @@
+# Beispiel: Runner per Docker Compose betreiben (Datei nach docker-compose.yml kopieren und anpassen).
+#
+#   cd runner
+#   docker compose build
+#   # Konfiguration: ./config/runner.config.json (siehe runner.config.example.json)
+#   # Einmalig je Konto anmelden (Login landet im Volume des Kontos):
+#   docker compose run --rm runner login claude-main      # startet `claude auth login` mit HOME des Kontos
+#   docker compose run --rm runner login codex-main       # startet `codex login --device-auth`
+#   docker compose run --rm --entrypoint gh runner auth login   # oder GH_TOKEN setzen (fine-grained PAT)
+#   docker compose run --rm runner probe                  # prüft CLIs und Anmeldungen
+#   docker compose up -d
+#
+# Ohne eigenes `home` je Konto geht auch direkt: docker compose run --rm --entrypoint claude runner login
+
+services:
+  runner:
+    build:
+      context: ..
+      dockerfile: runner/Dockerfile
+      args:
+        CLAUDE_CODE_VERSION: 2.1.331
+        CODEX_VERSION: 0.164.0
+        GEMINI_CLI_VERSION: 0.71.1
+    image: atrium-aidev-runner:latest
+    restart: unless-stopped
+    init: false # tini ist bereits ENTRYPOINT
+    environment:
+      ATRIUM_URL: https://atrium.example.org
+      ATRIUM_API_KEY: ${ATRIUM_API_KEY:?ATRIUM_API_KEY fehlt}
+      RUNNER_NAME: runner-1
+      MAX_SLOTS: '2'
+      RUNNER_CONFIG: /config/runner.config.json
+      # Fine-grained PAT nur für die gewählten Repos (Contents, Pull requests, Workflows: Read & write)
+      GH_TOKEN: ${GH_TOKEN:-}
+      GIT_AUTHOR_NAME: Atrium Agent
+      GIT_AUTHOR_EMAIL: agent@atrium.local
+      LOG_LEVEL: info
+    volumes:
+      - ./config:/config:ro
+      - runner-work:/work
+      - runner-home:/home/runner
+      # Je Konto ein eigenes Login-Verzeichnis (in runner.config.json: "home": "/accounts/<key>")
+      - runner-accounts:/accounts
+    # Agents laufen ohne Rückfragen und brauchen Schreibzugriff (Repos, npm-Caches) → kein read_only
+    read_only: false
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:size=2g
+    # Optional: eigenes Netz mit Egress-Allowlist (Proxy) für GitHub, Atrium und die KI-Anbieter
+    networks:
+      - runner
+    stop_grace_period: 45s
+
+volumes:
+  runner-work:
+  runner-home:
+  runner-accounts:
+
+networks:
+  runner: {}

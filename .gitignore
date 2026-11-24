@@ -1,0 +1,13 @@
+node_modules
+modules/node_modules
+modules/package.json
+modules/package-lock.json
+runner/node_modules
+runner/dist
+runner/.work
+.data
+/test-results
+/playwright-report
+.idea/
+.env
+*.local.json
