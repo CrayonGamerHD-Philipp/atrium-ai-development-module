@@ -19,19 +19,22 @@
 </script>
 
 {#snippet stamp()}
-	<span class="w-12 shrink-0 pt-0.5 text-right font-mono text-xs text-muted-foreground tabular-nums"
+	<span
+		class="w-10 shrink-0 pt-0.5 text-right font-mono text-[11px] text-muted-foreground tabular-nums sm:w-12 sm:text-xs"
 		>{time}</span
 	>
 {/snippet}
 
 {#if event.kind === 'text'}
-	<div class="flex gap-3 py-1.5">
+	<div class="flex gap-2 py-1.5 sm:gap-3">
 		{@render stamp()}
-		<Markdown {text} class="min-w-0 flex-1" />
+		<Markdown {text} class="min-w-0 flex-1 overflow-x-auto" />
 	</div>
 {:else if event.kind === 'thinking'}
 	<details class="group py-1">
-		<summary class="flex cursor-pointer list-none gap-3 text-xs text-muted-foreground">
+		<summary
+			class="flex cursor-pointer list-none items-center gap-2 text-xs text-muted-foreground pointer-coarse:min-h-10 sm:gap-3"
+		>
 			{@render stamp()}
 			<span class="inline-flex min-w-0 items-center gap-1.5">
 				<ChevronRight class="size-3.5 shrink-0 transition-transform group-open:rotate-90" />
@@ -39,7 +42,7 @@
 				<span class="truncate italic">Denkt: {shorten(text, 100)}</span>
 			</span>
 		</summary>
-		<div class="mt-1 ml-15 text-xs text-muted-foreground italic">
+		<div class="mt-1 ml-0 min-w-0 sm:ml-15 text-xs text-muted-foreground italic">
 			<p class="break-words whitespace-pre-wrap">{text}</p>
 		</div>
 	</details>
@@ -47,7 +50,9 @@
 	{@const name = asText(p.name) || 'Werkzeug'}
 	{@const input = asText(p.input)}
 	<details class="group py-1">
-		<summary class="flex cursor-pointer list-none gap-3 text-xs">
+		<summary
+			class="flex cursor-pointer list-none items-center gap-2 text-xs pointer-coarse:min-h-10 sm:gap-3"
+		>
 			{@render stamp()}
 			<span
 				class="inline-flex min-w-0 flex-1 items-center gap-1.5 rounded-md border bg-muted/40 px-2 py-1"
@@ -61,7 +66,7 @@
 			</span>
 		</summary>
 		<pre
-			class="mt-1 ml-15 max-h-96 overflow-auto rounded-md border bg-muted/40 p-2 font-mono text-xs leading-snug whitespace-pre-wrap">{input.length >
+			class="mt-1 ml-0 min-w-0 sm:ml-15 max-h-96 overflow-auto rounded-md border bg-muted/40 p-2 font-mono text-xs leading-snug whitespace-pre-wrap">{input.length >
 			MAX_INLINE
 				? `${input.slice(0, MAX_INLINE)}\n… (${input.length - MAX_INLINE} Zeichen gekürzt)`
 				: input}</pre>
@@ -70,8 +75,10 @@
 	{@const output = asText(p.output)}
 	{@const isError = p.isError === true}
 	<details class="group py-0.5">
-		<summary class="flex cursor-pointer list-none gap-3 text-xs">
-			<span class="w-12 shrink-0"></span>
+		<summary
+			class="flex cursor-pointer list-none items-center gap-2 text-xs pointer-coarse:min-h-10 sm:gap-3"
+		>
+			<span class="w-10 shrink-0 sm:w-12"></span>
 			<span
 				class={cn(
 					'inline-flex min-w-0 flex-1 items-center gap-1.5 pl-2',
@@ -87,14 +94,14 @@
 		</summary>
 		<pre
 			class={cn(
-				'mt-1 ml-15 max-h-96 overflow-auto rounded-md border p-2 font-mono text-xs leading-snug whitespace-pre-wrap',
+				'mt-1 ml-0 min-w-0 sm:ml-15 max-h-96 overflow-auto rounded-md border p-2 font-mono text-xs leading-snug whitespace-pre-wrap',
 				isError ? 'border-destructive-border bg-destructive-muted text-destructive' : 'bg-muted/40'
 			)}>{output.length > MAX_INLINE
 				? `${output.slice(0, MAX_INLINE)}\n… (${output.length - MAX_INLINE} Zeichen gekürzt)`
 				: output}</pre>
 	</details>
 {:else if event.kind === 'stderr' || event.kind === 'error'}
-	<div class="flex gap-3 py-1">
+	<div class="flex gap-2 py-1 sm:gap-3">
 		{@render stamp()}
 		<div
 			class={cn(
@@ -111,17 +118,17 @@
 		</div>
 	</div>
 {:else if event.kind === 'git'}
-	<div class="flex gap-3 py-1 text-xs">
+	<div class="flex gap-2 py-1 text-xs sm:gap-3">
 		{@render stamp()}
-		<span class="inline-flex min-w-0 items-center gap-1.5 text-muted-foreground">
+		<span class="inline-flex min-w-0 flex-1 items-center gap-1.5 text-muted-foreground">
 			<GitCommitHorizontal class="size-3.5 shrink-0" aria-hidden="true" />
 			<span class="font-medium text-foreground">{asText(p.action)}</span>
-			<span class="truncate font-mono">{shorten(asText(p.detail), 200)}</span>
+			<span class="min-w-0 truncate font-mono">{shorten(asText(p.detail), 200)}</span>
 		</span>
 	</div>
 {:else}
 	<!-- status / system -->
-	<div class="flex gap-3 py-0.5 text-xs text-muted-foreground">
+	<div class="flex gap-2 py-0.5 text-xs text-muted-foreground sm:gap-3">
 		{@render stamp()}
 		<span class="min-w-0 flex-1 break-words whitespace-pre-wrap">{text || asText(p)}</span>
 	</div>

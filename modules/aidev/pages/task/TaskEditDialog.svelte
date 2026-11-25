@@ -74,7 +74,7 @@
 			<Dialog.Title>Auftrag bearbeiten</Dialog.Title>
 			<Dialog.Description>Änderungen wirken beim nächsten Start eines Laufs.</Dialog.Description>
 		</Dialog.Header>
-		<form id="task-edit" class="grid gap-4 sm:grid-cols-3" onsubmit={save} novalidate>
+		<form id="task-edit" class="grid grid-cols-1 gap-4 sm:grid-cols-3" onsubmit={save} novalidate>
 			<div class="sm:col-span-3">
 				<FormField label="Titel" id="task-edit-title" error={errors.title}>
 					<Input id="task-edit-title" bind:value={title} maxlength={200} disabled={busy} />
