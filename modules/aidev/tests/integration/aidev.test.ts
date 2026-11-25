@@ -1177,7 +1177,8 @@ describe('aidev', () => {
 		expect((await fakeA()).limits).toBeNull();
 
 		const resetsAt = new Date(Date.now() + 2 * 3600_000).toISOString();
-		const observedAt = new Date(Date.now() - 60_000).toISOString();
+		// Beobachtung nach den Buchungen früherer Tests (Verbrauch zählt nur bis zur Beobachtung)
+		const observedAt = new Date().toISOString();
 		const limits = {
 			observedAt,
 			source: 'probe',
@@ -1200,7 +1201,8 @@ describe('aidev', () => {
 		// Budgetvorschlag = Verbrauch im Fenster / gemeldete Auslastung (frühere Tests haben Verbrauch gebucht)
 		const [ledger] = await q<{ units: number }>(
 			sql`SELECT COALESCE(sum(units), 0)::int AS units FROM usage_ledger
-				WHERE account_id = ${account.id} AND source <> 'reserved'`
+				WHERE account_id = ${account.id} AND source <> 'reserved'
+					AND ts <= ${observedAt}::timestamptz`
 		);
 		const units = ledger!.units;
 		expect(first.suggestedBudget5hUnits).toBe(units > 0 ? Math.round(units / 0.2) : null);
@@ -1212,6 +1214,7 @@ describe('aidev', () => {
 				usedPercent: 20,
 				resetsAt,
 				status: 'allowed',
+				stale: false,
 				estimatedUtil: est5h,
 				exhaustsAt: null
 			},
@@ -1221,6 +1224,7 @@ describe('aidev', () => {
 				usedPercent: 35,
 				resetsAt: null,
 				status: 'unknown',
+				stale: false,
 				estimatedUtil: estWeek,
 				exhaustsAt: null
 			}
@@ -1246,5 +1250,38 @@ describe('aidev', () => {
 		expect(second.windows).toHaveLength(1);
 		expect(second.windows[0]).toMatchObject({ usedPercent: 30, status: 'warning' });
 		expect(await samples()).toBe(2);
+
+		// vorgehende Runner-Uhr: Zeiten werden auf „jetzt“ begrenzt, Fensterzeiten um dieselbe Abweichung verschoben
+		const ahead = Date.now() + 3 * 3600_000;
+		const future = {
+			observedAt: new Date(ahead).toISOString(),
+			source: 'stream',
+			windows: [
+				{ window: '5h', usedPercent: 40, resetsAt, status: 'allowed' },
+				{
+					window: 'week',
+					usedPercent: 50,
+					resetsAt: null,
+					status: 'rejected',
+					observedAt: new Date(ahead - 2 * 3600_000).toISOString()
+				}
+			]
+		};
+		const before = Date.now();
+		ok(await beat([{ key: 'fake-a', loggedIn: true, limits: future }]), 201);
+		const third = (await fakeA()).limits!;
+		const thirdAt = new Date(third.observedAt).getTime();
+		expect(thirdAt).toBeGreaterThanOrEqual(before - 1000);
+		expect(thirdAt).toBeLessThanOrEqual(Date.now());
+		expect(third.stale).toBe(false);
+		// das Wochenfenster ist 2 h älter als der Schnappschuss → veraltet
+		expect(third.windows.map((w) => [w.window, w.stale])).toEqual([
+			['5h', false],
+			['week', true]
+		]);
+
+		// derselbe Stand erneut gesendet (Heartbeat) gilt nicht als neue Beobachtung
+		ok(await beat([{ key: 'fake-a', loggedIn: true, limits: future }]), 201);
+		expect((await fakeA()).limits!.observedAt).toBe(third.observedAt);
 	});
 });
