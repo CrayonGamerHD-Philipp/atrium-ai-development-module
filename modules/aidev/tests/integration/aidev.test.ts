@@ -894,11 +894,14 @@ describe('aidev', () => {
 			['queued', 0]
 		]);
 
-		// abarbeiten und ausliefern
-		for (const c of [a!, b!]) {
-			const o = await offerFor(c.id);
-			ok(await call('runner', 'POST', `/runner/runs/${o.runId}/accept`), 201);
-			ok(await finish(o.runId, { status: 'succeeded', summary: `Ergebnis ${c.title}` }), 201);
+		// abarbeiten (Reihenfolge wie angeboten) und ausliefern
+		const open = new Set([a!.id, b!.id]);
+		while (open.size) {
+			const o = (await offers()).find((x) => open.has(x.taskId));
+			expect(o, 'kein Angebot für die Teilaufträge').toBeTruthy();
+			ok(await call('runner', 'POST', `/runner/runs/${o!.runId}/accept`), 201);
+			ok(await finish(o!.runId, { status: 'succeeded', summary: 'Ergebnis' }), 201);
+			open.delete(o!.taskId);
 		}
 		const deliver = await offerFor(parent.id);
 		ok(await call('runner', 'POST', `/runner/runs/${deliver.runId}/accept`), 201);
@@ -942,6 +945,122 @@ describe('aidev', () => {
 		ok(await finish(again.runId, { status: 'succeeded', summary: 'erneut ausgeliefert' }), 201);
 		expect((await task(parent.id)).task.status).toBe('done');
 		expect(await delivered()).toBe(true);
+	});
+
+	it('Neu starten: wartende Aufträge, hängengebliebene Läufe werden abgebrochen', async () => {
+		const runOf = async (runId: string) =>
+			(
+				await q<{ status: string; error_kind: string | null }>(
+					sql`SELECT status, error_kind FROM run WHERE id = ${runId}`
+				)
+			)[0]!;
+		const ledger = async (runId: string, source: string) =>
+			(
+				await q<{ n: number }>(
+					sql`SELECT count(*)::int AS n FROM usage_ledger WHERE run_id = ${runId} AND source = ${source}`
+				)
+			)[0]!.n;
+
+		// (a) wartender Auftrag → neu starten → wartet weiter, Versuche 0, Fehler gelöscht
+		const t = await createTask({ prompt: 'Neustart wartend', maxAttempts: 2 });
+		await q(sql`UPDATE task SET attempts = 1, error_message = 'hängt' WHERE id = ${t.id}`);
+		const queued = ok<TaskDto>(await call('admin', 'POST', `/tasks/${t.id}/retry`), 201);
+		expect(queued).toMatchObject({ status: 'queued', attempts: 0, errorMessage: null });
+
+		// (b) hängengebliebenes Angebot → Lauf abgebrochen, Reservierung weg, neues Angebot möglich
+		const stuck = await offerFor(t.id);
+		await q(
+			sql`UPDATE task SET excluded_account_ids = '["x"]'::jsonb, attempts = 1 WHERE id = ${t.id}`
+		);
+		expect(await ledger(stuck.runId, 'reserved')).toBe(1);
+		const restarted = ok<TaskDto>(await call('admin', 'POST', `/tasks/${t.id}/retry`), 201);
+		expect(restarted).toMatchObject({ status: 'queued', attempts: 0 });
+		expect(await runOf(stuck.runId)).toEqual({ status: 'cancelled', error_kind: 'cancelled' });
+		expect(await ledger(stuck.runId, 'reserved')).toBe(0);
+		const [excluded] = await q<{ ids: unknown }>(
+			sql`SELECT excluded_account_ids AS ids FROM task WHERE id = ${t.id}`
+		);
+		expect(excluded!.ids).toEqual([]);
+		// das alte Angebot lässt sich nicht mehr annehmen, ein neues schon
+		expect((await call('runner', 'POST', `/runner/runs/${stuck.runId}/accept`)).status).toBe(409);
+		const fresh = await offerFor(t.id);
+		expect(fresh.runId).not.toBe(stuck.runId);
+
+		// (c) laufender Auftrag bleibt gesperrt (409)
+		ok(await call('runner', 'POST', `/runner/runs/${fresh.runId}/accept`), 201);
+		expect((await task(t.id)).task.status).toBe('running');
+		expect((await call('admin', 'POST', `/tasks/${t.id}/retry`)).status).toBe(409);
+
+		// hängengebliebener laufender Lauf an einem wartenden Auftrag → Lauf beendet, Reservierung als Schätzung
+		await q(sql`UPDATE task SET status = 'queued' WHERE id = ${t.id}`);
+		expect(await ledger(fresh.runId, 'reserved')).toBe(1);
+		ok(await call('admin', 'POST', `/tasks/${t.id}/retry`), 201);
+		expect(await runOf(fresh.runId)).toEqual({ status: 'cancelled', error_kind: 'cancelled' });
+		expect(await ledger(fresh.runId, 'reserved')).toBe(0);
+		expect(await ledger(fresh.runId, 'estimated')).toBe(1);
+		// spätere Meldungen des Runners zum alten Lauf ändern den neu gestarteten Auftrag nicht
+		const late = ok<{ taskStatus: string }>(
+			await finish(fresh.runId, { status: 'succeeded', summary: 'zu spät' }),
+			201
+		);
+		expect(late.taskStatus).toBe('queued');
+		expect(ok(await heartbeat('runner', [fresh.runId]), 201).cancel).toContain(fresh.runId);
+		expect((await task(t.id)).task).toMatchObject({ status: 'queued', attempts: 0 });
+		const next = await offerFor(t.id);
+		expect(next.runId).not.toBe(fresh.runId);
+		ok(await call('runner', 'POST', `/runner/runs/${next.runId}/accept`), 201);
+		ok(await finish(next.runId, { status: 'succeeded', summary: 'fertig' }), 201);
+		expect((await task(t.id)).task.status).toBe('done');
+	});
+
+	it('Neu starten: blockierte Orchestrierung setzt fehlgeschlagene Teilaufträge zurück', async () => {
+		const parent = await createTask({ prompt: 'Neustart blockiert', decompose: true });
+		const plan = await offerFor(parent.id);
+		ok(await call('runner', 'POST', `/runner/runs/${plan.runId}/accept`), 201);
+		ok(
+			await finish(plan.runId, {
+				status: 'succeeded',
+				plan: {
+					subtasks: [
+						{ key: 'a', title: 'Teil A', prompt: 'A', role: 'research' },
+						{ key: 'b', title: 'Teil B', prompt: 'B', role: 'research' }
+					]
+				}
+			}),
+			201
+		);
+		const [a, b] = (await task(parent.id)).children;
+		// hängengebliebener Zustand: Teilauftrag gescheitert, Orchestrierung wartet weiter
+		await q(
+			sql`UPDATE task SET status = 'failed', attempts = 3, error_message = 'A kaputt',
+					finished_at = now() WHERE id = ${a!.id}`
+		);
+		expect((await task(parent.id)).task.status).toBe('blocked');
+
+		const restarted = ok<TaskDto>(await call('admin', 'POST', `/tasks/${parent.id}/retry`), 201);
+		expect(restarted).toMatchObject({ status: 'blocked', attempts: 0 });
+		let d = await task(parent.id);
+		expect(d.children.map((c) => [c.status, c.attempts, c.errorMessage])).toEqual([
+			['queued', 0, null],
+			['queued', 0, null]
+		]);
+
+		// wartender Teilauftrag unter blockierter Orchestrierung lässt sich ebenfalls neu starten
+		const child = ok<TaskDto>(await call('admin', 'POST', `/tasks/${b!.id}/retry`), 201);
+		expect(child).toMatchObject({ status: 'queued', attempts: 0 });
+		expect((await task(parent.id)).task.status).toBe('blocked');
+
+		// abarbeiten und ausliefern
+		for (const c of [a!, b!]) {
+			const o = await offerFor(c.id);
+			ok(await call('runner', 'POST', `/runner/runs/${o.runId}/accept`), 201);
+			ok(await finish(o.runId, { status: 'succeeded', summary: `Ergebnis ${c.title}` }), 201);
+		}
+		const deliver = await offerFor(parent.id);
+		ok(await call('runner', 'POST', `/runner/runs/${deliver.runId}/accept`), 201);
+		ok(await finish(deliver.runId, { status: 'succeeded', summary: 'ausgeliefert' }), 201);
+		d = await task(parent.id);
+		expect(d.task.status).toBe('done');
 	});
 
 	it('Rechte: Runner-Key, fremder Runner, Person ohne Projektrecht, fremde Aufträge', async () => {
