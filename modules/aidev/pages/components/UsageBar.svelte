@@ -11,7 +11,7 @@
 </script>
 
 <div class="min-w-0 space-y-1">
-	<div class="flex items-baseline justify-between gap-2 text-xs">
+	<div class="flex flex-wrap items-baseline justify-between gap-x-2 text-xs">
 		<span class="text-muted-foreground">{label}</span>
 		<span class="tabular-nums" title={known ? `${units(used)} von ${units(budget)} Einheiten` : ''}>
 			{#if known}{pct} %{:else}{units(used)} · Budget unbekannt{/if}

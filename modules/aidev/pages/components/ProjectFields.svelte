@@ -52,7 +52,7 @@
 	const policyOptions = COMMIT_POLICIES.map((p) => ({ value: p, label: POLICY_LABELS[p] }));
 </script>
 
-<div class="grid gap-4 sm:grid-cols-2">
+<div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
 	<FormField label="Name" id={id('name')} required error={errors.name}>
 		<Input id={id('name')} bind:value={values.name} maxlength={120} {disabled} autocomplete="off" />
 	</FormField>

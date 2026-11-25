@@ -127,7 +127,7 @@
 	<Card.Root>
 		<Card.Header>
 			<Card.Title>Projekt</Card.Title>
-			<Card.Description>
+			<Card.Description class="wrap-anywhere">
 				Repository {store.project?.repoOwner}/{store.project?.repoName} – das Repository selbst lässt
 				sich nicht ändern.
 			</Card.Description>
@@ -150,7 +150,7 @@
 			</form>
 		</Card.Content>
 		{#if canManage}
-			<Card.Footer class="justify-end gap-2">
+			<Card.Footer class="flex-wrap justify-end gap-2">
 				{#if dirty}
 					<Button
 						variant="ghost"
@@ -188,11 +188,14 @@
 								: 'Repository nicht erreichbar'}
 						</Alert.Title>
 						<Alert.Description>
-							<p class="whitespace-pre-wrap">{check.message}</p>
+							<p class="whitespace-pre-wrap wrap-anywhere">{check.message}</p>
 							{#if check.defaultBranch && check.defaultBranch !== store.project?.defaultBranch}
 								<p>
-									Standard-Branch auf GitHub: <code class="font-mono">{check.defaultBranch}</code>
-									(eingestellt: <code class="font-mono">{store.project?.defaultBranch}</code>)
+									Standard-Branch auf GitHub: <code class="font-mono wrap-anywhere"
+										>{check.defaultBranch}</code
+									>
+									(eingestellt:
+									<code class="font-mono wrap-anywhere">{store.project?.defaultBranch}</code>)
 								</p>
 							{/if}
 						</Alert.Description>

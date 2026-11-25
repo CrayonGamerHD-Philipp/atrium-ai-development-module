@@ -84,15 +84,15 @@
 	<Dialog.Content class="sm:max-w-2xl">
 		<Dialog.Header>
 			<Dialog.Title>{pr ? `PR #${pr.number} mit Agent bearbeiten` : 'PR bearbeiten'}</Dialog.Title>
-			<Dialog.Description>
+			<Dialog.Description class="wrap-break-word">
 				{#if pr}
 					„{pr.title}“ – der Agent arbeitet auf dem Branch
-					<span class="font-mono">{pr.branch}</span> und aktualisiert diesen Pull Request, statt einen
-					neuen zu öffnen.
+					<span class="font-mono wrap-anywhere">{pr.branch}</span> und aktualisiert diesen Pull Request,
+					statt einen neuen zu öffnen.
 				{/if}
 			</Dialog.Description>
 		</Dialog.Header>
-		<form id="pr-task" class="grid gap-4 sm:grid-cols-2" onsubmit={submit} novalidate>
+		<form id="pr-task" class="grid grid-cols-1 gap-4 sm:grid-cols-2" onsubmit={submit} novalidate>
 			<div class="sm:col-span-2">
 				<FormField label="Auftrag" id="pr-task-prompt" required error={errors.prompt}>
 					<Textarea

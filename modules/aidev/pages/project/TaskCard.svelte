@@ -26,18 +26,18 @@
 <a
 	href={taskPath(task.projectId, task.id)}
 	class={cn(
-		'block space-y-2 rounded-md border bg-card p-3 text-left shadow-xs transition-colors outline-none hover:border-foreground/25 focus-visible:ring-2 focus-visible:ring-ring',
+		'block min-w-0 space-y-2 rounded-md border bg-card p-3 text-left shadow-xs transition-colors outline-none hover:border-foreground/25 focus-visible:ring-2 focus-visible:ring-ring',
 		task.status === 'needs-input' && 'border-warning-border',
 		task.status === 'draft' && 'border-dashed'
 	)}
 >
 	{#if parentTitle}
-		<div class="flex items-center gap-1 truncate text-xs text-muted-foreground">
-			<Network class="size-3" aria-hidden="true" />
-			<span class="truncate">{parentTitle}</span>
+		<div class="flex min-w-0 items-center gap-1 text-xs text-muted-foreground">
+			<Network class="size-3 shrink-0" aria-hidden="true" />
+			<span class="min-w-0 truncate">{parentTitle}</span>
 		</div>
 	{/if}
-	<div class="line-clamp-3 text-sm leading-snug font-medium">{taskTitle(task)}</div>
+	<div class="line-clamp-3 text-sm leading-snug font-medium wrap-break-word">{taskTitle(task)}</div>
 	<div class="flex flex-wrap items-center gap-1.5">
 		<span class="rounded-sm bg-muted px-1.5 py-0.5 text-xs text-muted-foreground">
 			{roleLabel(task.role)}
@@ -66,8 +66,8 @@
 			</div>
 		</div>
 	{/if}
-	<div class="flex items-center justify-between gap-2 text-xs text-muted-foreground">
-		<span class="inline-flex items-center gap-2">
+	<div class="flex items-end justify-between gap-2 text-xs text-muted-foreground">
+		<span class="inline-flex min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5">
 			{#if task.attempts > 0}
 				<span class="tabular-nums" title="Versuche">Versuch {task.attempts}/{task.maxAttempts}</span
 				>
@@ -95,6 +95,6 @@
 				>
 			{/if}
 		</span>
-		<TimeAgo value={task.updatedAt} />
+		<span class="shrink-0"><TimeAgo value={task.updatedAt} /></span>
 	</div>
 </a>

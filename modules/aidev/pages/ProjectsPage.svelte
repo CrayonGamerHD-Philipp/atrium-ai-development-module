@@ -209,14 +209,14 @@
 				{/if}
 			</EmptyState>
 		{:else}
-			<ul class="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+			<ul class="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-3 min-[110rem]:grid-cols-4">
 				{#each visible as p (p.id)}
 					<li>
 						<a
 							href={projectPath(p.id)}
 							class="group block h-full rounded-lg border bg-card p-4 transition-colors outline-none hover:border-foreground/25 focus-visible:ring-2 focus-visible:ring-ring"
 						>
-							<div class="flex items-start gap-3">
+							<div class="flex min-w-0 items-start gap-3">
 								<FolderGit2
 									class="mt-0.5 size-5 shrink-0 text-muted-foreground"
 									aria-hidden="true"
@@ -228,12 +228,12 @@
 									</div>
 								</div>
 								{#if p.counts.needsInput}
-									<Badge variant="warning"
+									<Badge variant="warning" class="shrink-0"
 										>{p.counts.needsInput} Rückfrage{p.counts.needsInput === 1 ? '' : 'n'}</Badge
 									>
 								{/if}
 							</div>
-							<dl class="mt-4 grid grid-cols-4 gap-2 text-center">
+							<dl class="mt-4 grid grid-cols-4 gap-1 text-center sm:gap-2">
 								<div>
 									<dt class="text-xs text-muted-foreground">Wartet</dt>
 									<dd class="text-sm font-semibold tabular-nums">{p.counts.queued}</dd>
@@ -259,9 +259,9 @@
 							<div
 								class="mt-3 flex items-center justify-between gap-2 border-t pt-2 text-xs text-muted-foreground"
 							>
-								<span class="inline-flex items-center gap-1 truncate">
-									<GitPullRequest class="size-3.5" aria-hidden="true" />
-									{POLICY_LABELS[p.commitPolicy]}
+								<span class="inline-flex min-w-0 items-center gap-1">
+									<GitPullRequest class="size-3.5 shrink-0" aria-hidden="true" />
+									<span class="truncate">{POLICY_LABELS[p.commitPolicy]}</span>
 								</span>
 								<TimeAgo value={p.updatedAt} />
 							</div>
