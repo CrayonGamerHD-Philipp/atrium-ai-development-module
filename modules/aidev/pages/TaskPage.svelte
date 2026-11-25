@@ -102,6 +102,10 @@
 	let deleteOpen = $state(false);
 	let cancelOpen = $state(false);
 	let now = $state(Date.now());
+	// Prompt in der Seitenleiste: ab lg (zweispaltig) anfangs aufgeklappt, mobil eingeklappt
+	let promptOpen = $state(
+		typeof window !== 'undefined' && window.matchMedia('(min-width: 1024px)').matches
+	);
 
 	const TABS = ['log', 'diff', 'commits', 'children', 'result'] as const;
 	type Tab = (typeof TABS)[number];
@@ -425,8 +429,10 @@
 						<p class="text-sm">Kein Branch bereitgestellt.</p>
 					{/if}
 					{#if task.branch}
-						<span class="inline-flex items-center gap-1 font-mono text-xs text-muted-foreground">
-							<GitBranch class="size-3.5" aria-hidden="true" />{task.branch}
+						<span
+							class="inline-flex max-w-full min-w-0 items-center gap-1 font-mono text-xs break-all text-muted-foreground"
+						>
+							<GitBranch class="size-3.5 shrink-0" aria-hidden="true" />{task.branch}
 						</span>
 					{/if}
 					{#if task.targetPr}
@@ -463,7 +469,7 @@
 					{#if store}<LiveIndicator status={store.live.status} />{/if}
 				</div>
 			</div>
-			<div class="flex flex-wrap gap-2 lg:justify-end">
+			<div class="flex flex-wrap gap-2 lg:shrink-0 lg:justify-end">
 				{#if actions.queue}
 					<Button
 						onclick={() => run('queue', () => queueTask(task.id), 'Auftrag eingeplant')}
@@ -546,268 +552,285 @@
 				</div>
 			</form>
 		{/if}
-
-		<details class="group rounded-lg border bg-card">
-			<summary
-				class="flex cursor-pointer list-none items-center justify-between gap-2 px-3 py-2 text-sm"
-			>
-				<span class="font-medium">Auftrag</span>
-				<span class="truncate text-xs text-muted-foreground group-open:hidden">
-					{task.prompt.slice(0, 140)}
-				</span>
-			</summary>
-			<div class="border-t px-3 py-3">
-				<Markdown text={task.prompt} />
-				{#if detail.dependencies.length}
-					<div class="mt-3 flex flex-wrap items-center gap-2 text-xs">
-						<span class="text-muted-foreground">Wartet auf:</span>
-						{#each detail.dependencies as d (d.id)}
-							<a
-								href={taskPath(projectId, d.id)}
-								class="inline-flex items-center gap-1 rounded-md border px-1.5 py-0.5 hover:bg-muted"
-							>
-								{d.title}
-								<StatusBadge status={d.status} />
-							</a>
-						{/each}
-					</div>
-				{/if}
-				{#if task.parentId}
-					<p class="mt-2 text-xs">
-						<a href={taskPath(projectId, task.parentId)} class="text-link hover:underline"
-							>Zum übergeordneten Auftrag</a
-						>
-					</p>
-				{/if}
-			</div>
-		</details>
 	</header>
 
-	<Tabs.Root value={tab} onValueChange={setTab}>
-		<Tabs.List variant="line" aria-label="Bereiche des Auftrags">
-			<Tabs.Trigger value="log">Verlauf</Tabs.Trigger>
-			<Tabs.Trigger value="diff">Diff</Tabs.Trigger>
-			<Tabs.Trigger value="commits">
-				Commits
-				{#if allCommits.length}<span class="text-xs text-muted-foreground tabular-nums"
-						>{allCommits.length}</span
-					>{/if}
-			</Tabs.Trigger>
-			{#if detail.children.length || task.role === 'orchestrate'}
-				<Tabs.Trigger value="children">
-					Teilaufträge
-					<span class="text-xs text-muted-foreground tabular-nums"
-						>{doneChildren}/{detail.children.length}</span
-					>
-				</Tabs.Trigger>
-			{/if}
-			<Tabs.Trigger value="result">Ergebnis</Tabs.Trigger>
-		</Tabs.List>
+	<!-- Mobil einspaltig (Auftrag über den Reitern), ab lg Hauptbereich links und Auftrag als Seitenleiste rechts -->
+	<div class="grid gap-4 lg:grid-cols-[minmax(0,1fr)_minmax(18rem,24rem)] lg:items-start">
+		<aside class="min-w-0 lg:sticky lg:top-4 lg:col-start-2 lg:row-start-1" aria-label="Auftrag">
+			<details
+				bind:open={promptOpen}
+				class="group rounded-lg border bg-card lg:max-h-[calc(100dvh-6rem)] lg:overflow-y-auto"
+			>
+				<summary
+					class="flex min-h-10 cursor-pointer list-none items-center justify-between gap-2 px-3 py-2 text-sm"
+				>
+					<span class="font-medium">Auftrag</span>
+					<span class="truncate text-xs text-muted-foreground group-open:hidden">
+						{task.prompt.slice(0, 140)}
+					</span>
+				</summary>
+				<div class="min-w-0 border-t px-3 py-3 break-words">
+					<Markdown text={task.prompt} />
+					{#if detail.dependencies.length}
+						<div class="mt-3 flex flex-wrap items-center gap-2 text-xs">
+							<span class="text-muted-foreground">Wartet auf:</span>
+							{#each detail.dependencies as d (d.id)}
+								<a
+									href={taskPath(projectId, d.id)}
+									class="inline-flex items-center gap-1 rounded-md border px-1.5 py-0.5 hover:bg-muted"
+								>
+									{d.title}
+									<StatusBadge status={d.status} />
+								</a>
+							{/each}
+						</div>
+					{/if}
+					{#if task.parentId}
+						<p class="mt-2 text-xs">
+							<a href={taskPath(projectId, task.parentId)} class="text-link hover:underline"
+								>Zum übergeordneten Auftrag</a
+							>
+						</p>
+					{/if}
+				</div>
+			</details>
+		</aside>
 
-		<div class="pt-4">
-			{#if tab === 'log'}
-				{#if !runs.length}
-					<EmptyState
-						title="Noch kein Lauf"
-						description={task.status === 'draft'
-							? 'Der Auftrag ist ein Entwurf. Starte ihn, damit ein Agent loslegt.'
-							: task.status === 'blocked'
-								? 'Der Auftrag wartet auf andere Aufträge.'
-								: 'Sobald ein Runner und ein Konto frei sind, startet ein Agent.'}
-					/>
-				{:else}
-					<div class="mb-3 flex flex-wrap items-center gap-3">
-						{#if runs.length > 1}
-							<SelectField
-								label="Lauf"
-								options={runOptions}
-								value={selectedRun?.id ?? null}
-								onchange={(v) => {
-									if (!v) return;
-									selectedRunId = v;
-									followLatest = v === runs[0]?.id;
-								}}
-								size="sm"
-								class="w-72"
+		<div class="min-w-0 lg:col-start-1 lg:row-start-1">
+			<Tabs.Root value={tab} onValueChange={setTab}>
+				<div class="-mx-1 overflow-x-auto px-1">
+					<Tabs.List variant="line" aria-label="Bereiche des Auftrags">
+						<Tabs.Trigger value="log">Verlauf</Tabs.Trigger>
+						<Tabs.Trigger value="diff">Diff</Tabs.Trigger>
+						<Tabs.Trigger value="commits">
+							Commits
+							{#if allCommits.length}<span class="text-xs text-muted-foreground tabular-nums"
+									>{allCommits.length}</span
+								>{/if}
+						</Tabs.Trigger>
+						{#if detail.children.length || task.role === 'orchestrate'}
+							<Tabs.Trigger value="children">
+								Teilaufträge
+								<span class="text-xs text-muted-foreground tabular-nums"
+									>{doneChildren}/{detail.children.length}</span
+								>
+							</Tabs.Trigger>
+						{/if}
+						<Tabs.Trigger value="result">Ergebnis</Tabs.Trigger>
+					</Tabs.List>
+				</div>
+
+				<div class="pt-4">
+					{#if tab === 'log'}
+						{#if !runs.length}
+							<EmptyState
+								title="Noch kein Lauf"
+								description={task.status === 'draft'
+									? 'Der Auftrag ist ein Entwurf. Starte ihn, damit ein Agent loslegt.'
+									: task.status === 'blocked'
+										? 'Der Auftrag wartet auf andere Aufträge.'
+										: 'Sobald ein Runner und ein Konto frei sind, startet ein Agent.'}
+							/>
+						{:else}
+							<div class="mb-3 flex flex-wrap items-center gap-3">
+								{#if runs.length > 1}
+									<SelectField
+										label="Lauf"
+										options={runOptions}
+										value={selectedRun?.id ?? null}
+										onchange={(v) => {
+											if (!v) return;
+											selectedRunId = v;
+											followLatest = v === runs[0]?.id;
+										}}
+										size="sm"
+										class="w-full sm:w-72"
+									/>
+								{/if}
+								{#if selectedRun}
+									<StatusBadge status={selectedRun.status} run />
+									<span class="text-xs text-muted-foreground">
+										{runMeta(selectedRun)} · {elapsed(
+											selectedRun.startedAt,
+											selectedRun.finishedAt,
+											now
+										)}{selectedRun.units ? ` · ${units(selectedRun.units)} Einheiten` : ''}
+									</span>
+								{/if}
+							</div>
+							{#if selectedRun?.errorMessage && !running}
+								<Alert.Root variant="destructive" class="mb-3">
+									<Alert.Title>
+										{ERROR_KIND_LABELS[selectedRun.errorKind ?? ''] ?? 'Fehler'}
+									</Alert.Title>
+									<Alert.Description class="whitespace-pre-wrap"
+										>{selectedRun.errorMessage}</Alert.Description
+									>
+								</Alert.Root>
+							{/if}
+							<RunLog
+								events={selectedEvents}
+								loading={!!(selectedRun && eventsLoading[selectedRun.id])}
+								{running}
 							/>
 						{/if}
-						{#if selectedRun}
-							<StatusBadge status={selectedRun.status} run />
-							<span class="text-xs text-muted-foreground">
-								{runMeta(selectedRun)} · {elapsed(
-									selectedRun.startedAt,
-									selectedRun.finishedAt,
-									now
-								)}{selectedRun.units ? ` · ${units(selectedRun.units)} Einheiten` : ''}
-							</span>
+					{:else if tab === 'diff'}
+						{#if diffLoading}
+							<LoadingState rows={6} rowClass="h-6 w-full" label="Diff" />
+						{:else if diffError}
+							{#if diffUnavailable}
+								<Alert.Root variant="warning">
+									<Alert.Title>Diff gerade nicht verfügbar</Alert.Title>
+									<Alert.Description>
+										Den Diff berechnet ein Runner. Gerade ist keiner erreichbar – versuch es gleich
+										noch einmal.
+										<Button variant="link" size="sm" onclick={loadDiff} class="px-0"
+											>Erneut versuchen</Button
+										>
+									</Alert.Description>
+								</Alert.Root>
+							{:else}
+								<ErrorState message={diffError} onretry={loadDiff} />
+							{/if}
+						{:else if diff}
+							<div class="mb-3 flex justify-end">
+								<Button variant="ghost" size="sm" onclick={loadDiff}>Aktualisieren</Button>
+							</div>
+							<DiffView {diff} />
+						{:else if !task.branch}
+							<EmptyState
+								title="Noch kein Branch"
+								description="Sobald der Agent Änderungen macht, siehst du hier den Diff."
+							/>
 						{/if}
-					</div>
-					{#if selectedRun?.errorMessage && !running}
-						<Alert.Root variant="destructive" class="mb-3">
-							<Alert.Title>
-								{ERROR_KIND_LABELS[selectedRun.errorKind ?? ''] ?? 'Fehler'}
-							</Alert.Title>
-							<Alert.Description class="whitespace-pre-wrap"
-								>{selectedRun.errorMessage}</Alert.Description
-							>
-						</Alert.Root>
-					{/if}
-					<RunLog
-						events={selectedEvents}
-						loading={!!(selectedRun && eventsLoading[selectedRun.id])}
-						{running}
-					/>
-				{/if}
-			{:else if tab === 'diff'}
-				{#if diffLoading}
-					<LoadingState rows={6} rowClass="h-6 w-full" label="Diff" />
-				{:else if diffError}
-					{#if diffUnavailable}
-						<Alert.Root variant="warning">
-							<Alert.Title>Diff gerade nicht verfügbar</Alert.Title>
-							<Alert.Description>
-								Den Diff berechnet ein Runner. Gerade ist keiner erreichbar – versuch es gleich noch
-								einmal.
-								<Button variant="link" size="sm" onclick={loadDiff} class="px-0"
-									>Erneut versuchen</Button
-								>
-							</Alert.Description>
-						</Alert.Root>
-					{:else}
-						<ErrorState message={diffError} onretry={loadDiff} />
-					{/if}
-				{:else if diff}
-					<div class="mb-3 flex justify-end">
-						<Button variant="ghost" size="sm" onclick={loadDiff}>Aktualisieren</Button>
-					</div>
-					<DiffView {diff} />
-				{:else if !task.branch}
-					<EmptyState
-						title="Noch kein Branch"
-						description="Sobald der Agent Änderungen macht, siehst du hier den Diff."
-					/>
-				{/if}
-			{:else if tab === 'commits'}
-				{#if !allCommits.length}
-					<EmptyState
-						title="Keine Commits"
-						description="Commits erscheinen, wenn ein Lauf Änderungen gepusht hat."
-					/>
-				{:else}
-					<ul class="divide-y rounded-lg border bg-card">
-						{#each allCommits as c (`${c.run.id}:${c.sha}`)}
-							<li class="flex flex-wrap items-start gap-x-3 gap-y-1 px-3 py-2">
-								<code class="shrink-0 font-mono text-xs text-muted-foreground"
-									>{shortSha(c.sha)}</code
-								>
-								<div class="min-w-0 flex-1 basis-60">
-									<div class="truncate text-sm font-medium">{firstLine(c.message)}</div>
-									{#if c.files.length}
-										<details class="text-xs text-muted-foreground">
-											<summary class="cursor-pointer">{c.files.length} Dateien</summary>
-											<ul class="mt-1 space-y-0.5 font-mono">
-												{#each c.files as f (f)}<li class="truncate">{f}</li>{/each}
-											</ul>
-										</details>
-									{/if}
-								</div>
-								<span class="font-mono text-xs tabular-nums">
-									<span class="text-success">+{c.additions}</span>
-									<span class="text-destructive">−{c.deletions}</span>
-								</span>
-								<Badge variant="outline">Versuch {c.run.attempt}</Badge>
-							</li>
-						{/each}
-					</ul>
-				{/if}
-			{:else if tab === 'children'}
-				{#if !detail.children.length}
-					<EmptyState
-						title="Noch keine Teilaufträge"
-						description="Der planende Agent legt sie an, sobald sein Plan steht."
-					/>
-				{:else}
-					<ul class="divide-y rounded-lg border bg-card">
-						{#each [...detail.children].sort((a, b) => a.position - b.position) as c (c.id)}
-							<li class="flex flex-wrap items-center gap-x-3 gap-y-1 px-3 py-2">
-								<span class="w-6 text-xs text-muted-foreground tabular-nums">{c.position + 1}.</span
-								>
-								<div class="min-w-0 flex-1 basis-60">
-									<a
-										href={taskPath(projectId, c.id)}
-										class="block truncate text-sm font-medium hover:underline">{taskTitle(c)}</a
-									>
-									{#if c.dependsOn.length}
-										<div class="truncate text-xs text-muted-foreground">
-											wartet auf: {c.dependsOn
-												.map((d) => childTitles.get(d) ?? 'anderer Auftrag')
-												.join(', ')}
+					{:else if tab === 'commits'}
+						{#if !allCommits.length}
+							<EmptyState
+								title="Keine Commits"
+								description="Commits erscheinen, wenn ein Lauf Änderungen gepusht hat."
+							/>
+						{:else}
+							<ul class="divide-y rounded-lg border bg-card">
+								{#each allCommits as c (`${c.run.id}:${c.sha}`)}
+									<li class="flex flex-wrap items-start gap-x-3 gap-y-1 px-3 py-2">
+										<code class="shrink-0 font-mono text-xs text-muted-foreground"
+											>{shortSha(c.sha)}</code
+										>
+										<div class="min-w-0 flex-1 basis-60">
+											<div class="truncate text-sm font-medium">{firstLine(c.message)}</div>
+											{#if c.files.length}
+												<details class="text-xs text-muted-foreground">
+													<summary class="cursor-pointer py-1">{c.files.length} Dateien</summary>
+													<ul class="mt-1 space-y-0.5 font-mono">
+														{#each c.files as f (f)}<li class="truncate">{f}</li>{/each}
+													</ul>
+												</details>
+											{/if}
 										</div>
-									{/if}
+										<span class="font-mono text-xs tabular-nums">
+											<span class="text-success">+{c.additions}</span>
+											<span class="text-destructive">−{c.deletions}</span>
+										</span>
+										<Badge variant="outline">Versuch {c.run.attempt}</Badge>
+									</li>
+								{/each}
+							</ul>
+						{/if}
+					{:else if tab === 'children'}
+						{#if !detail.children.length}
+							<EmptyState
+								title="Noch keine Teilaufträge"
+								description="Der planende Agent legt sie an, sobald sein Plan steht."
+							/>
+						{:else}
+							<ul class="divide-y rounded-lg border bg-card">
+								{#each [...detail.children].sort((a, b) => a.position - b.position) as c (c.id)}
+									<li class="flex flex-wrap items-center gap-x-3 gap-y-1 px-3 py-2">
+										<span class="w-6 text-xs text-muted-foreground tabular-nums"
+											>{c.position + 1}.</span
+										>
+										<div class="min-w-0 flex-1 basis-60">
+											<a
+												href={taskPath(projectId, c.id)}
+												class="block truncate text-sm font-medium hover:underline">{taskTitle(c)}</a
+											>
+											{#if c.dependsOn.length}
+												<div class="truncate text-xs text-muted-foreground">
+													wartet auf: {c.dependsOn
+														.map((d) => childTitles.get(d) ?? 'anderer Auftrag')
+														.join(', ')}
+												</div>
+											{/if}
+										</div>
+										<span class="text-xs text-muted-foreground">{roleLabel(c.role)}</span>
+										{#if c.lastRun}<ProviderBadge provider={c.lastRun.provider} />{/if}
+										<StatusBadge status={c.status} />
+									</li>
+								{/each}
+							</ul>
+						{/if}
+					{:else}
+						<div class="space-y-4">
+							{#if task.errorMessage}
+								<Alert.Root variant="destructive">
+									<Alert.Title>Fehlermeldung</Alert.Title>
+									<Alert.Description class="whitespace-pre-wrap"
+										>{task.errorMessage}</Alert.Description
+									>
+								</Alert.Root>
+							{:else if lastFailedRun?.errorMessage && task.status === 'failed'}
+								<Alert.Root variant="destructive">
+									<Alert.Title
+										>{ERROR_KIND_LABELS[lastFailedRun.errorKind ?? ''] ?? 'Fehler'}</Alert.Title
+									>
+									<Alert.Description class="whitespace-pre-wrap"
+										>{lastFailedRun.errorMessage}</Alert.Description
+									>
+								</Alert.Root>
+							{/if}
+							{#if task.resultSummary}
+								<div class="rounded-lg border bg-card p-4">
+									<h2 class="mb-2 text-sm font-medium">Zusammenfassung des Agents</h2>
+									<Markdown text={task.resultSummary} />
 								</div>
-								<span class="text-xs text-muted-foreground">{roleLabel(c.role)}</span>
-								{#if c.lastRun}<ProviderBadge provider={c.lastRun.provider} />{/if}
-								<StatusBadge status={c.status} />
-							</li>
-						{/each}
-					</ul>
-				{/if}
-			{:else}
-				<div class="space-y-4">
-					{#if task.errorMessage}
-						<Alert.Root variant="destructive">
-							<Alert.Title>Fehlermeldung</Alert.Title>
-							<Alert.Description class="whitespace-pre-wrap">{task.errorMessage}</Alert.Description>
-						</Alert.Root>
-					{:else if lastFailedRun?.errorMessage && task.status === 'failed'}
-						<Alert.Root variant="destructive">
-							<Alert.Title
-								>{ERROR_KIND_LABELS[lastFailedRun.errorKind ?? ''] ?? 'Fehler'}</Alert.Title
-							>
-							<Alert.Description class="whitespace-pre-wrap"
-								>{lastFailedRun.errorMessage}</Alert.Description
-							>
-						</Alert.Root>
-					{/if}
-					{#if task.resultSummary}
-						<div class="rounded-lg border bg-card p-4">
-							<h2 class="mb-2 text-sm font-medium">Zusammenfassung des Agents</h2>
-							<Markdown text={task.resultSummary} />
-						</div>
-					{:else if !task.errorMessage}
-						<EmptyState
-							title="Noch kein Ergebnis"
-							description={isFinal
-								? 'Der Agent hat keine Zusammenfassung hinterlassen.'
-								: 'Die Zusammenfassung erscheint, wenn der Agent fertig ist.'}
-						/>
-					{/if}
-					{#if detail.pullRequest}
-						<div class="flex flex-wrap items-center gap-2 rounded-lg border bg-card p-3 text-sm">
-							<GitPullRequest class="size-4 text-muted-foreground" aria-hidden="true" />
-							<span class="font-medium"
-								>#{detail.pullRequest.number} {detail.pullRequest.title}</span
-							>
-							<Badge variant={detail.pullRequest.state === 'merged' ? 'success' : 'info'}>
-								{detail.pullRequest.state === 'merged'
-									? 'Gemergt'
-									: detail.pullRequest.state === 'open'
-										? 'Offen'
-										: 'Geschlossen'}
-							</Badge>
-							<a
-								href={detail.pullRequest.url}
-								target="_blank"
-								rel="noopener noreferrer"
-								class="ml-auto inline-flex items-center gap-1 text-link hover:underline"
-								>Auf GitHub <ExternalLink class="size-3.5" aria-hidden="true" /></a
-							>
+							{:else if !task.errorMessage}
+								<EmptyState
+									title="Noch kein Ergebnis"
+									description={isFinal
+										? 'Der Agent hat keine Zusammenfassung hinterlassen.'
+										: 'Die Zusammenfassung erscheint, wenn der Agent fertig ist.'}
+								/>
+							{/if}
+							{#if detail.pullRequest}
+								<div
+									class="flex flex-wrap items-center gap-2 rounded-lg border bg-card p-3 text-sm"
+								>
+									<GitPullRequest class="size-4 text-muted-foreground" aria-hidden="true" />
+									<span class="min-w-0 font-medium break-words"
+										>#{detail.pullRequest.number} {detail.pullRequest.title}</span
+									>
+									<Badge variant={detail.pullRequest.state === 'merged' ? 'success' : 'info'}>
+										{detail.pullRequest.state === 'merged'
+											? 'Gemergt'
+											: detail.pullRequest.state === 'open'
+												? 'Offen'
+												: 'Geschlossen'}
+									</Badge>
+									<a
+										href={detail.pullRequest.url}
+										target="_blank"
+										rel="noopener noreferrer"
+										class="ml-auto inline-flex min-h-10 items-center gap-1 text-link hover:underline"
+										>Auf GitHub <ExternalLink class="size-3.5" aria-hidden="true" /></a
+									>
+								</div>
+							{/if}
 						</div>
 					{/if}
 				</div>
-			{/if}
+			</Tabs.Root>
 		</div>
-	</Tabs.Root>
+	</div>
 
 	<TaskEditDialog
 		bind:open={editOpen}
