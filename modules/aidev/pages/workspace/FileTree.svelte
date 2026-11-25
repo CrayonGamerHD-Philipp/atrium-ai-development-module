@@ -93,8 +93,10 @@
 	{:else if 'error' in st}
 		<div class="space-y-1 py-1 pr-2 text-xs" style={`padding-left:${depth * 12 + 8}px`}>
 			<p class={st.unavailable ? 'text-warning' : 'text-destructive'}>{st.error}</p>
-			<button type="button" class="text-link hover:underline" onclick={() => loadDir(path)}
-				>Erneut versuchen</button
+			<button
+				type="button"
+				class="text-link hover:underline pointer-coarse:min-h-10"
+				onclick={() => loadDir(path)}>Erneut versuchen</button
 			>
 		</div>
 	{:else if !st.entries.length}
@@ -114,7 +116,7 @@
 					<button
 						type="button"
 						class={cn(
-							'flex w-full items-center gap-1.5 rounded-sm py-[3px] pr-2 text-left text-[13px] hover:bg-muted',
+							'flex w-full items-center gap-1.5 rounded-sm py-[3px] pr-2 text-left text-[13px] hover:bg-muted pointer-coarse:min-h-10 pointer-coarse:text-sm',
 							activePath === e.path && 'bg-muted font-medium'
 						)}
 						style={`padding-left:${depth * 12 + 6}px`}
