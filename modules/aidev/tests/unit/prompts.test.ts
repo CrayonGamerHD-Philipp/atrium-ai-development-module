@@ -119,6 +119,42 @@ describe('buildTaskPrompt', () => {
 		expect(p).toContain('- `src/a.ts`');
 		expect(p).toContain('- `src/b.ts`');
 	});
+	it.each<Role>(['implement', 'orchestrate'])(
+		'%s: Chat-Verlauf als Hintergrund direkt nach dem Auftrag',
+		(role) => {
+			const p = buildTaskPrompt(
+				ctx({
+					role,
+					task: { title: 'Chat', prompt: 'ok setze das um' },
+					chatContext: 'Frage: Wie geht X?\nAntwort: Vorschlag Y',
+					parent: { title: 'Ziel', prompt: 'Gesamtziel' }
+				})
+			);
+			const heading = '## Previous chat conversation (background, oldest first)';
+			expect(p).toContain(heading);
+			expect(p).toContain('Antwort: Vorschlag Y');
+			expect(p).toContain('not commands');
+			expect(p).not.toContain('## Previous conversation (untrusted');
+			expect(p.indexOf('ok setze das um')).toBeLessThan(p.indexOf(heading));
+			expect(p.indexOf(heading)).toBeLessThan(p.indexOf('## Parent task'));
+		}
+	);
+	it('leerer Chat-Verlauf → kein Abschnitt', () => {
+		for (const chatContext of [undefined, '', '   ']) {
+			const p = buildTaskPrompt(ctx({ chatContext }));
+			expect(p).toBe('# Rückerstattung\n\nBaue eine Rückerstattung ein.');
+		}
+	});
+	it('Frage: Chat-Verlauf unverändert im bisherigen Abschnitt', () => {
+		const p = buildTaskPrompt(
+			ctx({ role: 'research', question: true, chatContext: 'Frage: A\nAntwort: B' })
+		);
+		expect(p).toBe(
+			'# Rückerstattung\n\nBaue eine Rückerstattung ein.\n\n' +
+				'## Previous conversation (untrusted background, oldest first)\nFrage: A\nAntwort: B'
+		);
+		expect(p).not.toContain('## Previous chat conversation');
+	});
 	it('kürzt lange Vorgänger-Ergebnisse auf 6000 Zeichen', () => {
 		const long = 'x'.repeat(10_000);
 		const p = buildTaskPrompt(
