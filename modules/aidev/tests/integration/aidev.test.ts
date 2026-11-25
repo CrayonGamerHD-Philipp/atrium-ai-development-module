@@ -78,7 +78,7 @@ async function technicalKey(name: string, roleId: string, scopes: string[]) {
 	keys[name] = (await createApiKey(ctx, { name, scopes })).key;
 }
 
-const register = (who: string, accounts: string[]) =>
+const register = (who: string, accounts: string[], maxSlots = 4) =>
 	call<{ runnerId: string; status: string; heartbeatSec: number }>(
 		who,
 		'POST',
@@ -87,7 +87,7 @@ const register = (who: string, accounts: string[]) =>
 			protocol: 1,
 			name: `Runner ${who}`,
 			version: '0.1.0',
-			maxSlots: 4,
+			maxSlots,
 			capabilities: {
 				question: true,
 				branchDelivery: true,
@@ -245,6 +245,23 @@ describe('aidev', () => {
 		);
 		expect(approved.status).toBe('approved');
 		expect(ok(await heartbeat('runner'), 201).status).toBe('approved');
+
+		// MAX_SLOTS: Admin-Wert bleibt bei gleichem gemeldetem Wert, geänderter Wert wird übernommen
+		const slots = async () =>
+			ok<RunnerDto[]>(await call('admin', 'GET', '/runners')).find((r) => r.id === runnerId)!
+				.maxSlots;
+		ok(await call('admin', 'PATCH', `/runners/${runnerId}`, { maxSlots: 2 }));
+		ok(await register('runner', ['fake-a', 'fake-b'], 4), 201);
+		expect(await slots()).toBe(2);
+		ok(await register('runner', ['fake-a', 'fake-b'], 15), 201);
+		expect(await slots()).toBe(15);
+		// vor Migration 0006 angemeldet (kein gemeldeter Wert) → Wert des Runners übernehmen
+		ok(await call('admin', 'PATCH', `/runners/${runnerId}`, { maxSlots: 2 }));
+		await q(sql`UPDATE runner SET reported_max_slots = NULL WHERE id = ${runnerId}`);
+		ok(await register('runner', ['fake-a', 'fake-b'], 15), 201);
+		expect(await slots()).toBe(15);
+		ok(await register('runner', ['fake-a', 'fake-b'], 4), 201);
+		expect(await slots()).toBe(4);
 
 		// Verteilung: Test-Agent für alle Rollen
 		const routing = Object.fromEntries(

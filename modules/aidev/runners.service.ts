@@ -64,9 +64,10 @@ export async function registerRunner(
 		const id = crypto.randomUUID();
 		runner = await oneOf(
 			tx,
-			sql`INSERT INTO runner (id, name, api_key_id, status, version, capabilities, max_slots, last_seen_at)
+			sql`INSERT INTO runner (id, name, api_key_id, status, version, capabilities, max_slots,
+					reported_max_slots, last_seen_at)
 				VALUES (${id}, ${input.name}, ${key}, 'pending', ${input.version}, ${jsonb(input.capabilities)},
-					${input.maxSlots}, now())
+					${input.maxSlots}, ${input.maxSlots}, now())
 				ON CONFLICT (api_key_id) DO NOTHING
 				RETURNING *`
 		);
@@ -77,10 +78,17 @@ export async function registerRunner(
 			metadata: { name: input.name, version: input.version, accounts: input.accounts.length }
 		});
 	} else {
+		// geändertes MAX_SLOTS des Runners übernehmen; ein von der Verwaltung gesetzter Wert bleibt,
+		// solange der Runner denselben Wert meldet (NULL: zuletzt vor Migration 0006 angemeldet)
+		const reported = runner.reported_max_slots;
+		const slotsChanged =
+			reported === null || reported === undefined || Number(reported) !== input.maxSlots;
 		runner = await oneOf(
 			tx,
 			sql`UPDATE runner SET name = ${input.name}, version = ${input.version},
-					capabilities = ${jsonb(input.capabilities)}, last_seen_at = now()
+					capabilities = ${jsonb(input.capabilities)}, last_seen_at = now(),
+					max_slots = ${slotsChanged ? input.maxSlots : Number(runner.max_slots)},
+					reported_max_slots = ${input.maxSlots}
 				WHERE id = ${runner.id} RETURNING *`
 		);
 	}

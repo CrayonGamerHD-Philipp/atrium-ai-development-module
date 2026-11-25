@@ -72,7 +72,7 @@ export const runnerApiEndpoints: AnyApiEndpoint[] = [
 		path: '/runner/register',
 		summary: 'Runner anmelden bzw. aktualisieren',
 		description:
-			'Legt den Runner zum API-Key an (Status `pending`, Freigabe durch die Verwaltung) oder aktualisiert Name, Version und Fähigkeiten. Konten werden je Schlüssel übernommen; nicht mehr gemeldete gelten als abgemeldet. `maxSlots` gilt nur beim ersten Anmelden.',
+			'Legt den Runner zum API-Key an (Status `pending`, Freigabe durch die Verwaltung) oder aktualisiert Name, Version und Fähigkeiten. Konten werden je Schlüssel übernommen; nicht mehr gemeldete gelten als abgemeldet. `maxSlots` wird übernommen, sobald der Runner einen anderen Wert als bei der letzten Anmeldung meldet; sonst bleibt ein von der Verwaltung gesetzter Wert erhalten.',
 		tags,
 		permission,
 		rateLimit: { limit: 60, windowSec: 60 },
