@@ -116,8 +116,17 @@ export const queueTask = (id: string) =>
 	apiFetch<TaskDto>(`${API}/tasks/${id}/queue`, { method: 'POST' });
 export const cancelTask = (id: string) =>
 	apiFetch<TaskDto>(`${API}/tasks/${id}/cancel`, { method: 'POST' });
-export const retryTask = (id: string) =>
-	apiFetch<TaskDto>(`${API}/tasks/${id}/retry`, { method: 'POST' });
+/**
+ * Optionen für den manuellen Neustart. `subtasks` gilt für Orchestrierungen: `'failed'` (Standard im Backend) startet
+ * nur fehlgeschlagene und abgebrochene Teilaufträge neu, `'all'` auch erledigte. Bewusst lokal definiert und nicht aus
+ * `../schemas` übernommen.
+ */
+export type RetryTaskOptions = { subtasks?: 'failed' | 'all' };
+export const retryTask = (id: string, opts?: RetryTaskOptions) =>
+	apiFetch<TaskDto>(`${API}/tasks/${id}/retry`, {
+		method: 'POST',
+		...(opts ? { body: json(opts) } : {})
+	});
 export const replyTask = (id: string, message: string) =>
 	apiFetch<TaskDto>(`${API}/tasks/${id}/reply`, { method: 'POST', body: json({ message }) });
 export const deleteTask = (id: string) => apiFetch<Ok>(`${API}/tasks/${id}`, { method: 'DELETE' });
