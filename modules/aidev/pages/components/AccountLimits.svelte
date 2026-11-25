@@ -82,7 +82,8 @@
 											'ml-1 font-medium',
 											v.tone === 'destructive' ? 'text-destructive' : 'text-warning'
 										)}>· {statusText}</span
-									>{/if}
+									>{/if}{#if v.w.stale && !limits.stale}
+									<span class="ml-1 font-medium text-warning">· veraltet</span>{/if}
 							</span>
 							<span
 								class={cn(

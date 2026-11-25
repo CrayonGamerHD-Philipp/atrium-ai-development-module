@@ -79,6 +79,23 @@ export function isStale(snapshot: LimitSnapshot, now: number): boolean {
 	return at == null || now - at > LIMIT_STALE_MS;
 }
 
+/**
+ * Beobachtungszeit eines Fensters (ms): eigene Zeit, höchstens die des Schnappschusses; ohne eigene Zeit die des
+ * Schnappschusses (ältere Runner). Ungültig → null.
+ */
+export function windowObservedAt(w: LimitWindow, snapshot: LimitSnapshot): number | null {
+	const snap = msOf(snapshot.observedAt);
+	const own = msOf(w.observedAt);
+	if (own == null) return snap;
+	return snap == null ? own : Math.min(own, snap);
+}
+
+/** Fenster älter als 30 Minuten (oder ohne gültige Beobachtungszeit)? */
+export function isWindowStale(w: LimitWindow, snapshot: LimitSnapshot, now: number): boolean {
+	const at = windowObservedAt(w, snapshot);
+	return at == null || now - at > LIMIT_STALE_MS;
+}
+
 /** Median (leere Liste → null) */
 export function median(values: number[]): number | null {
 	if (!values.length) return null;
@@ -100,6 +117,10 @@ export function forecastExhaustion(
 	const pts = points
 		.filter((p) => finite(p.ts) && finite(p.usedPercent))
 		.sort((a, b) => a.ts - b.ts);
+	const last = pts[pts.length - 1];
+	if (!last) return null;
+	// bereits erschöpft: auch mit nur einem Punkt bzw. ohne Anstieg
+	if (last.usedPercent >= 100) return last.ts < resetsAt ? Math.round(last.ts) : null;
 	if (pts.length < 2) return null;
 	const n = pts.length;
 	const mx = pts.reduce((s, p) => s + p.ts, 0) / n;
@@ -113,8 +134,7 @@ export function forecastExhaustion(
 	if (!(sxx > 0)) return null;
 	const slope = sxy / sxx; // Prozent je ms
 	if (!(slope > 0)) return null;
-	const last = pts[n - 1]!;
-	const at = last.usedPercent >= 100 ? last.ts : last.ts + (100 - last.usedPercent) / slope;
+	const at = last.ts + (100 - last.usedPercent) / slope;
 	if (!Number.isFinite(at) || at >= resetsAt) return null;
 	return Math.round(at);
 }
@@ -162,8 +182,8 @@ export function analyzeLimits(
 	now: number
 ): AccountLimitsDto {
 	const util = utilization(state);
-	const observedAt = msOf(snapshot.observedAt);
 	const windows: AccountLimitWindowDto[] = snapshot.windows.map((w) => {
+		const observedAt = windowObservedAt(w, snapshot);
 		const resetsAt = msOf(w.resetsAt);
 		let exhaustsAt: number | null = null;
 		if (resetsAt != null && resetsAt > now && finite(w.usedPercent)) {
@@ -182,6 +202,7 @@ export function analyzeLimits(
 			usedPercent: w.usedPercent,
 			resetsAt: w.resetsAt,
 			status: w.status,
+			stale: isWindowStale(w, snapshot, now),
 			estimatedUtil: estimatedUtilOf(w.window, state, util),
 			exhaustsAt: exhaustsAt == null ? null : new Date(exhaustsAt).toISOString()
 		};
@@ -197,8 +218,8 @@ export function analyzeLimits(
 }
 
 /**
- * Vom Anbieter gemeldete Auslastung (0..1, über 1 bei Overage) für den Scheduler. Nur aktuelle Daten (nicht
- * veraltet) und Fenster, deren Rücksetzzeit noch in der Zukunft liegt; `uWeek` = Maximum aus week/week-opus/
+ * Vom Anbieter gemeldete Auslastung (0..1, über 1 bei Overage) für den Scheduler. Nur aktuelle Daten (weder
+ * Schnappschuss noch Fenster veraltet) und Fenster, deren Rücksetzzeit noch in der Zukunft liegt; `uWeek` = Maximum aus week/week-opus/
  * week-sonnet. Kein Wert → null.
  */
 export function reportedUtil(
@@ -210,6 +231,7 @@ export function reportedUtil(
 	for (const w of snapshot.windows) {
 		const resetsAt = msOf(w.resetsAt);
 		if (resetsAt == null || resetsAt <= now || !finite(w.usedPercent)) continue;
+		if (isWindowStale(w, snapshot, now)) continue;
 		const u = w.usedPercent / 100;
 		if (w.window === '5h') result.u5h = Math.max(result.u5h ?? 0, u);
 		else if (WEEK_WINDOWS.has(w.window)) result.uWeek = Math.max(result.uWeek ?? 0, u);
@@ -219,14 +241,16 @@ export function reportedUtil(
 
 /**
  * Späteste Rücksetzzeit (ms) eines Fensters mit Status `rejected`, die noch in der Zukunft liegt – wirkt wie eine
- * Wartezeit. `other` (z. B. abgelehntes Overage) bleibt unberücksichtigt, weil das reguläre Kontingent dann noch
+ * Wartezeit. Nur aktuelle Daten (weder Schnappschuss noch Fenster veraltet), sonst könnte eine alte Ablehnung das
+ * Konto bis zum Wochen-Reset sperren. `other` (z. B. abgelehntes Overage) bleibt unberücksichtigt, weil das reguläre Kontingent dann noch
  * nutzbar sein kann. Keins → null.
  */
 export function rejectedUntil(snapshot: LimitSnapshot | null, now: number): number | null {
-	if (!snapshot) return null;
+	if (!snapshot || isStale(snapshot, now)) return null;
 	let until: number | null = null;
 	for (const w of snapshot.windows) {
 		if (w.status !== 'rejected' || w.window === 'other') continue;
+		if (isWindowStale(w, snapshot, now)) continue;
 		const resetsAt = msOf(w.resetsAt);
 		if (resetsAt != null && resetsAt > now) until = Math.max(until ?? 0, resetsAt);
 	}

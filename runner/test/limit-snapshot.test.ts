@@ -180,7 +180,8 @@ describe('LimitStore', () => {
 		expect(snap).toEqual({
 			observedAt: t(5).toISOString(),
 			source: 'probe',
-			windows: [w('5h', 10), w('week', 30)]
+			// älteres Fenster trägt seine eigene Beobachtungszeit
+			windows: [{ ...w('5h', 10), observedAt: t(0).toISOString() }, w('week', 30)]
 		});
 		expect(limitSnapshotSchema.parse(snap)).toEqual(snap);
 		expect(s.snapshot('b')?.windows).toEqual([w('5h', 70)]);
@@ -197,6 +198,18 @@ describe('LimitStore', () => {
 		const snap = s.snapshot('a');
 		expect(snap?.windows[0]).toMatchObject({ window: '5h', usedPercent: 95, status: 'rejected' });
 		expect(snap?.windows.filter((x) => x.window === 'other')).toHaveLength(2);
+	});
+
+	it('überträgt die Beobachtungszeit je Fenster, damit alte Fenster nicht durch neue frisch wirken', () => {
+		const s = new LimitStore();
+		s.update('a', [w('5h', 10), w('week', 90)], 'probe', t(0));
+		// der Stream meldet danach nur noch das 5h-Fenster
+		s.update('a', [w('5h', 20)], 'stream', t(60));
+		s.update('a', [w('5h', 30)], 'stream', t(120));
+		const snap = s.snapshot('a');
+		expect(snap?.observedAt).toBe(t(120).toISOString());
+		expect(snap?.windows).toEqual([w('5h', 30), { ...w('week', 90), observedAt: t(0).toISOString() }]);
+		expect(limitSnapshotSchema.parse(snap)).toEqual(snap);
 	});
 
 	it('hält höchstens 10 Fenster', () => {

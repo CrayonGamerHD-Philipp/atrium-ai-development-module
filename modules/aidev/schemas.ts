@@ -504,6 +504,8 @@ export interface AccountLimitWindowDto {
 	usedPercent: number | null;
 	resetsAt: string | null;
 	status: LimitWindow['status'];
+	/** Stand dieses Fensters älter als 30 min (fließt nicht in Scheduler-Entscheidungen ein) */
+	stale: boolean;
 	/** eigene Schätzung Atriums aus dem Verbrauch (0..1), nur für `5h` und `week` */
 	estimatedUtil: number | null;
 	/** Prognose, wann 100 % erreicht werden (`null` = nicht vor dem Reset bzw. unbekannt) */
