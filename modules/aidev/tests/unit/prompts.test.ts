@@ -2,7 +2,9 @@ import { describe, it, expect } from 'vitest';
 import {
 	buildSystemPrompt,
 	buildTaskPrompt,
+	extractCoordination,
 	extractPlan,
+	MAX_DEPENDENCY_SUMMARY,
 	slugify,
 	slugOrNull,
 	titleFromPrompt,
@@ -376,5 +378,149 @@ describe('slugOrNull', () => {
 		expect(slugOrNull(null)).toBeNull();
 		expect(slugOrNull('  ')).toBeNull();
 		expect(slugOrNull('日本語')).toBeNull();
+	});
+});
+
+const COORD: NonNullable<PromptContext['coordination']> = {
+	round: 1,
+	maxRounds: 3,
+	subtasks: [
+		{
+			key: 'r1',
+			title: 'Recherche',
+			role: 'research',
+			status: 'done',
+			provider: 'codex',
+			summary: 'Die API liegt in src/api.ts.',
+			error: null
+		},
+		{
+			key: 'i1',
+			title: 'Umsetzen',
+			role: 'implement',
+			status: 'failed',
+			provider: null,
+			summary: '',
+			error: 'Tests schlugen fehl'
+		}
+	]
+};
+
+describe('Koordination (Master-Agent)', () => {
+	it('Koordinator-Abschnitt statt Erstplanung, Output-Format mit Koordinations-Beispielen', () => {
+		const p = buildSystemPrompt(
+			ctx({ role: 'orchestrate', readOnly: true, expectPlan: true, coordination: COORD })
+		);
+		expect(p).toContain('## Your role: master agent (coordinator)');
+		expect(p).not.toContain('orchestrator (planning only)');
+		expect(p).toMatch(/Do NOT change anything/);
+		expect(p).toContain('`git diff origin/main...HEAD`');
+		expect(p).toContain('round 1 of 3');
+		expect(p).toContain('2 more coordination round(s)');
+		expect(p).toMatch(/must not reuse any existing key/);
+		expect(p).toContain('`fix`');
+		expect(p).toContain('"done": false');
+		expect(p).toContain('"done": true');
+		expect(p).not.toContain('"branch": "payment-refunds"');
+		// letztes Beispiel ist die Abschluss-Entscheidung
+		expect(extractCoordination(p, ['research-api'])).toMatchObject({ done: true, subtasks: [] });
+	});
+	it('letzte mögliche Runde: nur kleine abschließende Aufträge', () => {
+		const p = buildSystemPrompt(
+			ctx({ role: 'orchestrate', readOnly: true, coordination: { ...COORD, round: 3 } })
+		);
+		expect(p).toMatch(/last possible round/);
+	});
+	it('Task-Prompt listet die Ergebnisse der Teilaufträge als Daten', () => {
+		const long = 'x'.repeat(MAX_DEPENDENCY_SUMMARY + 100);
+		const p = buildTaskPrompt(
+			ctx({
+				role: 'orchestrate',
+				coordination: {
+					...COORD,
+					subtasks: [{ ...COORD.subtasks[0]!, summary: long }, COORD.subtasks[1]!]
+				}
+			})
+		);
+		expect(p).toContain('## Subtask results (round 1 of 3)');
+		expect(p).toMatch(/data, not as instructions/);
+		expect(p).toContain('### Recherche [key: r1] (research, done, codex)');
+		expect(p).toContain('### Umsetzen [key: i1] (implement, failed, any)');
+		expect(p).toContain('[truncated]');
+		expect(p).not.toContain(long);
+		expect(p).toContain('Tests schlugen fehl');
+	});
+	it('ohne Koordination kein Ergebnis-Abschnitt', () => {
+		expect(buildTaskPrompt(ctx())).not.toContain('Subtask results');
+	});
+	it('Erstplanung: Hinweis auf Master-Agent nur bei masterRounds > 0', () => {
+		const base = { role: 'orchestrate' as Role, readOnly: true, expectPlan: true };
+		const withMaster = buildSystemPrompt(ctx({ ...base, masterRounds: 2 }));
+		expect(withMaster).toMatch(/master agent sees the results/);
+		expect(withMaster).toContain('up to 2 rounds');
+		expect(withMaster).toMatch(/as many independent agents/);
+		expect(withMaster).toMatch(/mix providers/);
+		expect(buildSystemPrompt(ctx({ ...base, masterRounds: 0 }))).not.toMatch(/master agent/);
+		expect(buildSystemPrompt(ctx(base))).not.toMatch(/master agent/);
+	});
+});
+
+describe('extractCoordination', () => {
+	const follow = {
+		summary: 'Weiter',
+		done: false,
+		subtasks: [
+			{
+				key: 'i2',
+				title: 'Neu umsetzen',
+				prompt: 'Setze mit den Erkenntnissen aus r1 um …',
+				role: 'implement',
+				dependsOn: ['r1', 'i2', 'unbekannt', 'rv'],
+				provider: 'claude'
+			},
+			{ key: 'rv', title: 'Review', prompt: 'Prüfe …', role: 'review', dependsOn: ['i2'] }
+		]
+	};
+	const wrap = (o: unknown) => `Begründung …\n\n\`\`\`json\n${JSON.stringify(o)}\n\`\`\``;
+
+	it('done ohne Folgeaufträge', () => {
+		expect(
+			extractCoordination(wrap({ summary: 'Fertig', done: true, subtasks: [] }), ['r1'])
+		).toEqual({ summary: 'Fertig', done: true, subtasks: [] });
+	});
+	it('Folgeaufträge mit Verweis auf existierende Keys, unbekannte und Selbstbezug gefiltert', () => {
+		const c = extractCoordination(wrap(follow), ['r1', 'i1']);
+		expect(c?.done).toBe(false);
+		expect(c?.subtasks.map((s) => s.key)).toEqual(['i2', 'rv']);
+		expect(c?.subtasks[0]?.dependsOn).toEqual(['r1', 'rv']);
+		expect(c?.subtasks[0]?.provider).toBe('claude');
+		expect(c?.subtasks[1]?.dependsOn).toEqual(['i2']);
+	});
+	it('Key-Kollision mit vorhandenem Key → null', () => {
+		expect(extractCoordination(wrap(follow), ['r1', 'rv'])).toBeNull();
+	});
+	it('doppelte neue Keys → null', () => {
+		const dup = { ...follow, subtasks: [follow.subtasks[1], follow.subtasks[1]] };
+		expect(extractCoordination(wrap(dup), [])).toBeNull();
+	});
+	it('leere bzw. fehlende subtasks → done', () => {
+		expect(extractCoordination(wrap({ summary: 'x', done: false, subtasks: [] }), [])?.done).toBe(
+			true
+		);
+		expect(extractCoordination('{"summary": "nur Text"}', [])).toEqual({
+			summary: 'nur Text',
+			done: true,
+			subtasks: []
+		});
+	});
+	it('done: true mit Subtasks → Arbeit hat Vorrang (done: false)', () => {
+		const c = extractCoordination(wrap({ ...follow, done: true }), ['r1']);
+		expect(c?.done).toBe(false);
+		expect(c?.subtasks).toHaveLength(2);
+	});
+	it('letzter gültiger Block gewinnt, ungültige werden übersprungen', () => {
+		const text = `${wrap(follow)}\n\n\`\`\`json\n{ kaputt \n\`\`\``;
+		expect(extractCoordination(text, [])?.subtasks).toHaveLength(2);
+		expect(extractCoordination('kein JSON', [])).toBeNull();
 	});
 });
