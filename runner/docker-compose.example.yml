@@ -35,6 +35,10 @@ services:
       GIT_AUTHOR_NAME: Atrium Agent
       GIT_AUTHOR_EMAIL: agent@atrium.local
       LOG_LEVEL: info
+      # Aktive Limit-Abfrage für Claude-Konten mit OAuth-Login (Standard: an, alle 5 min; undokumentierter Endpunkt).
+      # Das Token bleibt auf dem Runner, an Atrium gehen nur die Limit-Werte.
+      # LIMIT_PROBE: 'false'
+      # LIMIT_PROBE_MIN: '5'
     volumes:
       - ./config:/config:ro
       - runner-work:/work

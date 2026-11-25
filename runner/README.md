@@ -164,6 +164,33 @@ Fenster zusätzlich mit `/limit` an Atrium. Quellen (Abbildung in `src/providers
 - **Fehlermeldungen**: Ohne Stand aus dem Stream wird ein erkannter 5-Stunden- bzw. Wochen-Treffer als gesperrtes
   Fenster (`source: error`) übernommen.
 
+Unterstützte Anbieter:
+
+| Anbieter | Lauf (`source: stream`) | Aktive Abfrage (`source: probe`) | Fehlermeldung (`source: error`) |
+|---|---|---|---|
+| `claude` | ja | ja, nur mit OAuth-Login (Abo), nicht mit reinem `ANTHROPIC_API_KEY` | ja |
+| `codex` | ja, nur mit ChatGPT-Login (Stream bzw. Sitzungsdatei) | nein | ja |
+| `gemini`, `openai-api` | nein | nein | ja |
+| `fake` | ja (5h-Stand für Demo und Tests) | nein | – |
+
+Ohne gemeldeten Stand rechnet Atrium für das Konto nur mit der eigenen Schätzung über die Budgets. Die Auswertung in
+Atrium beschreibt die [Limit-Analyse](../README.md#limit-analyse).
+
+Konfiguration der aktiven Abfrage (siehe auch die Tabellen unter [Konfiguration](#2-konfiguration)):
+
+| Option | Bedeutung | Standard |
+|---|---|---|
+| `LIMIT_PROBE` / Datei `limitProbe` | für alle Konten an oder aus (`true`/`false`, in der Umgebung auch `1`/`0`) | an für Claude-Konten mit OAuth-Login, sonst aus |
+| `LIMIT_PROBE_MIN` / Datei `limitProbeMin` | Abstand in Minuten (1–1440) | `5` |
+| `accounts[].limitProbe` | Schalter je Konto, hat Vorrang | – |
+
+Der OAuth-Endpunkt ist nicht offiziell dokumentiert. Prüfe vor dem Einsatz die Nutzungsbedingungen deines Abos; wer
+ihn nicht nutzen will, setzt `LIMIT_PROBE=false`. Die Stände aus den Läufen kommen trotzdem weiter an.
+
+**Datenschutz**: An Atrium gehen je Konto nur Fenster (`window`, `label`), Auslastung in Prozent, Rücksetzzeit, Status
+(`allowed`, `warning`, `rejected`, `unknown`), Quelle und Beobachtungszeit. OAuth-Tokens, Logins und der übrige Inhalt
+der Codex-Sitzungsdateien bleiben auf dem Runner. Die aktive Abfrage spricht nur `api.anthropic.com` an.
+
 ## Sicherheit
 
 - **Agents laufen ohne Rückfragen** (`--dangerously-skip-permissions`, `--dangerously-bypass-approvals-and-sandbox`,
@@ -181,6 +208,9 @@ Fenster zusätzlich mit `/limit` an Atrium. Quellen (Abbildung in `src/providers
   Branches unter Branch-Protection, muss das Token dort pushen dürfen.
 - **Zugangsdaten bleiben auf dem Runner**: CLI-Logins, gh-Token und API-Keys werden nie an Atrium übertragen. Der
   API-Key des Runners wird nicht an Agents, Projektbefehle oder Terminals weitergegeben.
+- **Limit-Abfrage**: Das OAuth-Token eines Claude-Kontos wird nur lokal gelesen (`CLAUDE_CODE_OAUTH_TOKEN` bzw.
+  `<CLAUDE_CONFIG_DIR>/.credentials.json`), nie erneuert, nie protokolliert und nie an Atrium gesendet. Im Heartbeat
+  stehen nur die Limit-Werte (siehe [Limit-Stand](#limit-stand)). Abschalten mit `LIMIT_PROBE=false`.
 - **Bereinigung**: Alle hochgeladenen Texte (Ereignisse, Fehlermeldungen, Diffs, Terminal-Ausgabe) werden von Tokens
   befreit (`ghp_`, `gho_`, `github_pat_`, `sk-`, `sk-ant-`, `AIza…`, `xox…`, `Bearer …`, AWS-Keys, Zugangsdaten in
   URLs, der eigene API-Key und alle Werte aus `env`/`apiKeyEnv`) → `[entfernt]`. Ausnahme: Dateiinhalte für den Editor
