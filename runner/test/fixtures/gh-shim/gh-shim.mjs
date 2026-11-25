@@ -1,4 +1,5 @@
-// Kleiner Ersatz für die GitHub-CLI in Tests: simuliert `pr create|view|merge|list`, `repo view` und `--version`.
+// Kleiner Ersatz für die GitHub-CLI in Tests: simuliert `pr create|view|merge|list|comment`, `api …/pulls/<n>/comments`,
+// `repo view` und `--version`.
 // Zustand in der JSON-Datei aus GH_SHIM_STATE.
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 
@@ -56,7 +57,54 @@ if (args[0] === 'pr' && args[1] === 'view') {
 		process.stderr.write(`no pull requests found for branch "${args[2]}"\n`);
 		process.exit(1);
 	}
-	process.stdout.write(JSON.stringify({ number: pr.number, url: pr.url }) + '\n');
+	if (pr.failView) {
+		process.stderr.write('HTTP 502: Bad Gateway\n');
+		process.exit(1);
+	}
+	process.stdout.write(
+		JSON.stringify({
+			number: pr.number,
+			url: pr.url,
+			title: pr.title,
+			body: pr.body ?? '',
+			state: pr.state,
+			headRefName: pr.head,
+			baseRefName: pr.base,
+			isCrossRepository: pr.isCrossRepository ?? false,
+			comments: pr.comments ?? [],
+			reviews: pr.reviews ?? []
+		}) + '\n'
+	);
+	process.exit(0);
+}
+
+if (args[0] === 'pr' && args[1] === 'comment') {
+	const repo = opt('--repo');
+	const pr = state.prs.find((p) => p.repo === repo && String(p.number) === args[2]);
+	if (!pr || pr.failComment) {
+		save();
+		process.stderr.write('pull request not found\n');
+		process.exit(1);
+	}
+	const body = opt('--body-file') === '-' ? readStdin() : (opt('--body') ?? '');
+	pr.comments = [...(pr.comments ?? []), { author: { login: 'atrium-agent' }, body }];
+	save();
+	process.stdout.write(`${pr.url}#issuecomment-1\n`);
+	process.exit(0);
+}
+
+if (args[0] === 'api') {
+	const m = /^repos\/([^/]+\/[^/]+)\/pulls\/(\d+)\/comments$/.exec(args[1] ?? '');
+	const pr = m && state.prs.find((p) => p.repo === m[1] && String(p.number) === m[2]);
+	save();
+	if (!pr) {
+		process.stderr.write('HTTP 404: Not Found\n');
+		process.exit(1);
+	}
+	// wie `--paginate`: Seiten als aneinandergehängte JSON-Arrays
+	const all = pr.inlineComments ?? [];
+	process.stdout.write(all.length > 1 ? JSON.stringify(all.slice(0, 1)) + JSON.stringify(all.slice(1)) : JSON.stringify(all));
+	process.stdout.write('\n');
 	process.exit(0);
 }
 
