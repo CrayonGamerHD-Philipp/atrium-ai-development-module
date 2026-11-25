@@ -124,7 +124,8 @@ async function promptContext(tx: Tx, task: Row, project: Row, role: Role): Promi
 	return {
 		role,
 		question: task.chat_question === true,
-		chatContext: String(task.chat_context ?? ''),
+		// Teilaufträge einer Orchestrierung aus dem Chat sehen den Gesprächsverlauf des Elternauftrags
+		chatContext: String(task.chat_context ?? '') || String(parent?.chat_context ?? ''),
 		project: {
 			name: String(project.name),
 			repoOwner: String(project.repo_owner),

@@ -1,7 +1,7 @@
 /** Projekt-Chat: Verlauf (neueste zuerst) und neue Nachricht – im Modus `task` wird daraus ein Auftrag. */
 import { sql } from 'drizzle-orm';
 import { type AnyApiEndpoint, defineEndpoint, rowsOf } from '$lib/sdk/server';
-import { mdb, oneOf } from './db';
+import { mdb, oneOf, type Tx } from './db';
 import { newEffects } from './effects';
 import { chatDto } from './mappers';
 import { publish, userNames } from './publish.service';
@@ -19,6 +19,27 @@ import {
 } from './schemas';
 
 const tags = ['Modul: aidev – Chat'];
+
+/**
+ * Bisheriger Frage-/Antwort-Verlauf des Projekts (älteste zuerst) als Kontext für einen neuen Auftrag:
+ * die letzten 12 Nachrichten aus Chat-Fragen, je höchstens 2000 und insgesamt 12000 Zeichen.
+ * Vor dem Einfügen der neuen Nachricht aufrufen, damit sie nicht selbst im Verlauf steht.
+ */
+async function chatHistoryContext(tx: Tx, projectId: string): Promise<string> {
+	const history = await rowsOf(
+		tx,
+		sql`SELECT m.kind, m.body FROM chat_message m
+			JOIN task t ON t.id = m.task_id
+			WHERE m.project_id = ${projectId} AND t.chat_question = true
+			AND m.kind IN ('user', 'agent')
+			ORDER BY m.created_at DESC, m.id DESC LIMIT 12`
+	);
+	return history
+		.reverse()
+		.map((m) => `${m.kind === 'user' ? 'Question' : 'Answer'}: ${String(m.body).slice(0, 2000)}`)
+		.join('\n\n')
+		.slice(-12000);
+}
 
 export const chatEndpoints: AnyApiEndpoint[] = [
 	defineEndpoint({
@@ -75,25 +96,13 @@ export const chatEndpoints: AnyApiEndpoint[] = [
 						})
 					);
 				}
-				if (body.mode === 'question' && taskId) {
-					const history = await rowsOf(
-						tx,
-						sql`SELECT m.kind, m.body FROM chat_message m
-						JOIN task t ON t.id = m.task_id
-						WHERE m.project_id = ${params.id} AND t.chat_question = true
-						AND m.kind IN ('user', 'agent')
-						ORDER BY m.created_at DESC, m.id DESC LIMIT 12`
-					);
-					const context = history
-						.reverse()
-						.map(
-							(m) =>
-								`${m.kind === 'user' ? 'Question' : 'Answer'}: ${String(m.body).slice(0, 2000)}`
-						)
-						.join('\n\n')
-						.slice(-12000);
+				if (taskId) {
+					// Fragen und Aufträge sehen den bisherigen Frage-/Antwort-Verlauf; nur Fragen sind Chat-Fragen
+					const context = await chatHistoryContext(tx, params.id);
 					await tx.execute(
-						sql`UPDATE task SET chat_question = true, chat_context = ${context} WHERE id = ${taskId}`
+						body.mode === 'question'
+							? sql`UPDATE task SET chat_question = true, chat_context = ${context} WHERE id = ${taskId}`
+							: sql`UPDATE task SET chat_context = ${context} WHERE id = ${taskId}`
 					);
 				}
 				const id = await insertChat(tx, fx, {
