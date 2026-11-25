@@ -10,7 +10,8 @@ committen, pushen und öffnen Pull Requests. Unterstützt werden:
 - **OpenAI-kompatible API**
 
 Ein Scheduler verteilt die Arbeit über mehrere Projekte und Agents gleichzeitig. Er lastet die Abos gleichmäßig aus und
-achtet auf das 5-Stunden-Fenster, die Woche und Limits.
+achtet auf das 5-Stunden-Fenster, die Woche und Limits. Die [Limit-Analyse](#limit-analyse) zeigt dazu den echten
+Limit-Stand der Anbieter mit Prognose und Budgetvorschlag.
 
 ## Aufbau
 
@@ -100,6 +101,45 @@ der Scheduler parallel auf freie Konten und Runner. Welcher Anbieter welche Roll
 **Administration → KI-Verteilung** ein. Der Orchestrator setzt `provider` für einen Teilauftrag nur, wenn ein Anbieter
 dafür klar geeignet ist; sonst gilt die Verteilung.
 
+### Limit-Analyse
+
+Neben der eigenen Schätzung über die Budgets wertet Atrium den **echten Limit-Stand der Anbieter** aus. Du siehst ihn
+in der Übersicht **Auslastung der Konten** und unter **Administration → Runner & Konten** im Kasten „Limits laut
+Anbieter“.
+
+Woher die Daten kommen:
+
+- Der Runner liest den Stand aus den Läufen mit (Claude `rate_limit_event`, Codex `rate_limits`). Für Claude-Konten mit
+  OAuth-Login fragt er ihn zusätzlich alle 5 Minuten aktiv ab, wenn kein frischer Stand aus einem Lauf vorliegt.
+- Er sendet den Stand im Heartbeat (`accounts[].limits`) und bei einem Limit-Treffer mit `/limit`. Tokens und Logins
+  verlassen den Runner dabei nie, übertragen werden nur Fenster, Prozentwerte, Rücksetzzeiten und Status.
+- Unterstützt sind **Claude** (Stream und Abfrage) und **Codex** mit ChatGPT-Login (Stream bzw. Sitzungsdatei).
+  Gemini und `openai-api` melden keinen Stand; dort gilt weiter nur die eigene Schätzung. Details und Schalter:
+  [`runner/README.md`](runner/README.md#limit-stand).
+
+Was Atrium daraus macht (`modules/aidev/limits.ts`, Speicherung in `limits.service.ts`, Migration `0005`):
+
+- **Speichern**: Je Konto wird der neueste Stand gehalten; ältere Meldungen werden ignoriert. Dazu kommt höchstens alle
+  5 Minuten eine Probe je Fenster mit dem Verbrauch laut Ledger. Proben älter als 14 Tage löscht der Job `retention`.
+- **Aktualität**: Ein Stand älter als 30 Minuten gilt als **veraltet** und wird so angezeigt.
+- **Prognose**: Aus den Proben der aktuellen Periode (gleiche Rücksetzzeit) wird linear hochgerechnet, wann das
+  Fenster 100 % erreicht („voraussichtlich erschöpft um …“). Nur bei steigender Nutzung und vor der Rücksetzzeit.
+- **Budgetvorschlag**: Median von `Einheiten im Fenster / gemeldete Auslastung` aus den Proben der letzten 7 Tage mit
+  mindestens 10 % Auslastung, getrennt für 5 Stunden und Woche. Im Konto-Dialog übernimmt „Vorschlag übernehmen“ die
+  Werte in die Budget-Felder; gespeichert wird erst mit „Speichern“.
+- **Abgleich**: Weichen eigene Schätzung und Meldung um mehr als 15 Prozentpunkte ab, weist die Oberfläche darauf hin.
+
+Im Scheduler:
+
+- Ob ein Konto noch Aufträge bekommt, prüft er gegen das **Maximum aus eigener Schätzung und aktueller Meldung**
+  (5 Stunden; Woche als Maximum aus `week`, `week-opus` und `week-sonnet`). Veraltete Meldungen zählen nicht.
+- Ein Fenster mit Status `rejected` und Rücksetzzeit in der Zukunft sperrt das Konto bis dahin, wie eine Wartezeit –
+  auch bei veralteten Daten. Ausnahme ist `other` (z. B. Overage), weil das reguläre Kontingent dann oft noch reicht.
+- Die Meldung wirkt nur beim Ausschluss, nicht bei der Auswahl, welches Konto einen Auftrag bekommt.
+
+Ältere Runner ohne die Fähigkeit `limitReport` funktionieren weiter. Für ihre Konten steht „Keine Limit-Daten vom
+Runner“, und es gilt nur die eigene Schätzung.
+
 ## Entwicklung
 
 ```bash
@@ -126,6 +166,8 @@ anschließend unter **Runner & Konten** frei.
   Runner-Container, nie auf dem Atrium-Host.
 - CLI-Logins, das GitHub-Token und API-Keys bleiben auf dem Runner. Atrium sieht sie nie. Ausgaben werden vor dem
   Hochladen bereinigt (`runner/src/redact.ts`).
+- Für die [Limit-Analyse](#limit-analyse) sendet der Runner nur Limit-Werte (Fenster, Prozent, Rücksetzzeit, Status).
+  Die aktive Claude-Abfrage nutzt das OAuth-Token lokal und lässt sich mit `LIMIT_PROBE=false` abschalten.
 - Verwende ein fine-grained PAT, das nur für die gewählten Repos gilt, und Branch-Protection auf `main`.
 - Terminal und Dateieditor geben vollen Zugriff auf die Arbeitskopie des Runners, also eigene Rechte
   (`aidev.workspace.terminal`, `aidev.workspace.files`). Jede Sitzung wird protokolliert.
