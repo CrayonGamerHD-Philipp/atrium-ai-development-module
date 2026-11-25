@@ -32,6 +32,8 @@ await build({
 	format: 'esm',
 	target: 'node22',
 	sourcemap: true,
+	// Runner-tsconfig auch für `modules/aidev/protocol.ts` (die Root-tsconfig erweitert das ggf. fehlende `.core`)
+	tsconfig: resolve(root, 'tsconfig.json'),
 	external: ['node-pty'],
 	plugins: [zodFromRunner],
 	define: { __RUNNER_VERSION__: JSON.stringify(pkg.version) },
