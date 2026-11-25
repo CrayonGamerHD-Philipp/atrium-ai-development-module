@@ -431,8 +431,13 @@ export async function applyPlan(
 		}
 	}
 	const stored: StoredPlan = { ...plan, delivered: false };
+	// Bestehender PR: dessen Head-Branch bleibt der Integrations-Branch (Ausliefern pusht in den PR)
+	const integrationBranch =
+		parent.target_pr !== null && parent.target_pr !== undefined && str(parent.branch)
+			? String(parent.branch)
+			: topBranchOf(parent);
 	await tx.execute(
-		sql`UPDATE task SET plan = ${jsonb(stored)}, branch = ${topBranchOf(parent)},
+		sql`UPDATE task SET plan = ${jsonb(stored)}, branch = ${integrationBranch},
 				base_ref = ${null}, updated_at = now()
 			WHERE id = ${parent.id}`
 	);

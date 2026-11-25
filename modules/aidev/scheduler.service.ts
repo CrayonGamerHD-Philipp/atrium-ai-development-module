@@ -13,6 +13,8 @@
  * - Auftrag mit `target_pr` (bestehenden PR bearbeiten): `createTask` setzt `branch` = Head-Branch des PR und
  *   `base_ref` = Haupt-Branch; `branchPlan` übernimmt beides. Bei `orchestrate` wird der PR-Branch so zum
  *   Integrations-Branch (Teilaufträge zweigen von ihm ab und werden hineingemergt), das Ausliefern pusht in den PR.
+ *   Teilaufträge erhalten dafür `integrate` mit `pullNumber` (PR-Prüfung, keine Neuanlage des Branchs, nur Runner
+ *   mit `prUpdate`); das Ausliefern erhält `pr-update` mit `integrated`, sobald Teilaufträge Commits gemergt haben.
  */
 import { sql } from 'drizzle-orm';
 import { inList, logBestEffort, num, rowsOf, str, toIso, type Row } from '$lib/sdk/server';
@@ -86,9 +88,19 @@ export async function deliveryOf(tx: Tx, task: Row, project: Row, depth = 0): Pr
 		return deliveryOf(tx, parent, project, depth + 1);
 	}
 	if (parent && parent.role === 'orchestrate') {
-		return { mode: 'integrate', integrationBranch: str(parent.branch) ?? topBranchOf(parent) };
+		const integrationBranch = str(parent.branch) ?? topBranchOf(parent);
+		// Integrations-Branch = Head-Branch eines PR: Runner prüft den PR und legt den Branch nie neu an
+		return parent.target_pr
+			? { mode: 'integrate', integrationBranch, pullNumber: num(parent.target_pr) }
+			: { mode: 'integrate', integrationBranch };
 	}
-	if (task.target_pr) return { mode: 'pr-update', number: num(task.target_pr) };
+	if (task.target_pr) {
+		const number = num(task.target_pr);
+		// Abschluss einer Orchestrierung: Teilaufträge haben ihre Änderungen schon in den PR-Branch gemergt
+		if (planOf(task) && (await hasIntegratedChanges(tx, String(task.id))))
+			return { mode: 'pr-update', number, integrated: true };
+		return { mode: 'pr-update', number };
+	}
 	if (task.delivery === 'branch') return { mode: 'branch' };
 	const policy = String(project.commit_policy);
 	if (policy === 'direct') return { mode: 'direct' };
@@ -98,6 +110,20 @@ export async function deliveryOf(tx: Tx, task: Row, project: Row, depth = 0): Pr
 		title: clip(String(task.title), 200),
 		body: clip(`${clip(String(task.prompt), 4000)}\n\n---\nAidev-Task: ${String(task.id)}`, 20_000)
 	};
+}
+
+/** Hat ein Teilauftrag (oder dessen Konfliktlösung) Commits erfolgreich in den Integrations-Branch gemergt? */
+async function hasIntegratedChanges(tx: Tx, parentId: string): Promise<boolean> {
+	const row = await oneOf(
+		tx,
+		sql`SELECT 1 FROM run r JOIN task t ON t.id = r.task_id
+			WHERE r.status = 'succeeded'
+				AND EXISTS (SELECT 1 FROM run_commit c WHERE c.run_id = r.id)
+				AND (t.parent_id = ${parentId}
+					OR t.parent_id IN (SELECT id FROM task WHERE parent_id = ${parentId}))
+			LIMIT 1`
+	);
+	return !!row;
 }
 
 const DELIVER_PROMPT = (branch: string, prompt: string) =>
@@ -289,18 +315,23 @@ async function dispatchIn(tx: Tx, fx: Effects, settings: AidevSettings): Promise
 		new Set(runnerCaps.filter((r) => r[key] === true).map((r) => String(r.id)));
 	const questionRunners = runnersWith('question');
 	// Auslieferungsarten, die nicht jeder Runner kennt (gemischte Runner-Versionen beim Upgrade)
-	const modeRunners: Partial<Record<Delivery['mode'], Set<string>>> = {
-		branch: runnersWith('branch'),
-		'pr-update': runnersWith('pr_update')
+	const branchRunners = runnersWith('branch');
+	const prRunners = runnersWith('pr_update');
+	const capsFor = (d: Delivery): Set<string> | null => {
+		if (d.mode === 'branch') return branchRunners;
+		if (d.mode === 'pr-update') return prRunners;
+		// Merge in den Head-Branch eines PR: nur Runner, die den PR prüfen und den Branch nie neu anlegen
+		if (d.mode === 'integrate' && d.pullNumber !== undefined) return prRunners;
+		return null;
 	};
 	const restricted = new Map<string, Set<string>>();
-	// Nur diese Zeilen können eine solche Auslieferung haben (Konfliktlösungen erben sie vom Elternauftrag).
-	// Teilaufträge liefern immer `integrate` (Merge ohne Force-Push, auch in einen PR-Branch) und entfallen.
+	// Nur diese Zeilen können eine solche Auslieferung haben (Konfliktlösungen erben sie vom Elternauftrag,
+	// Teilaufträge einer PR-Orchestrierung mergen in den PR-Branch).
 	const maybeRestricted = rows.filter(
 		(r) =>
-			r.role === 'resolve' ||
-			(!r.parent_id &&
-				(r.delivery === 'branch' || (r.target_pr !== null && r.target_pr !== undefined)))
+			!!r.parent_id ||
+			r.delivery === 'branch' ||
+			(r.target_pr !== null && r.target_pr !== undefined)
 	);
 	if (maybeRestricted.length) {
 		const projects = new Map(
@@ -314,7 +345,7 @@ async function dispatchIn(tx: Tx, fx: Effects, settings: AidevSettings): Promise
 		for (const r of maybeRestricted) {
 			const project = projects.get(String(r.project_id));
 			if (!project) continue;
-			const caps = modeRunners[(await deliveryOf(tx, r, project)).mode];
+			const caps = capsFor(await deliveryOf(tx, r, project));
 			if (caps) restricted.set(String(r.id), caps);
 		}
 	}

@@ -943,6 +943,123 @@ describe('aidev', () => {
 		}
 	});
 
+	it('Orchestrierung eines PR: Teilaufträge mit PR-Schutz, Abschluss meldet den PR', async () => {
+		const parent = await createTask({
+			prompt: 'PR 101 in Teilen überarbeiten',
+			targetPr: 101,
+			decompose: true
+		});
+		const plan = await offerFor(parent.id);
+		expect(plan).toMatchObject({ readOnly: true, expectPlan: true, delivery: { mode: 'none' } });
+		ok(await call('runner', 'POST', `/runner/runs/${plan.runId}/accept`), 201);
+		ok(
+			await finish(plan.runId, {
+				status: 'succeeded',
+				plan: {
+					summary: 'Ein Teil',
+					subtasks: [{ key: 'a', title: 'Teil A', prompt: 'Baue A', role: 'implement' }]
+				}
+			}),
+			201
+		);
+		const [child] = (await task(parent.id)).children;
+
+		// Teilauftrag mergt in den PR-Branch → nur an Runner mit `prUpdate`
+		const runners = ok<RunnerDto[]>(await call('admin', 'GET', '/runners'));
+		const old = runners.find((r) => r.id !== runnerId && !r.capabilities.prUpdate)!;
+		ok(await call('admin', 'PATCH', `/runners/${old.id}`, { maxSlots: 4 }));
+		ok(await heartbeat('runner2'), 201);
+		ok(await call('admin', 'PATCH', `/runners/${runnerId}`, { maxSlots: 0 }));
+		try {
+			expect((await offers('runner2')).map((o) => o.taskId)).not.toContain(child!.id);
+		} finally {
+			ok(await call('admin', 'PATCH', `/runners/${runnerId}`, { maxSlots: 4 }));
+			ok(await call('admin', 'PATCH', `/runners/${old.id}`, { maxSlots: 0 }));
+		}
+		const sub = await offerFor(child!.id);
+		expect(sub).toMatchObject({ baseRef: 'feature/x', readOnly: false });
+		expect(sub.delivery).toEqual({
+			mode: 'integrate',
+			integrationBranch: 'feature/x',
+			pullNumber: 101
+		});
+		ok(await call('runner', 'POST', `/runner/runs/${sub.runId}/accept`), 201);
+		ok(
+			await finish(sub.runId, {
+				status: 'succeeded',
+				summary: 'A gebaut',
+				merged: true,
+				commits: [{ sha: 'abcdef1', message: 'Teil A' }]
+			}),
+			201
+		);
+
+		// Abschluss: Änderungen liegen schon im PR-Branch → `integrated`
+		const deliver = await offerFor(parent.id);
+		expect(deliver).toMatchObject({ branch: 'feature/x', readOnly: false });
+		expect(deliver.delivery).toEqual({ mode: 'pr-update', number: 101, integrated: true });
+		ok(await call('runner', 'POST', `/runner/runs/${deliver.runId}/accept`), 201);
+		ok(
+			await finish(deliver.runId, {
+				status: 'succeeded',
+				summary: 'Integration geprüft',
+				branch: 'feature/x',
+				branchPushed: true,
+				pr: { number: 101, url: 'https://github.com/acme/widgets/pull/101' }
+			}),
+			201
+		);
+		expect((await task(parent.id)).task).toMatchObject({
+			status: 'review',
+			prNumber: 101,
+			branchPushed: true
+		});
+	});
+
+	it('PR-Sync überträgt den Merge auf alle Aufträge desselben PR', async () => {
+		const reviewing = await q<{ id: string }>(
+			sql`SELECT id FROM task WHERE project_id = ${projectId} AND pr_number = 101
+				AND status = 'review'`
+		);
+		// Auftrag aus „Bestehenden PR bearbeiten“ und die PR-Orchestrierung
+		expect(reviewing.length).toBeGreaterThanOrEqual(2);
+		const stream = await openStream<RunnerCommand>(keys.runner!, '/runner/stream?client=main');
+		await stream.waitFor('hello');
+		try {
+			const sync = call('admin', 'POST', `/projects/${projectId}/pulls/sync`);
+			const rpc = (await stream.waitFor(
+				'rpc',
+				(e) => (e as Extract<RunnerCommand, { type: 'rpc' }>).op === 'gh.pr-list'
+			)) as Extract<RunnerCommand, { type: 'rpc' }>;
+			const pr = {
+				number: 101,
+				title: 'Offen',
+				branch: 'feature/x',
+				state: 'merged',
+				isDraft: false,
+				mergeable: 'MERGEABLE',
+				checks: 'passing',
+				autoMerge: false,
+				url: 'https://github.com/acme/widgets/pull/101',
+				additions: 1,
+				deletions: 0,
+				createdAt: '',
+				updatedAt: ''
+			};
+			ok(
+				await call('runner', 'POST', `/runner/rpc/${rpc.reqId}`, {
+					ok: true,
+					result: { pulls: [pr] }
+				}),
+				201
+			);
+			ok(await sync, 201);
+		} finally {
+			stream.close();
+		}
+		for (const r of reviewing) expect((await task(r.id)).task.status).toBe('done');
+	});
+
 	it('SSE: Projekt-Stream und Runner-Stream mit RPC (Repo prüfen)', async () => {
 		const live = await openStream<{ type: string }>(
 			keys.admin!,
