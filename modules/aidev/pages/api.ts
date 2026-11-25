@@ -8,6 +8,7 @@ import type { gitStatusResult, WorkspaceTarget } from '../protocol';
 import type {
 	AccountDto,
 	AccountPatch,
+	ChatActionDecision,
 	ChatInput,
 	ChatMessageDto,
 	DiffDto,
@@ -127,6 +128,17 @@ export const postChat = (projectId: string, input: Partial<ChatInput> & Pick<Cha
 			method: 'POST',
 			body: json(input)
 		}
+	);
+
+/** Aktionsvorschlag `index` einer Agent-Nachricht übernehmen oder verwerfen (Fehler → Zustand `failed`) */
+export const decideChatAction = (
+	messageId: string,
+	index: number,
+	decision: ChatActionDecision['decision']
+) =>
+	apiFetch<{ message: ChatMessageDto; task: TaskDto | null }>(
+		`${API}/chat/${messageId}/actions/${index}`,
+		{ method: 'POST', body: json({ decision }) }
 	);
 
 // ---------------------------------------------------------------- Pull Requests

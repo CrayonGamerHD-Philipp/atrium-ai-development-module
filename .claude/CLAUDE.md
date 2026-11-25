@@ -6,7 +6,7 @@ still apply: `.core/.claude/CLAUDE.md` and `.core/.claude/rules/*.md` (especiall
 
 ## Structure
 - `modules/aidev/` – Atrium module (control center): `protocol.ts` (Runner ↔ Atrium, also bundled by the runner – only `zod`),
-  `schemas.ts` (permissions, DTOs, endpoint table), `scheduler.ts` + `prompts.ts` (pure logic), `*.endpoints.ts`/`*.service.ts`,
+  `schemas.ts` (permissions, DTOs, endpoint table), `scheduler.ts` + `prompts.ts` + `actions.ts` (pure logic; `actions.ts` = agent action proposals from the `aidev-actions` block), `*.endpoints.ts`/`*.service.ts`,
   `live.ts` (SSE hubs), `jobs.ts`, `migrations/`, `pages/` + `ui.ts` (interface), `tests/`.
 - `runner/` – standalone Node service (Docker) with git, gh, and the agent CLIs; not loaded by Atrium.
 
