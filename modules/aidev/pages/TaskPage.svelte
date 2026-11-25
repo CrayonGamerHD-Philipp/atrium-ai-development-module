@@ -415,6 +415,11 @@
 						<ProviderBadge provider={task.providerHint} />
 						<span class="text-xs text-muted-foreground">erzwungen</span>
 					{/if}
+					{#if task.branchPushed}
+						<p class="text-sm">Branch bereitgestellt (ohne Pull Request)</p>
+					{:else if task.delivery === 'branch' && task.status === 'done'}
+						<p class="text-sm">Kein Branch bereitgestellt.</p>
+					{/if}
 					{#if task.branch}
 						<span class="inline-flex items-center gap-1 font-mono text-xs text-muted-foreground">
 							<GitBranch class="size-3.5" aria-hidden="true" />{task.branch}

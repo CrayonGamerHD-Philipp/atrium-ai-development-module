@@ -20,6 +20,7 @@ import {
 	routingSchema
 } from './schemas';
 import m0001 from './migrations/0001_init.sql?raw';
+import m0002 from './migrations/0002_task_delivery.sql?raw';
 
 export default defineModule({
 	package: pkg,
@@ -96,7 +97,10 @@ export default defineModule({
 			writePermission: PERM.settingsManage
 		}
 	],
-	migrations: [{ name: '0001_init', sql: m0001 }],
+	migrations: [
+		{ name: '0001_init', sql: m0001 },
+		{ name: '0002_task_delivery', sql: m0002 }
+	],
 	jobs: aidevJobs,
 	onUserDeleted,
 	onDisable: async () => closeAllLive(),
