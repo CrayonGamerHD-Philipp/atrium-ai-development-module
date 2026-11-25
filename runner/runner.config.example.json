@@ -3,13 +3,15 @@
 	"name": "runner-1",
 	"workDir": "/work",
 	"maxSlots": 2,
+	"limitProbeMin": 5,
 	"accounts": [
 		{
 			"key": "claude-main",
 			"provider": "claude",
 			"label": "Claude Max (Team)",
 			"home": "/accounts/claude-main",
-			"models": ["sonnet", "opus", "haiku"]
+			"models": ["sonnet", "opus", "haiku"],
+			"limitProbe": true
 		},
 		{
 			"key": "codex-main",
