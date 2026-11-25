@@ -4,7 +4,8 @@
  * Verbrauch → Abschluss mit PR (Auftrag `review`, pull_request); Lease-Ablauf → Job → neu eingeplant;
  * Limit → Wartezeit → zweites Konto übernimmt; Orchestrierung → Teilaufträge mit Abhängigkeiten → Ausliefern;
  * Zyklus im Plan abgelehnt; Konflikt → Konfliktlösung; Rechte; bestehenden PR bearbeiten (`targetPr`, pr-update);
- * SSE (Projekt, Runner) inkl. RPC über den Stream.
+ * PR-Sync löscht Branches gemergter `aidev/`-PRs (nur Runner mit `branchCleanup`); SSE (Projekt, Runner) inkl.
+ * RPC über den Stream.
  */
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { sql } from 'drizzle-orm';
@@ -78,7 +79,12 @@ async function technicalKey(name: string, roleId: string, scopes: string[]) {
 	keys[name] = (await createApiKey(ctx, { name, scopes })).key;
 }
 
-const register = (who: string, accounts: string[], maxSlots = 4) =>
+const register = (
+	who: string,
+	accounts: string[],
+	maxSlots = 4,
+	extraCapabilities: Record<string, boolean> = {}
+) =>
 	call<{ runnerId: string; status: string; heartbeatSec: number }>(
 		who,
 		'POST',
@@ -95,7 +101,8 @@ const register = (who: string, accounts: string[], maxSlots = 4) =>
 				git: true,
 				gh: true,
 				pty: true,
-				os: 'linux'
+				os: 'linux',
+				...extraCapabilities
 			},
 			accounts: accounts.map((key) => ({
 				key,
@@ -1120,6 +1127,127 @@ describe('aidev', () => {
 			stream.close();
 		}
 		for (const r of reviewing) expect((await task(r.id)).task.status).toBe('done');
+	});
+
+	it('PR-Sync löscht Branches gemergter PRs inkl. Teilaufträgen, schont Aktives und Geschlossenes', async () => {
+		type Rpc = Extract<RunnerCommand, { type: 'rpc' }>;
+		const ids = Object.fromEntries(
+			['parent', 'child', 'fix', 'main', 'foreign', 'single', 'active'].map((k) => [
+				k,
+				crypto.randomUUID()
+			])
+		);
+		const addTask = (id: string, branch: string, status: string, parentId: string | null = null) =>
+			q(
+				sql`INSERT INTO task (id, project_id, parent_id, title, prompt, status, branch)
+					VALUES (${id}, ${projectId}, ${parentId}, 'Aufräumen', 'Aufräumen', ${status}, ${branch})`
+			);
+		// PR 201: Orchestrierung mit Teilauftrag (Lauf auf eigenem Branch) und dessen Korrektur
+		await addTask(ids.parent!, 'aidev/aaaa1111-feature', 'done');
+		await addTask(ids.child!, 'aidev/aaaa1111/1-teil', 'done', ids.parent!);
+		await addTask(ids.fix!, 'aidev/aaaa1111/1-teil-fix', 'done', ids.child!);
+		await addTask(ids.main!, 'main', 'done', ids.parent!);
+		await addTask(ids.foreign!, 'feature/fremd', 'done', ids.parent!);
+		await q(
+			sql`INSERT INTO run (id, task_id, project_id, attempt, provider, status, branch)
+				VALUES (${crypto.randomUUID()}, ${ids.child!}, ${projectId}, 1, 'fake', 'succeeded',
+					'aidev/aaaa1111/1-teil-lauf')`
+		);
+		// PR 202: ein Branch des Laufs wird von einem aktiven Auftrag noch genutzt
+		await addTask(ids.single!, 'aidev/bbbb2222-einzeln', 'done');
+		await q(
+			sql`INSERT INTO run (id, task_id, project_id, attempt, provider, status, branch)
+				VALUES (${crypto.randomUUID()}, ${ids.single!}, ${projectId}, 1, 'fake', 'succeeded',
+					'aidev/bbbb2222-geteilt')`
+		);
+		await addTask(ids.active!, 'aidev/bbbb2222-geteilt', 'needs-input');
+		await q(
+			sql`INSERT INTO pull_request (project_id, number, task_id, title, branch, state, url) VALUES
+				(${projectId}, 201, ${ids.parent!}, 'Feature', 'aidev/aaaa1111-feature', 'merged', 'u201'),
+				(${projectId}, 202, ${ids.single!}, 'Einzeln', 'aidev/bbbb2222-einzeln', 'merged', 'u202'),
+				(${projectId}, 203, NULL, 'Zu', 'aidev/cccc3333-zu', 'closed', 'u203')`
+		);
+		const deletedAt = async () =>
+			Object.fromEntries(
+				(
+					await q<{ number: number; branch_deleted_at: unknown }>(
+						sql`SELECT number, branch_deleted_at FROM pull_request
+							WHERE project_id = ${projectId} AND number IN (201, 202, 203)`
+					)
+				).map((r) => [r.number, r.branch_deleted_at !== null])
+			);
+
+		const stream = await openStream<RunnerCommand>(keys.runner!, '/runner/stream?client=main');
+		await stream.waitFor('hello');
+		const handled = new Set<string>();
+		const nextRpc = async (op: string) => {
+			const rpc = (await stream.waitFor(
+				'rpc',
+				(e) => (e as Rpc).op === op && !handled.has((e as Rpc).reqId)
+			)) as Rpc;
+			handled.add(rpc.reqId);
+			return rpc;
+		};
+		const answer = async (rpc: Rpc, result: unknown) =>
+			ok(await call('runner', 'POST', `/runner/rpc/${rpc.reqId}`, { ok: true, result }), 201);
+		const deleteCalls = () =>
+			stream.events.filter((e) => e.type === 'rpc' && (e as Rpc).op === 'git.branch-delete').length;
+		/** Abgleich; `respond` beantwortet ein erwartetes `git.branch-delete` und liefert dessen Branches */
+		const sync = async (respond?: (branches: string[]) => unknown) => {
+			const res = call('admin', 'POST', `/projects/${projectId}/pulls/sync`);
+			await answer(await nextRpc('gh.pr-list'), { pulls: [] });
+			let branches: string[] = [];
+			if (respond) {
+				const rpc = await nextRpc('git.branch-delete');
+				branches = [...(rpc.args as { branches: string[] }).branches].sort();
+				await answer(rpc, respond(branches));
+			}
+			ok(await res, 201);
+			return branches;
+		};
+		try {
+			// Runner ohne Capability `branchCleanup` → kein Aufruf, nichts markiert
+			await sync();
+			expect(deleteCalls()).toBe(0);
+			expect(await deletedAt()).toEqual({ 201: false, 202: false, 203: false });
+
+			ok(await register('runner', ['fake-a', 'fake-b'], 4, { branchCleanup: true }), 201);
+			const first = await sync((branches) => ({ deleted: branches, missing: [], failed: [] }));
+			expect(first).toEqual([
+				'aidev/aaaa1111-feature',
+				'aidev/aaaa1111/1-teil',
+				'aidev/aaaa1111/1-teil-fix',
+				'aidev/aaaa1111/1-teil-lauf',
+				'aidev/bbbb2222-einzeln'
+			]);
+			// PR 202 behält den vom aktiven Auftrag genutzten Branch und bleibt offen für später
+			expect(await deletedAt()).toEqual({ 201: true, 202: false, 203: false });
+
+			// aktiver Auftrag beendet → nun beide Branches; ein Fehler verhindert die Markierung
+			await q(sql`UPDATE task SET status = 'cancelled' WHERE id = ${ids.active!}`);
+			const second = await sync(() => ({
+				deleted: ['aidev/bbbb2222-geteilt'],
+				missing: [],
+				failed: [{ branch: 'aidev/bbbb2222-einzeln', error: 'Netzwerk' }]
+			}));
+			expect(second).toEqual(['aidev/bbbb2222-einzeln', 'aidev/bbbb2222-geteilt']);
+			expect(await deletedAt()).toEqual({ 201: true, 202: false, 203: false });
+			const third = await sync(() => ({
+				deleted: ['aidev/bbbb2222-einzeln'],
+				missing: ['aidev/bbbb2222-geteilt'],
+				failed: []
+			}));
+			expect(third).toEqual(['aidev/bbbb2222-einzeln', 'aidev/bbbb2222-geteilt']);
+			expect(await deletedAt()).toEqual({ 201: true, 202: true, 203: false });
+
+			// alles aufgeräumt → kein weiterer Aufruf; der geschlossene PR bleibt unberührt
+			const calls = deleteCalls();
+			await sync();
+			expect(deleteCalls()).toBe(calls);
+			expect(await deletedAt()).toEqual({ 201: true, 202: true, 203: false });
+		} finally {
+			stream.close();
+		}
 	});
 
 	it('SSE: Projekt-Stream und Runner-Stream mit RPC (Repo prüfen)', async () => {
