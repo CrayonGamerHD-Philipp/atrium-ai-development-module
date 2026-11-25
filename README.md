@@ -50,6 +50,13 @@ stehen unter **Administration → Runner & Konten**.
 
 Teilaufträge werden in einen Integrations-Branch gemergt und zum Schluss gemeinsam ausgeliefert.
 
+**Branch-Namen** bildet das System selbst: `aidev/<kurz-id>-<slug>` für Aufträge und Integrations-Branches,
+`aidev/<eltern-kurz>/<n>-<slug>` für Teilaufträge. `slugify` entfernt Umlaute, Füllwörter (deutsch/englisch) und
+doppelte Wörter und kürzt an Wortgrenzen auf höchstens 5 Wörter bzw. 40 Zeichen. Aus „Ok die branches sollen
+automatisch bessere Namen bekommen“ wird so `branches-automatisch-bessere-namen`. Der Orchestrator kann im Plan ein
+optionales Feld `branch` (2–5 Wörter in Kebab-Case, ohne `aidev/`) vorschlagen; es benennt den Integrations-Branch.
+Ein bereits gespeicherter Branch des Auftrags und der Head-Branch eines bestehenden PR haben Vorrang.
+
 ### Bestehende Pull Requests bearbeiten
 
 Ein Auftrag kann einen offenen Pull Request weiterbearbeiten, statt einen neuen Branch und PR anzulegen. Im Tab
@@ -156,6 +163,14 @@ npm run branches:prune # gemergte Branches (lokal + origin) auflisten; mit `-- -
 `branches:prune` erkennt normale Merges, Squash-Merges, Rebases und Teil-Branches gemergter Sammel-Branches. Den
 Basis-Branch, in einem Worktree ausgecheckte Branches und Branches mit Commits aus der letzten Stunde (`--min-age`) lässt
 es stehen. Worktrees räumt der Runner selbst auf (nach 48 h bzw. ab 30 Stück).
+
+Neue `aidev/`-Branches räumt Atrium **automatisch** auf: Nach jedem PR-Abgleich (auch im Job) löscht es bei gemergten
+PRs den PR-Branch sowie die Branches aller Teilaufträge und Läufe über den Runner-RPC `git.branch-delete` (höchstens
+`MAX_BRANCH_DELETE` pro Aufruf). Nur Runner mit der Capability `branchCleanup` bekommen diesen Aufruf. Der Haupt-Branch,
+Branches außerhalb von `aidev/` und Branches, die ein aktiver Auftrag, ein laufender Lauf oder ein offener PR noch nutzt,
+bleiben stehen; geschlossene, nicht gemergte PRs werden nicht angefasst. Ist alles gelöscht, setzt Atrium
+`pull_request.branch_deleted_at` und schreibt das Audit `aidev.branch.deleted`; sonst versucht es der nächste Abgleich
+erneut. `branches:prune` bleibt für Altlasten, also Branches von vor dieser Funktion oder ohne passenden Runner.
 
 ## Installation in Atrium
 
