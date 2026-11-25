@@ -5,6 +5,7 @@
 import { z } from 'zod';
 import {
 	commitPolicySchema,
+	taskDeliverySchema,
 	providerSchema,
 	roleSchema,
 	workspaceTargetSchema,
@@ -208,6 +209,7 @@ export const projectPatch = z
 export type ProjectPatch = z.infer<typeof projectPatch>;
 
 export const taskInput = z.object({
+	delivery: taskDeliverySchema.default('project'),
 	title: z.string().trim().max(200).optional(),
 	prompt: z.string().trim().min(1).max(20_000),
 	role: roleSchema.default('implement'),
@@ -232,6 +234,7 @@ export type TaskPatch = z.infer<typeof taskPatch>;
 export const replyInput = z.object({ message: z.string().trim().min(1).max(20_000) });
 
 export const chatInput = z.object({
+	delivery: taskDeliverySchema.default('project'),
 	body: z.string().trim().min(1).max(20_000),
 	/** `task` = Nachricht wird ein Auftrag, `note` = nur Notiz im Verlauf */
 	mode: z.enum(['task', 'note']).default('task'),
@@ -328,6 +331,8 @@ export interface ProjectDto {
 }
 
 export interface TaskDto {
+	delivery: 'project' | 'branch';
+	branchPushed: boolean;
 	id: string;
 	projectId: string;
 	parentId: string | null;

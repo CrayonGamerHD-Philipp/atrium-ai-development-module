@@ -6,10 +6,11 @@
  * Repos arbeiten und seine Abschluss-Zusammenfassung in der Sprache des Auftrags schreiben.
  */
 import { planSchema } from './protocol';
-import type { Plan, Role } from './protocol';
+import type { Delivery, Plan, Role } from './protocol';
 
 export interface PromptContext {
 	role: Role;
+	delivery?: Delivery;
 	project: {
 		name: string;
 		repoOwner: string;
@@ -76,6 +77,23 @@ function truncate(text: string, max: number): string {
 	return `${t.slice(0, max).trimEnd()}\n… [truncated]`;
 }
 
+function deliveryDescription(delivery: Delivery | undefined): string {
+	switch (delivery?.mode) {
+		case 'branch':
+			return 'push the task branch without opening a pull request';
+		case 'pr':
+			return delivery.autoMerge
+				? 'push the task branch, open a pull request and enable auto-merge'
+				: 'push the task branch and open a pull request';
+		case 'direct':
+			return 'push to the main branch';
+		case 'integrate':
+			return 'merge into and push the integration branch';
+		default:
+			return 'follow the configured delivery policy';
+	}
+}
+
 function roleSection(c: PromptContext): string[] {
 	const base = c.project.defaultBranch;
 	const test = c.project.testCmd.trim();
@@ -119,7 +137,7 @@ function roleSection(c: PromptContext): string[] {
 					: '- Implement the task completely, following the existing architecture and code style.',
 				testLine,
 				'- Commit in small, meaningful steps with descriptive messages (Conventional Commits, e.g. `feat: …`, `fix: …`).',
-				'- Do NOT push – the runner pushes and opens the pull request.',
+				`- Do NOT push – the runner handles delivery: ${deliveryDescription(c.delivery)}.`,
 				'- Finish with a short summary: what you changed, why, and any open points.'
 			];
 		case 'resolve':
