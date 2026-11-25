@@ -9,7 +9,10 @@ import { LIMIT_SAMPLE_RETENTION_DAYS } from './limits';
 import { syncPulls } from './pulls.service';
 import { schedulerTick } from './scheduler.service';
 
-/** PR-Abgleich für Projekte mit offenen PRs bzw. Aufträgen im Zustand `review` */
+/**
+ * PR-Abgleich für Projekte mit offenen PRs, Aufträgen im Zustand `review` oder gemergten `aidev/`-PRs, deren
+ * Branches noch nicht aufgeräumt sind
+ */
 export async function prSyncAll(): Promise<string> {
 	const projects = await mdb().transaction((tx) =>
 		rowsOf(
@@ -17,6 +20,8 @@ export async function prSyncAll(): Promise<string> {
 			sql`SELECT p.id FROM project p WHERE p.archived_at IS NULL AND (
 					EXISTS (SELECT 1 FROM pull_request pr WHERE pr.project_id = p.id AND pr.state = 'open')
 					OR EXISTS (SELECT 1 FROM task t WHERE t.project_id = p.id AND t.status = 'review')
+					OR EXISTS (SELECT 1 FROM pull_request pr WHERE pr.project_id = p.id AND pr.state = 'merged'
+						AND pr.branch LIKE 'aidev/%' AND pr.branch_deleted_at IS NULL)
 				)
 				ORDER BY p.created_at`
 		)
