@@ -40,6 +40,7 @@ import {
 	type ChatMessageDto,
 	type ProjectDto,
 	type PullRequestDto,
+	type RepoProbeDto,
 	type RunEventDto,
 	type RunnerDto,
 	type Routing,
@@ -48,6 +49,8 @@ import {
 } from '$modules/aidev/schemas';
 import { inList } from '$lib/sdk/server';
 import type { RequestContext } from '$lib/sdk/types';
+
+type RunnerRpcCmd = Extract<RunnerCommand, { type: 'rpc' }>;
 
 const M = '/modules/aidev';
 const keys: Record<string, string> = {};
@@ -1732,7 +1735,8 @@ describe('aidev', () => {
 			}),
 			201
 		);
-		expect(ok(await check, 201)).toMatchObject({ ok: true, canPush: true });
+		// ältere Runner ohne `branches` → leere Liste
+		expect(ok(await check, 201)).toMatchObject({ ok: true, canPush: true, branches: [] });
 
 		// Live-Ereignis bei Änderung eines Auftrags
 		const t = await createTask({ prompt: 'Live-Test', draft: true });
@@ -1748,6 +1752,96 @@ describe('aidev', () => {
 		});
 		// ohne Runner-Verbindung keine Projekt-Operationen
 		expect((await call('admin', 'POST', `/projects/${projectId}/check`)).status).toBe(503);
+	});
+
+	it('Repo vor dem Anlegen prüfen (POST /projects/probe): Format, Rechte, Runner, Branches, Duplikat', async () => {
+		const probe = (who: string, repo: string) =>
+			call<RepoProbeDto>(who, 'POST', '/projects/probe', { repo });
+		// ungültiges Format → 422 (Validierung), fehlendes Recht → 403, ohne Runner-Verbindung → 503
+		expect((await probe('admin', 'kein repo')).status).toBe(422);
+		expect((await call('admin', 'POST', '/projects/probe', {})).status).toBe(422);
+		expect((await probe('viewer', 'acme/neu')).status).toBe(403);
+		expect((await probe('creator', 'acme/neu')).status).toBe(403);
+		expect((await probe('admin', 'acme/neu')).status).toBe(503);
+
+		const stream = await openStream<RunnerCommand>(keys.runner!, '/runner/stream?client=main');
+		await stream.waitFor('hello');
+		const seen = new Set<string>();
+		const nextCheck = async () => {
+			const rpc = (await stream.waitFor(
+				'rpc',
+				(e) => !seen.has((e as RunnerRpcCmd).reqId) && (e as RunnerRpcCmd).op === 'repo.check'
+			)) as RunnerRpcCmd;
+			seen.add(rpc.reqId);
+			return rpc;
+		};
+		try {
+			// vorhandenes Projekt (Groß-/Kleinschreibung egal, Link-Form)
+			const pending = probe('admin', 'https://github.com/ACME/Widgets.git');
+			const rpc = await nextCheck();
+			expect(rpc.project).toMatchObject({ repoOwner: 'ACME', repoName: 'Widgets', defaultBranch: '' });
+			expect(rpc.project.id).not.toBe(projectId);
+			expect(rpc.target).toBe('main');
+			ok(
+				await call('runner', 'POST', `/runner/rpc/${rpc.reqId}`, {
+					ok: true,
+					result: {
+						ok: true,
+						defaultBranch: 'develop',
+						canPush: true,
+						message: 'Zugriff ok (WRITE)',
+						branches: ['develop', 'feature/x', 'main']
+					}
+				}),
+				201
+			);
+			expect(ok(await pending, 201)).toEqual({
+				owner: 'ACME',
+				name: 'Widgets',
+				ok: true,
+				message: 'Zugriff ok (WRITE)',
+				defaultBranch: 'develop',
+				branches: ['develop', 'feature/x', 'main'],
+				canPush: true,
+				existingProjectId: projectId
+			});
+
+			// neues Repo, nicht erreichbar (ohne `branches`) → leere Liste, kein Projekt
+			const pending2 = probe('admin', 'acme/neu');
+			const rpc2 = await nextCheck();
+			ok(
+				await call('runner', 'POST', `/runner/rpc/${rpc2.reqId}`, {
+					ok: true,
+					result: { ok: false, defaultBranch: null, canPush: false, message: 'nicht erreichbar' }
+				}),
+				201
+			);
+			expect(ok(await pending2, 201)).toMatchObject({
+				owner: 'acme',
+				name: 'neu',
+				ok: false,
+				defaultBranch: null,
+				branches: [],
+				existingProjectId: null
+			});
+
+			// Fehlermeldung des Runners → 400
+			const pending3 = probe('admin', 'acme/neu');
+			const rpc3 = await nextCheck();
+			ok(
+				await call('runner', 'POST', `/runner/rpc/${rpc3.reqId}`, { ok: false, error: 'kaputt' }),
+				201
+			);
+			expect((await pending3).status).toBe(400);
+		} finally {
+			stream.close();
+			await vi.waitFor(async () => {
+				const [r] = await q<{ online: boolean }>(
+					sql`SELECT online FROM runner WHERE id = ${runnerId}`
+				);
+				expect(r!.online).toBe(false);
+			});
+		}
 	});
 
 	it('Heartbeat mit Limit-Stand füllt `AccountDto.limits`, ältere Runner ändern nichts', async () => {
