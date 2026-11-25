@@ -1,8 +1,11 @@
 <script lang="ts">
-	// Auslastung je Anbieter-Konto: Balken 5 h / Woche, laufende Läufe, Wartezeit (Cooldown) bis Uhrzeit
+	// Auslastung je Anbieter-Konto: echte Limits des Anbieters (falls gemeldet), sonst geschätzte Balken 5 h / Woche;
+	// laufende Läufe, Wartezeit (Cooldown) bis Uhrzeit
+	import ChevronRight from '@lucide/svelte/icons/chevron-right';
 	import Clock from '@lucide/svelte/icons/clock';
 	import type { AccountDto } from '../../schemas';
 	import { absolute, clock } from '../format';
+	import AccountLimits from './AccountLimits.svelte';
 	import ProviderBadge from './ProviderBadge.svelte';
 	import UsageBar from './UsageBar.svelte';
 
@@ -33,20 +36,41 @@
 				</div>
 				<ProviderBadge provider={a.provider} />
 			</div>
-			<div class="grid grid-cols-2 gap-3">
-				<UsageBar
-					label="5 Stunden"
-					util={a.usage.util5h}
-					used={a.usage.used5h}
-					budget={a.effective5hUnits}
-				/>
-				<UsageBar
-					label="Woche"
-					util={a.usage.utilWeek}
-					used={a.usage.usedWeek}
-					budget={a.effectiveWeekUnits}
-				/>
-			</div>
+			{#snippet estimate()}
+				<div class="grid grid-cols-2 gap-3">
+					<UsageBar
+						label="5 Stunden"
+						util={a.usage.util5h}
+						used={a.usage.used5h}
+						budget={a.effective5hUnits}
+					/>
+					<UsageBar
+						label="Woche"
+						util={a.usage.utilWeek}
+						used={a.usage.usedWeek}
+						budget={a.effectiveWeekUnits}
+					/>
+				</div>
+			{/snippet}
+			{#if a.limits?.windows.length}
+				<!-- echte Werte des Anbieters zuerst, eigene Schätzung aufklappbar -->
+				<AccountLimits limits={a.limits} />
+				<details class="group">
+					<summary
+						class="flex cursor-pointer list-none items-center gap-1 text-xs text-muted-foreground pointer-coarse:min-h-10"
+					>
+						<ChevronRight
+							class="size-3.5 shrink-0 transition-transform group-open:rotate-90"
+							aria-hidden="true"
+						/>
+						Eigene Schätzung nach Budget
+					</summary>
+					<div class="mt-2">{@render estimate()}</div>
+				</details>
+			{:else}
+				{@render estimate()}
+				<AccountLimits limits={a.limits} />
+			{/if}
 			<div class="flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground">
 				<span class="tabular-nums">
 					{a.usage.running} von {a.maxConcurrency} gleichzeitig

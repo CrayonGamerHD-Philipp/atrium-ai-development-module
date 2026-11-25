@@ -1,5 +1,6 @@
 <script lang="ts">
-	// Anbieter-Konto bearbeiten (accountPatch): Label, aktiv, gleichzeitige Läufe, Budgets, Wochenanker, Kontext, Standardmodell
+	// Anbieter-Konto bearbeiten (accountPatch): Label, aktiv, gleichzeitige Läufe, Budgets, Wochenanker, Kontext, Standardmodell;
+	// Budgetvorschlag der Limit-Analyse ins Formular übernehmen
 	import { toast } from 'svelte-sonner';
 	import { BUSY_SAVE, FormField, NumberStepper } from '$lib/components/layout';
 	import { Button } from '$lib/components/ui/button';
@@ -57,6 +58,16 @@
 			(m) => ({ value: m, label: m })
 		)
 	);
+
+	// Budgetvorschlag der Limit-Analyse; „übernehmen“ füllt nur das Formular, gespeichert wird mit „Speichern“
+	const suggest5h = $derived(account.limits?.suggestedBudget5hUnits ?? null);
+	const suggestWeek = $derived(account.limits?.suggestedBudgetWeekUnits ?? null);
+	const hasSuggestion = $derived(suggest5h !== null || suggestWeek !== null);
+	function applySuggestion() {
+		if (suggest5h !== null) budget5h = Math.max(0, Math.round(suggest5h));
+		if (suggestWeek !== null) budgetWeek = Math.max(0, Math.round(suggestWeek));
+		toast.info('Vorschlag eingetragen – mit „Speichern“ übernehmen');
+	}
 
 	async function save(e: SubmitEvent) {
 		e.preventDefault();
@@ -165,6 +176,24 @@
 					Woche
 					{account.effectiveWeekUnits ? units(account.effectiveWeekUnits) : 'unbekannt'}.
 				</p>
+				{#if hasSuggestion}
+					<div class="flex flex-wrap items-center justify-between gap-2 rounded-md border p-2.5">
+						<p class="text-xs tabular-nums">
+							<span class="text-muted-foreground">Vorschlag aus der Limit-Analyse:</span>
+							{suggest5h === null ? 'unbekannt' : units(suggest5h)} Einheiten / 5 h,
+							{suggestWeek === null ? 'unbekannt' : units(suggestWeek)} / Woche
+						</p>
+						<Button
+							type="button"
+							size="sm"
+							variant="outline"
+							onclick={applySuggestion}
+							disabled={busy}
+						>
+							Vorschlag übernehmen
+						</Button>
+					</div>
+				{/if}
 			</div>
 			<FormField label="Budget 5 Stunden" id="acc-b5" error={errors.budget5hUnits}>
 				<Input
