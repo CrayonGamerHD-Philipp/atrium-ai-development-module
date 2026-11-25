@@ -297,9 +297,18 @@ async function projectStates(tx: Tx, ids: string[]): Promise<ProjectState[]> {
 	}));
 }
 
+/**
+ * Sperre der Branch-Vergabe bis zum Ende der Transaktion: Der Scheduler legt Läufe (und damit Branches) nur unter
+ * ihr an; das Branch-Aufräumen (`cleanupMergedBranches`) prüft unter ihr die Nutzung und reserviert die zu
+ * löschenden Branches (`branch_cleanup_claim`), die der Scheduler bis zur Freigabe nicht vergibt.
+ */
+export async function lockBranchAllocation(tx: Tx): Promise<void> {
+	await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext('aidev:scheduler'))`);
+}
+
 /** Ein Durchlauf: Zuteilungen planen, Läufe anlegen, Angebote sammeln. Liefert die Zahl der Angebote. */
 async function dispatchIn(tx: Tx, fx: Effects, settings: AidevSettings): Promise<number> {
-	await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext('aidev:scheduler'))`);
+	await lockBranchAllocation(tx);
 	const rows = await candidates(tx);
 	if (!rows.length) return 0;
 	const now = Date.now();
@@ -382,6 +391,13 @@ async function dispatchIn(tx: Tx, fx: Effects, settings: AidevSettings): Promise
 		const project = await oneOf(tx, sql`SELECT * FROM project WHERE id = ${task.project_id}`);
 		if (!project) continue;
 		const plan = await branchPlan(tx, task, project);
+		// Branch oder Basis wird gerade aufgeräumt → später (Freigabe stößt einen neuen Durchlauf an)
+		const claimed = await oneOf(
+			tx,
+			sql`SELECT 1 AS x FROM branch_cleanup_claim WHERE project_id = ${task.project_id}
+				AND branch IN (${plan.branch}, ${plan.baseRef}) AND expires_at > now()`
+		);
+		if (claimed) continue;
 		const runId = crypto.randomUUID();
 		const attempt = num(task.attempts) + 1;
 		await tx.execute(

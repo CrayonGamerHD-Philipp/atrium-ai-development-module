@@ -283,7 +283,8 @@ export const rpcCommandSchema = z.object({
 	project: rpcProjectSchema,
 	target: workspaceTargetSchema.default('main'),
 	/** Je `op`: `fs.*` → `{ path, content? }`, `git.diff` → `{ base?, head? }`, `gh.pr-merge` → `{ number, method }`,
-	 *  `git.branch-delete` → `{ branches: string[] }` (höchstens `MAX_BRANCH_DELETE`, Antwort `branchDeleteResult`) */
+	 *  `git.branch-delete` → `{ branches: string[], expect?: Record<Branch, SHA> }` (höchstens `MAX_BRANCH_DELETE`,
+	 *  Antwort `branchDeleteResult`; `expect` = erwarteter Remote-Stand, abweichend → `kept` mit `changed`) */
 	args: z.record(z.string(), z.unknown()).default({})
 });
 export type RpcCommand = z.infer<typeof rpcCommandSchema>;
@@ -492,7 +493,11 @@ export const prInfoSchema = z.object({
 	additions: z.number().int(),
 	deletions: z.number().int(),
 	createdAt: z.string(),
-	updatedAt: z.string()
+	updatedAt: z.string(),
+	/** Letzter Head-Commit (`headRefOid`); fehlt bei älteren Runnern */
+	headSha: z.string().max(64).optional(),
+	/** Head-Branch liegt in einem anderen Repository (Fork); fehlt bei älteren Runnern (= unbekannt) */
+	crossRepository: z.boolean().optional()
 });
 export type PrInfo = z.infer<typeof prInfoSchema>;
 export const prListResult = z.object({ pulls: z.array(prInfoSchema) });
@@ -503,11 +508,16 @@ export const repoCheckResult = z.object({
 	message: z.string()
 });
 
-/** Antwort auf `git.branch-delete`: gelöschte, nicht (mehr) vorhandene und fehlgeschlagene Branches */
+/**
+ * Antwort auf `git.branch-delete`: gelöschte, nicht (mehr) vorhandene, fehlgeschlagene und bewusst behaltene
+ * Branches. `kept.reason`: `open-pr` = ein offener PR nutzt den Branch als Head oder Basis (später erneut
+ * versuchen), `changed` = der Remote-Stand weicht von `expect` ab (nicht löschen).
+ */
 export const branchDeleteResult = z.object({
 	deleted: z.array(z.string()),
 	missing: z.array(z.string()),
-	failed: z.array(z.object({ branch: z.string(), error: z.string() }))
+	failed: z.array(z.object({ branch: z.string(), error: z.string() })),
+	kept: z.array(z.object({ branch: z.string(), reason: z.enum(['open-pr', 'changed']) })).optional()
 });
 /** Höchstzahl an Branches je `git.branch-delete`-Aufruf */
 export const MAX_BRANCH_DELETE = 50;

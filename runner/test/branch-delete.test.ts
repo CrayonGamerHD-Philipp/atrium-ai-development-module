@@ -1,6 +1,7 @@
 /**
  * RPC `git.branch-delete` end-to-end gegen ein lokales Bare-Remote: Löschen, fehlende Branches, Aufräumen des Caches
- * (Worktrees aktiver Läufe bleiben unangetastet) und strenge Validierung der Argumente.
+ * (Worktrees aktiver Läufe bleiben unangetastet), erwarteter Stand (`expect`), Schutz durch offene PRs (live über gh,
+ * auch jenseits der ersten 100; Forks zählen nicht) und strenge Validierung der Argumente.
  */
 import { randomUUID } from 'node:crypto';
 import { chmodSync, existsSync, rmSync, writeFileSync } from 'node:fs';
@@ -10,7 +11,7 @@ import { publicEnv } from '../src/config.ts';
 import { Workspace } from '../src/git/workspace.ts';
 import { MAX_BRANCH_DELETE, type RpcCommand } from '../src/protocol.ts';
 import { Redactor } from '../src/redact.ts';
-import { executeRpc, parseBranchList, RpcError } from '../src/rpc.ts';
+import { executeRpc, OPEN_PR_LIMIT, parseBranchList, RpcError } from '../src/rpc.ts';
 import { createRemote, git, type Remote, setupTestEnv, type TestEnv } from './helpers/env.ts';
 
 let env: TestEnv;
@@ -34,14 +35,18 @@ afterAll(async () => {
 	await env?.cleanup();
 });
 
-function cmd(branches: unknown, over: Partial<RpcCommand['project']> = {}): RpcCommand {
+function cmd(
+	branches: unknown,
+	over: Partial<RpcCommand['project']> = {},
+	args: Record<string, unknown> = {}
+): RpcCommand {
 	return {
 		type: 'rpc',
 		reqId: randomUUID(),
 		op: 'git.branch-delete',
 		project: { ...project, ...over },
 		target: 'main',
-		args: { branches }
+		args: { branches, ...args }
 	};
 }
 
@@ -65,7 +70,7 @@ describe('git.branch-delete', () => {
 		remote.commitFile('aidev/a', 'a.txt', 'a\n', 'A');
 		remote.commitFile('aidev/b', 'b.txt', 'b\n', 'B');
 		const res = await executeRpc(ctx(), cmd(['aidev/a', 'aidev/b', 'aidev/gibt-es-nicht', 'aidev/a']));
-		expect(res).toEqual({ deleted: ['aidev/a', 'aidev/b'], missing: ['aidev/gibt-es-nicht'], failed: [] });
+		expect(res).toEqual({ deleted: ['aidev/a', 'aidev/b'], missing: ['aidev/gibt-es-nicht'], failed: [], kept: [] });
 		expect(remote.sha('aidev/a')).toBeNull();
 		expect(remote.sha('aidev/b')).toBeNull();
 		expect(remote.sha('main')).not.toBeNull();
@@ -82,7 +87,7 @@ describe('git.branch-delete', () => {
 		await workspace.addWorktree(cache, workspace.runDir(runD), 'refs/remotes/origin/aidev/d', 'aidev/d');
 
 		const res = await executeRpc(ctx([runD]), cmd(['aidev/c', 'aidev/d']));
-		expect(res).toEqual({ deleted: ['aidev/c', 'aidev/d'], missing: [], failed: [] });
+		expect(res).toEqual({ deleted: ['aidev/c', 'aidev/d'], missing: [], failed: [], kept: [] });
 		expect(remote.sha('aidev/c')).toBeNull();
 		// Remote-Tracking-Refs weg
 		expect(localRef(cache, 'refs/remotes/origin/aidev/c')).toBe(false);
@@ -102,7 +107,7 @@ describe('git.branch-delete', () => {
 		r.commitFile('aidev/x', 'x.txt', 'x\n', 'X');
 		expect(existsSync(workspace.cacheDir(other))).toBe(false);
 		const res = await executeRpc(ctx(), cmd(['aidev/x'], { repoName: 'nocache' }));
-		expect(res).toEqual({ deleted: ['aidev/x'], missing: [], failed: [] });
+		expect(res).toEqual({ deleted: ['aidev/x'], missing: [], failed: [], kept: [] });
 		expect(r.sha('aidev/x')).toBeNull();
 		expect(existsSync(workspace.cacheDir(other))).toBe(false);
 	});
@@ -137,7 +142,70 @@ describe('git.branch-delete', () => {
 
 	it('nur fehlende Branches → kein Push, alles missing', async () => {
 		const res = await executeRpc(ctx(), cmd(['aidev/weg-1', 'aidev/weg-2']));
-		expect(res).toEqual({ deleted: [], missing: ['aidev/weg-1', 'aidev/weg-2'], failed: [] });
+		expect(res).toEqual({ deleted: [], missing: ['aidev/weg-1', 'aidev/weg-2'], failed: [], kept: [] });
+	});
+
+	it('expect: nur der erwartete Stand wird gelöscht, ein geänderter Branch bleibt (changed)', async () => {
+		const shaE = remote.commitFile('aidev/e-gleich', 'e.txt', 'e\n', 'E');
+		const old = remote.commitFile('aidev/e-neu', 'e.txt', 'e\n', 'E');
+		remote.commitFile('aidev/e-neu', 'e2.txt', 'nach dem Merge\n', 'E2');
+		const res = await executeRpc(
+			ctx(),
+			cmd(['aidev/e-gleich', 'aidev/e-neu'], {}, { expect: { 'aidev/e-gleich': shaE, 'aidev/e-neu': old } })
+		);
+		expect(res).toEqual({
+			deleted: ['aidev/e-gleich'],
+			missing: [],
+			failed: [],
+			kept: [{ branch: 'aidev/e-neu', reason: 'changed' }]
+		});
+		expect(remote.sha('aidev/e-gleich')).toBeNull();
+		expect(remote.sha('aidev/e-neu')).not.toBeNull();
+	});
+
+	it('lehnt ungültige expect-Angaben ab', async () => {
+		await expect(executeRpc(ctx(), cmd(['aidev/a'], {}, { expect: ['x'] }))).rejects.toThrow(/Objekt/);
+		await expect(executeRpc(ctx(), cmd(['aidev/a'], {}, { expect: { 'aidev/b': 'a'.repeat(40) } }))).rejects.toThrow(
+			/unbekannten Branch/
+		);
+		await expect(executeRpc(ctx(), cmd(['aidev/a'], {}, { expect: { 'aidev/a': 'HEAD' } }))).rejects.toThrow(/SHA/);
+	});
+
+	it('offene PRs schützen Head- und Basis-Branches (auch jenseits der ersten 100), Fork-Heads nicht', async () => {
+		const repo = `${project.repoOwner}/${project.repoName}`;
+		for (const b of ['aidev/p-head', 'aidev/p-basis', 'aidev/p-fork', 'aidev/p-frei']) remote.commitFile(b, 'p.txt', 'p\n', 'P');
+		// gh liefert die neuesten zuerst – der schützende PR liegt also außerhalb der ersten 100
+		env.addGhPr({ repo, head: 'aidev/p-head' });
+		for (let i = 0; i < 120; i++) env.addGhPr({ repo, head: `feature/f-${i}` });
+		env.addGhPr({ repo, head: 'aidev/p-basis-kind', base: 'aidev/p-basis' });
+		env.addGhPr({ repo, head: 'aidev/p-fork', isCrossRepository: true });
+		env.addGhPr({ repo, head: 'aidev/p-frei', state: 'MERGED' });
+		const res = await executeRpc(ctx(), cmd(['aidev/p-head', 'aidev/p-basis', 'aidev/p-fork', 'aidev/p-frei']));
+		expect(res).toEqual({
+			deleted: ['aidev/p-fork', 'aidev/p-frei'],
+			missing: [],
+			failed: [],
+			kept: [
+				{ branch: 'aidev/p-head', reason: 'open-pr' },
+				{ branch: 'aidev/p-basis', reason: 'open-pr' }
+			]
+		});
+		expect(remote.sha('aidev/p-head')).not.toBeNull();
+		expect(remote.sha('aidev/p-basis')).not.toBeNull();
+		expect(remote.sha('aidev/p-fork')).toBeNull();
+		const list = env.ghCalls().filter((c) => c[0] === 'pr' && c[1] === 'list').at(-1);
+		expect(list).toEqual(expect.arrayContaining(['--state', 'open', '--limit', String(OPEN_PR_LIMIT)]));
+	});
+
+	it('offene PRs nicht abrufbar → Fehler, nichts gelöscht', async () => {
+		remote.commitFile('aidev/q', 'q.txt', 'q\n', 'Q');
+		env.setGhListFailure(true);
+		try {
+			await expect(executeRpc(ctx(), cmd(['aidev/q']))).rejects.toThrow(/Offene PRs nicht abrufbar/);
+			expect(remote.sha('aidev/q')).not.toBeNull();
+		} finally {
+			env.setGhListFailure(false);
+		}
 	});
 
 	it('lehnt Branches ohne aidev/-Präfix ab und löscht nichts', async () => {
