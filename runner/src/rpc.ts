@@ -319,12 +319,14 @@ export function mapPr(p: Record<string, unknown>): PrInfo {
 		additions: Number(p.additions) || 0,
 		deletions: Number(p.deletions) || 0,
 		createdAt: String(p.createdAt ?? ''),
-		updatedAt: String(p.updatedAt ?? '')
+		updatedAt: String(p.updatedAt ?? ''),
+		...(typeof p.headRefOid === 'string' && /^[0-9a-f]{40,64}$/.test(p.headRefOid) ? { headSha: p.headRefOid } : {}),
+		...(typeof p.isCrossRepository === 'boolean' ? { crossRepository: p.isCrossRepository } : {})
 	};
 }
 
 const PR_FIELDS =
-	'number,title,headRefName,state,isDraft,mergeable,statusCheckRollup,autoMergeRequest,url,additions,deletions,createdAt,updatedAt';
+	'number,title,headRefName,headRefOid,isCrossRepository,state,isDraft,mergeable,statusCheckRollup,autoMergeRequest,url,additions,deletions,createdAt,updatedAt';
 
 async function prList(ctx: RpcContext, cmd: RpcCommand) {
 	const slug = `${cmd.project.repoOwner}/${cmd.project.repoName}`;
@@ -431,31 +433,95 @@ function gitErrorText(ctx: RpcContext, r: GitFailure): string {
 	return ctx.redactor ? ctx.redactor.redact(text) : text;
 }
 
-/** Remote-Branches löschen: fehlende → `missing`, nicht löschbare → `failed`; danach den Cache nachziehen */
+/** Argument `expect` von `git.branch-delete` prüfen: erwarteter Remote-Stand je Branch (nur Branches aus `branches`) */
+export function parseExpected(v: unknown, branches: string[]): Map<string, string> {
+	const out = new Map<string, string>();
+	if (v === undefined || v === null) return out;
+	if (typeof v !== 'object' || Array.isArray(v)) throw new RpcError('Argument „expect“ muss ein Objekt sein');
+	const known = new Set(branches);
+	for (const [b, sha] of Object.entries(v as Record<string, unknown>)) {
+		if (!known.has(b)) throw new RpcError(`Argument „expect“ nennt einen unbekannten Branch „${b.slice(0, 200)}“`);
+		if (typeof sha !== 'string' || !/^[0-9a-f]{40,64}$/.test(sha)) throw new RpcError(`Argument „expect“ für „${b}“ ist keine SHA`);
+		out.set(b, sha);
+	}
+	return out;
+}
+
+/** Höchstzahl offener PRs, die vor dem Löschen geprüft werden (mehr → keine verlässliche Aussage → Abbruch) */
+export const OPEN_PR_LIMIT = 1000;
+
+/**
+ * Branches, die offene PRs des Repositorys nutzen: Head-Branches aus demselben Repository und alle Basis-Branches
+ * (gh paginiert bis `OPEN_PR_LIMIT`). Nicht verlässlich ermittelbar → `RpcError` (dann wird nichts gelöscht).
+ */
+async function openPrBranches(ctx: RpcContext, cmd: RpcCommand, timeoutMs: number): Promise<Set<string>> {
+	const slug = `${cmd.project.repoOwner}/${cmd.project.repoName}`;
+	const r = await gh(
+		ctx.workspace,
+		['pr', 'list', '--repo', slug, '--state', 'open', '--limit', String(OPEN_PR_LIMIT), '--json', 'headRefName,baseRefName,isCrossRepository'],
+		{ timeoutMs }
+	);
+	if (r.code !== 0) throw new RpcError(`Offene PRs nicht abrufbar: ${gitErrorText(ctx, { ...r, timedOut: false })}`);
+	let list: unknown;
+	try {
+		list = JSON.parse(r.stdout);
+	} catch {
+		throw new RpcError('gh pr list lieferte kein JSON');
+	}
+	if (!Array.isArray(list)) throw new RpcError('gh pr list lieferte keine Liste');
+	if (list.length >= OPEN_PR_LIMIT) throw new RpcError(`Mehr als ${OPEN_PR_LIMIT - 1} offene PRs – Branches werden nicht gelöscht`);
+	const used = new Set<string>();
+	for (const pr of list as Record<string, unknown>[]) {
+		if (!pr || typeof pr !== 'object') continue;
+		if (typeof pr.baseRefName === 'string') used.add(pr.baseRefName);
+		// Head aus einem Fork nutzt nicht den gleichnamigen Branch dieses Repositorys; unbekannt → vorsichtshalber schon
+		if (typeof pr.headRefName === 'string' && pr.isCrossRepository !== true) used.add(pr.headRefName);
+	}
+	return used;
+}
+
+/**
+ * Remote-Branches löschen: fehlende → `missing`; Stand weicht von `expect` ab → `kept` (`changed`); von einem
+ * offenen PR genutzt (live über gh geprüft) → `kept` (`open-pr`); nicht löschbare → `failed`. Der Push löscht nur
+ * mit `--force-with-lease` auf den zuvor gelesenen Stand (zwischenzeitlich geändert → `failed`). Danach den Cache
+ * nachziehen.
+ */
 async function branchDelete(ctx: RpcContext, cmd: RpcCommand) {
 	const ws = ctx.workspace;
 	const branches = parseBranchList(cmd.args.branches, cmd.project.defaultBranch);
+	const expected = parseExpected(cmd.args.expect, branches);
 	const url = ws.remoteUrl(cmd.project);
 	const cfg = ws.netConfig(cmd.project).flatMap((c) => ['-c', c]);
 	// Reserve fürs Aufräumen und die Antwort innerhalb des RPC-Zeitlimits
 	const deadline = Date.now() + RPC_TIMEOUT_MS - 3000;
 	const left = () => Math.max(1000, deadline - Date.now());
 
-	/** Welche der Branches gibt es auf dem Remote? */
-	const existing = async (list: string[]): Promise<Set<string>> => {
+	/** Welche der Branches gibt es auf dem Remote (mit SHA)? */
+	const existing = async (list: string[]): Promise<Map<string, string>> => {
 		const ls = await exec('git', [...cfg, 'ls-remote', '--heads', url, ...list.map((b) => `refs/heads/${b}`)], {
 			env: ws.env,
 			timeoutMs: Math.min(12_000, left())
 		});
 		if (ls.code !== 0) throw new RpcError(`Repository nicht erreichbar: ${gitErrorText(ctx, ls)}`);
-		const found = new Set<string>();
-		for (const m of ls.stdout.matchAll(/^[0-9a-f]+\s+refs\/heads\/(\S+)$/gm)) if (m[1]) found.add(m[1]);
+		const found = new Map<string, string>();
+		for (const m of ls.stdout.matchAll(/^([0-9a-f]+)\s+refs\/heads\/(\S+)$/gm)) if (m[1] && m[2]) found.set(m[2], m[1]);
 		return found;
 	};
 
 	const present = await existing(branches);
 	const missing = branches.filter((b) => !present.has(b));
-	const toDelete = branches.filter((b) => present.has(b));
+	const kept: { branch: string; reason: 'open-pr' | 'changed' }[] = [];
+	let candidates = branches.filter((b) => present.has(b));
+	for (const b of candidates) {
+		const want = expected.get(b);
+		if (want && want !== present.get(b)) kept.push({ branch: b, reason: 'changed' });
+	}
+	candidates = candidates.filter((b) => !kept.some((k) => k.branch === b));
+	if (candidates.length) {
+		const used = await openPrBranches(ctx, cmd, Math.min(10_000, left()));
+		for (const b of candidates) if (used.has(b)) kept.push({ branch: b, reason: 'open-pr' });
+	}
+	const toDelete = candidates.filter((b) => !kept.some((k) => k.branch === b));
 	const deleted: string[] = [];
 	const failed: { branch: string; error: string }[] = [];
 
@@ -471,8 +537,10 @@ async function branchDelete(ctx: RpcContext, cmd: RpcCommand) {
 			cwd = tmp;
 		}
 		const hooks = ['-c', `core.hooksPath=${ws.emptyHooksDir.replace(/\\/g, '/')}`];
+		// Nur löschen, wenn der Remote noch auf dem gelesenen Stand ist
+		const lease = (list: string[]) => list.map((b) => `--force-with-lease=refs/heads/${b}:${present.get(b) ?? ''}`);
 		const push = (list: string[]) =>
-			exec('git', [...cfg, ...hooks, 'push', '--quiet', '--no-verify', url, '--delete', ...list.map((b) => `refs/heads/${b}`)], {
+			exec('git', [...cfg, ...hooks, 'push', '--quiet', '--no-verify', ...lease(list), url, '--delete', ...list.map((b) => `refs/heads/${b}`)], {
 				cwd,
 				env: ws.env,
 				timeoutMs: Math.min(15_000, left())
@@ -482,7 +550,7 @@ async function branchDelete(ctx: RpcContext, cmd: RpcCommand) {
 			if (all.code === 0) deleted.push(...toDelete);
 			else {
 				// Evtl. teilweise gelöscht: Stand neu lesen, den Rest einzeln versuchen
-				const still = await existing(toDelete).catch(() => new Set(toDelete));
+				const still = await existing(toDelete).catch(() => new Map(toDelete.map((b) => [b, ''])));
 				for (const b of toDelete) {
 					if (!still.has(b)) deleted.push(b);
 					else if (Date.now() >= deadline) failed.push({ branch: b, error: 'Zeitlimit überschritten' });
@@ -508,7 +576,7 @@ async function branchDelete(ctx: RpcContext, cmd: RpcCommand) {
 			(ctx.log ?? silentLogger).warn('Lokale Branches konnten nicht aufgeräumt werden', errorMessage(e));
 		}
 	}
-	return { deleted, missing, failed };
+	return { deleted, missing, failed, kept };
 }
 
 /** Eine RPC-Anfrage ausführen und das validierte Ergebnis liefern */

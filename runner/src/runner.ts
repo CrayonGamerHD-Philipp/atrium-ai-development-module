@@ -282,7 +282,7 @@ export class Runner {
 	async start(): Promise<void> {
 		await mkdir(this.o.config.workDir, { recursive: true });
 		const [git, ghOk, ptyOk] = await Promise.all([hasCommand('git'), hasCommand('gh'), this.pty.available()]);
-		this.capabilities = { question: true, branchDelivery: true, prUpdate: true, limitReport: true, branchCleanup: git, git, gh: ghOk, pty: ptyOk, os: `${os.platform()}-${os.arch()}`.slice(0, 40) };
+		this.capabilities = { question: true, branchDelivery: true, prUpdate: true, limitReport: true, branchCleanup: git && ghOk, git, gh: ghOk, pty: ptyOk, os: `${os.platform()}-${os.arch()}`.slice(0, 40) };
 		if (!git) this.log.error('git wurde nicht gefunden – Läufe sind nicht möglich');
 		if (!ghOk) this.log.warn('gh wurde nicht gefunden – PRs und PR-Übersicht sind nicht möglich');
 		if (!ptyOk) this.log.info('node-pty nicht verfügbar – Terminals sind deaktiviert');
