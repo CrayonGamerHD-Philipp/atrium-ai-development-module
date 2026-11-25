@@ -110,6 +110,7 @@ export async function registerRunner(
 				WHERE runner_id = ${runnerId} AND key NOT IN (${inList(keys)})`
 			: sql`UPDATE provider_account SET logged_in = false WHERE runner_id = ${runnerId}`
 	);
+	if (input.runIds) await releaseOrphanedRuns(tx, fx, runnerId, input.runIds);
 	fx.overview = true;
 	fx.dispatch = true;
 	return {
@@ -117,6 +118,32 @@ export async function registerRunner(
 		status: String(runner!.status) as RegisterResult['status'],
 		heartbeatSec: HEARTBEAT_SEC
 	};
+}
+
+/**
+ * Anmeldung mit `runIds`: laufende Läufe dieses Runners, die er nicht mehr ausführt (Neustart, Absturz), sofort
+ * als `lost` freigeben, statt bis zum Ende der Lease zu warten. Der Versuch zählt wie beim Lease-Ablauf (ein
+ * Auftrag, der den Runner wiederholt abstürzen lässt, endet so nach `max_attempts`); ein geordnetes Beenden meldet
+ * seine Läufe vorher selbst als `cancelled`. Angebotene Läufe holt der Runner nach der Anmeldung erneut ab.
+ */
+async function releaseOrphanedRuns(
+	tx: Tx,
+	fx: Effects,
+	runnerId: string,
+	active: string[]
+): Promise<number> {
+	const runs = await rowsOf(
+		tx,
+		active.length
+			? sql`SELECT * FROM run WHERE runner_id = ${runnerId} AND status = 'running'
+					AND id NOT IN (${inList(active)}) ORDER BY created_at FOR UPDATE`
+			: sql`SELECT * FROM run WHERE runner_id = ${runnerId} AND status = 'running'
+					ORDER BY created_at FOR UPDATE`
+	);
+	for (const run of runs) {
+		await loseRun(tx, fx, run, 'Runner wurde neu gestartet – Lauf wird neu eingeplant', true);
+	}
+	return runs.length;
 }
 
 export async function heartbeat(
