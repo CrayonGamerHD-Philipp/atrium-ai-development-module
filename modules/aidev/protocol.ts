@@ -57,6 +57,8 @@ export const registerInput = z.object({
 		question: z.boolean().optional(),
 		/** Versteht `delivery.mode = 'branch'` (ältere Runner verwerfen solche Angebote) */
 		branchDelivery: z.boolean().optional(),
+		/** Versteht `delivery.mode = 'pr-update'` (ältere Runner verwerfen solche Angebote) */
+		prUpdate: z.boolean().optional(),
 		git: z.boolean(),
 		gh: z.boolean(),
 		pty: z.boolean(),
@@ -108,7 +110,12 @@ export const deliverySchema = z.discriminatedUnion('mode', [
 	/** Eigenen Branch pushen, ohne PR oder Push auf den Haupt-Branch */
 	z.object({ mode: z.literal('branch') }),
 	/** Teilauftrag: eigenen Branch in den Integrations-Branch des Elternauftrags mergen und pushen */
-	z.object({ mode: z.literal('integrate'), integrationBranch: shortText(200) })
+	z.object({ mode: z.literal('integrate'), integrationBranch: shortText(200) }),
+	/**
+	 * Bestehenden PR `number` bearbeiten: in dessen Head-Branch (= `offer.branch`) pushen,
+	 * keinen neuen PR öffnen, kein Force-Push; Ergebnis als PR-Kommentar
+	 */
+	z.object({ mode: z.literal('pr-update'), number: z.number().int().positive() })
 ]);
 export type Delivery = z.infer<typeof deliverySchema>;
 
