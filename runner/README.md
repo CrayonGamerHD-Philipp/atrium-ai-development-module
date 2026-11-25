@@ -103,7 +103,8 @@ der Runner Aufträge. Konten, deren CLI fehlt oder die nicht angemeldet sind, me
    Orchestrierung wird der Plan (```json-Block) mitgesendet.
 5. **Schreibend**: offene Änderungen committen (Trailer `Aidev-Task: <id>`), **testCmd** (Fehlschlag → nichts
    pushen), dann Auslieferung: `pr` (Push + `gh pr create`, optional Auto-Merge), `direct` (Rebase + Push auf den
-   Haupt-Branch, bis zu 3 Versuche), `integrate` (Merge `--no-ff` in den Integrations-Branch, bis zu 3 Versuche) oder
+   Haupt-Branch, bis zu 3 Versuche), `integrate` (Merge `--no-ff` in den Integrations-Branch, bis zu 3 Versuche),
+   `pr-update` (Push ohne Force auf den Head-Branch eines bestehenden PR, Zusammenfassung als PR-Kommentar) oder
    `none`. Konflikte → `conflict` mit Dateiliste.
 
 Worktrees bleiben nach dem Lauf erhalten (Editor/Terminal „Lauf“), aufgeräumt wird beim Start und stündlich
@@ -148,6 +149,11 @@ Beim Beenden (`SIGTERM`/`SIGINT`) nimmt der Runner keine neuen Läufe an, bricht
   Workflows: Read & write). Auf dem Haupt-Branch **Branch-Protection** aktivieren (Reviews/Checks), dann kann auch ein
   fehlerhafter Agent nichts direkt zerstören. Force-Pushes macht der Runner nur `--force-with-lease` auf eigene
   `aidev/`-Branches.
+- **Bestehende PRs bearbeiten (`pr-update`)**: Das Token braucht Schreibrechte auf die Head-Branches der PRs
+  (fine-grained PAT: **Contents: Read & write**) und **Pull requests: Read & write**, um den PR-Kontext zu lesen und
+  die Zusammenfassung als Kommentar zu posten. `gh` muss im Runner verfügbar und angemeldet sein (`GH_TOKEN` oder
+  `gh auth login`). Bei `pr-update` pusht der Runner nie mit Force, auch nicht auf `aidev/`-Branches. Liegen die
+  Branches unter Branch-Protection, muss das Token dort pushen dürfen.
 - **Zugangsdaten bleiben auf dem Runner**: CLI-Logins, gh-Token und API-Keys werden nie an Atrium übertragen. Der
   API-Key des Runners wird nicht an Agents, Projektbefehle oder Terminals weitergegeben.
 - **Bereinigung**: Alle hochgeladenen Texte (Ereignisse, Fehlermeldungen, Diffs, Terminal-Ausgabe) werden von Tokens
