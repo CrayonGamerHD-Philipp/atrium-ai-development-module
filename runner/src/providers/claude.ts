@@ -12,6 +12,7 @@ import os from 'node:os';
 import path from 'node:path';
 import type { AccountConfig } from '../config.ts';
 import { exec } from '../util/proc.ts';
+import { claudeRateLimitWindows } from './limit-snapshot.ts';
 import { claudeWindowKind, detectLimit } from './limits.ts';
 import { probeFailed, probeVersion, runCliAgent } from './process.ts';
 import {
@@ -144,6 +145,9 @@ export function createClaudeParser(now: () => Date = () => new Date()): LinePars
 			}
 			if (type === 'rate_limit_event' && isObj(o.rate_limit_info)) {
 				const info = o.rate_limit_info;
+				// Limit-Stand bei jedem Ereignis melden (auch `allowed`); Treffer und Warnungen bleiben unverändert
+				const windows = claudeRateLimitWindows(info);
+				if (windows) out.push({ kind: 'limits', windows });
 				const status = typeof info.status === 'string' ? info.status : '';
 				const resetsAt =
 					typeof info.resetsAt === 'number' && info.resetsAt > 0

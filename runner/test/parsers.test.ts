@@ -3,7 +3,10 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { createClaudeParser } from '../src/providers/claude.ts';
-import { codexArgs, createCodexParser } from '../src/providers/codex.ts';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import os from 'node:os';
+import { codexArgs, createCodexParser, readCodexSessionLimits, withSessionLimits } from '../src/providers/codex.ts';
+import { AsyncQueue } from '../src/util/async.ts';
 import { createGeminiParser } from '../src/providers/gemini.ts';
 import { openAiConfigArgs } from '../src/providers/openai-compat.ts';
 import type { LineParser, NormalizedEvent } from '../src/providers/types.ts';
@@ -60,6 +63,40 @@ describe('Claude-Parser', () => {
 		expect(result.exitCode).not.toBe(0);
 	});
 
+	it('meldet den Limit-Stand bei jedem rate_limit_event (auch allowed)', () => {
+		const { events, result } = run(createClaudeParser(now), 'claude-limits.jsonl');
+		const limits = events.filter((e) => e.kind === 'limits');
+		expect(limits).toHaveLength(3);
+		expect(limits[0]).toEqual({
+			kind: 'limits',
+			windows: [{ window: '5h', label: 'five_hour', usedPercent: 37, resetsAt: new Date(1795566600 * 1000).toISOString(), status: 'allowed' }]
+		});
+		expect(limits[1]).toMatchObject({ windows: [{ window: 'week-sonnet', usedPercent: 85, status: 'warning' }] });
+		expect(limits[2]).toMatchObject({
+			windows: [
+				{ window: 'week', usedPercent: 52, resetsAt: new Date(1795999999000).toISOString() },
+				{ window: 'week-opus', usedPercent: 10 }
+			]
+		});
+		// bisheriges Verhalten: Warnung als Status, kein Limit-Treffer
+		expect(events.filter((e) => e.kind === 'status')).toHaveLength(1);
+		expect(events.filter((e) => e.kind === 'limit')).toHaveLength(0);
+		expect(result.limit).toBeNull();
+		expect(result.exitCode).toBe(0);
+	});
+
+	it('meldet den Limit-Stand auch in den bestehenden Fixtures', () => {
+		const ok = run(createClaudeParser(now), 'claude-success.jsonl');
+		expect(ok.events.filter((e) => e.kind === 'limits')).toEqual([
+			{ kind: 'limits', windows: [{ window: '5h', label: 'five_hour', usedPercent: null, resetsAt: new Date(1795566600 * 1000).toISOString(), status: 'allowed' }] }
+		]);
+		const hit = run(createClaudeParser(now), 'claude-limit.jsonl', 1);
+		const kindsHit = kinds(hit.events);
+		expect(kindsHit.indexOf('limits')).toBeGreaterThanOrEqual(0);
+		expect(kindsHit.indexOf('limits')).toBeLessThan(kindsHit.indexOf('limit'));
+		expect(hit.events.find((e) => e.kind === 'limits')).toMatchObject({ windows: [{ window: '5h', status: 'rejected' }] });
+	});
+
 	it('erkennt Limits in stderr bei Fehlschlag', () => {
 		const p = createClaudeParser(now);
 		const fin = p.finish(1, 'API Error: 429 rate_limit_error');
@@ -88,6 +125,63 @@ describe('Codex-Parser', () => {
 		expect(kinds(events)).toContain('thinking');
 		expect(kinds(events)).toContain('status');
 		expect(result.limit).toBeNull();
+	});
+
+	it('meldet rate_limits aus dem Stream', () => {
+		const { events, result } = run(createCodexParser('codex', '', now), 'codex-ratelimits.jsonl');
+		expect(events.filter((e) => e.kind === 'limits')).toEqual([
+			{
+				kind: 'limits',
+				windows: [
+					{ window: '5h', label: 'primary', usedPercent: 12.5, resetsAt: '2026-11-24T11:00:00.000Z', status: 'allowed' },
+					{ window: 'week', label: 'secondary', usedPercent: 40, resetsAt: new Date(1795566600 * 1000).toISOString(), status: 'allowed' }
+				]
+			}
+		]);
+		expect(result.lastText).toBe('Fertig.');
+		expect(result.usage?.inputTokens).toBe(100);
+		// Fixture ohne rate_limits: keine limits-Ereignisse
+		expect(run(createCodexParser('codex', '', now), 'codex-success.jsonl').events.filter((e) => e.kind === 'limits')).toEqual([]);
+	});
+
+	it('liest den Limit-Stand aus der Sitzungsdatei nach', async () => {
+		const home = await mkdtemp(path.join(os.tmpdir(), 'codex-home-'));
+		try {
+			const thread = '01a20fb8-67b8-7ee3-80bd-f716063bef6e';
+			const d = now();
+			const dir = path.join(home, 'sessions', String(d.getFullYear()), String(d.getMonth() + 1).padStart(2, '0'), String(d.getDate()).padStart(2, '0'));
+			await mkdir(dir, { recursive: true });
+			const lines = [
+				{ timestamp: '2026-11-24T09:00:00.000Z', type: 'session_meta', payload: { id: thread } },
+				{ timestamp: '2026-11-24T09:30:00.000Z', type: 'event_msg', payload: { type: 'token_count', rate_limits: { primary: { used_percent: 5, window_minutes: 300, resets_in_seconds: 60 } } } },
+				{ timestamp: '2026-11-24T09:50:00.000Z', type: 'event_msg', payload: { type: 'token_count', rate_limits: { primary: { used_percent: 20, window_minutes: 300, resets_in_seconds: 600 } } } },
+				{ timestamp: '2026-11-24T09:55:00.000Z', type: 'response_item', payload: { type: 'message' } }
+			];
+			await writeFile(path.join(dir, `rollout-2026-11-24T09-00-00-${thread}.jsonl`), lines.map((l) => JSON.stringify(l)).join('\n') + '\n{kaputt\n');
+			expect(await readCodexSessionLimits(home, thread, now())).toEqual([
+				// resets_in_seconds relativ zum Zeitstempel der Zeile
+				{ window: '5h', label: 'primary', usedPercent: 20, resetsAt: '2026-11-24T10:00:00.000Z', status: 'allowed' }
+			]);
+			expect(await readCodexSessionLimits(home, 'unbekannt-1234', now())).toBeNull();
+			expect(await readCodexSessionLimits(path.join(home, 'fehlt'), thread, now())).toBeNull();
+			expect(await readCodexSessionLimits(home, '../../etc', now())).toBeNull();
+
+			// Prozess ohne limits im Stream → Ereignis aus der Sitzungsdatei am Ende
+			const q = new AsyncQueue<NormalizedEvent>();
+			q.push({ kind: 'session', id: thread });
+			q.end();
+			const wrapped = withSessionLimits(
+				{ events: q, done: Promise.resolve({ exitCode: 0, sessionId: thread, usage: null, lastText: '', limit: null, error: null }), kill() {} },
+				home,
+				now
+			);
+			const evs: NormalizedEvent[] = [];
+			for await (const e of wrapped.events) evs.push(e);
+			expect(kinds(evs)).toEqual(['session', 'limits']);
+			expect((await wrapped.done).exitCode).toBe(0);
+		} finally {
+			await rm(home, { recursive: true, force: true });
+		}
 	});
 
 	it('erkennt das Nutzungslimit', () => {

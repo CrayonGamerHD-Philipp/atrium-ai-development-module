@@ -32,6 +32,7 @@ import type { Logger } from './log.ts';
 import { silentLogger } from './log.ts';
 import { extractPlan } from './plan.ts';
 import type { AdapterRegistry } from './providers/index.ts';
+import { LimitStore, limitHitWindow } from './providers/limit-snapshot.ts';
 import type { AgentLimit, AgentResult, AgentUsage } from './providers/types.ts';
 import type { FinishInput, RunEventKind, RunOffer } from './protocol.ts';
 import type { Redactor } from './redact.ts';
@@ -78,6 +79,8 @@ export interface ExecutorOptions {
 	redactor: Redactor;
 	accounts: () => Map<string, AccountState>;
 	log?: Logger;
+	/** Gemeinsamer Limit-Stand je Konto (Heartbeat); Standard: eigener Speicher */
+	limits?: LimitStore;
 	/** Gnadenfrist für Batcher in Tests */
 	batcherFlushMs?: number;
 }
@@ -90,9 +93,12 @@ export class Executor {
 	private readonly seen = new Map<string, number>();
 	private stopping = false;
 	private readonly log: Logger;
+	/** Zuletzt beobachteter Limit-Stand je Konto und Fenster */
+	readonly limits: LimitStore;
 
 	constructor(private readonly o: ExecutorOptions) {
 		this.log = o.log ?? silentLogger;
+		this.limits = o.limits ?? new LimitStore();
 	}
 
 	get slotsUsed(): number {
@@ -212,6 +218,8 @@ export class Executor {
 		let sessionId: string | null = offer.resumeSessionId;
 		let usage: AgentUsage | null = null;
 		let limitPosted = false;
+		/** Hat der Agent in diesem Lauf einen Limit-Stand gemeldet? */
+		let streamLimits = false;
 		const finish: FinishInput = {
 			status: 'failed',
 			sessionId: null,
@@ -241,11 +249,18 @@ export class Executor {
 		const postLimit = async (l: AgentLimit) => {
 			if (limitPosted) return;
 			limitPosted = true;
+			// Ohne Stand aus dem Stream: Fenster aus der Fehlermeldung ableiten (nur 5h/Woche)
+			if (!streamLimits) {
+				const w = limitHitWindow(l.limitKind, l.resetsAt);
+				if (w) this.limits.update(acct.key, [w], 'error');
+			}
+			const windows = this.limits.snapshot(acct.key)?.windows;
 			try {
 				await api.limit(offer.runId, {
 					kind: l.limitKind,
 					resetsAt: l.resetsAt,
-					raw: redactor.redact(l.raw).slice(0, 2000)
+					raw: redactor.redact(l.raw).slice(0, 2000),
+					...(windows?.length ? { windows } : {})
 				});
 			} catch (e) {
 				log.warn('Limit-Meldung fehlgeschlagen', errorMessage(e));
@@ -305,7 +320,10 @@ export class Executor {
 			for await (const ev of proc.events) {
 				if (ev.kind === 'usage') usage = ev.usage;
 				else if (ev.kind === 'session') sessionId = ev.id;
-				else if (ev.kind === 'limit') {
+				else if (ev.kind === 'limits') {
+					streamLimits = true;
+					this.limits.update(acct.key, ev.windows, 'stream');
+				} else if (ev.kind === 'limit') {
 					if (!limit) {
 						limit = { limitKind: ev.limitKind, resetsAt: ev.resetsAt, raw: ev.raw };
 						emit('error', { text: `Limit erreicht (${ev.limitKind})${ev.resetsAt ? `, zurückgesetzt ${ev.resetsAt}` : ''}` });

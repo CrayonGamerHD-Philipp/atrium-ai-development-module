@@ -1,0 +1,7 @@
+{"type":"system","subtype":"init","session_id":"7c1d2e3f-4a5b-4c6d-8e7f-901a2b3c4d5e","model":"claude-sonnet-5","claude_code_version":"2.1.331"}
+{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":1795566600,"rateLimitType":"five_hour","utilization":0.37,"overageStatus":"rejected","isUsingOverage":false},"session_id":"7c1d2e3f-4a5b-4c6d-8e7f-901a2b3c4d5e"}
+{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","rateLimitType":"seven_day_sonnet","resetsAt":1795566600,"utilization":0.85,"surpassedThreshold":0.75,"overageStatus":"allowed","isUsingOverage":false},"session_id":"7c1d2e3f-4a5b-4c6d-8e7f-901a2b3c4d5e"}
+{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","rateLimitType":"seven_day","resetsAt":1795999999000,"unifiedWindows":{"seven_day":{"utilization":0.52},"seven_day_opus":{"utilization":0.1,"resetsAt":1795999999,"status":"allowed"}}},"session_id":"7c1d2e3f-4a5b-4c6d-8e7f-901a2b3c4d5e"}
+{"type":"rate_limit_event","rate_limit_info":"kaputt","session_id":"7c1d2e3f-4a5b-4c6d-8e7f-901a2b3c4d5e"}
+{"type":"assistant","message":{"model":"claude-sonnet-5","id":"msg_01","type":"message","role":"assistant","content":[{"type":"text","text":"Erledigt."}]},"session_id":"7c1d2e3f-4a5b-4c6d-8e7f-901a2b3c4d5e"}
+{"type":"result","subtype":"success","is_error":false,"result":"Erledigt.","session_id":"7c1d2e3f-4a5b-4c6d-8e7f-901a2b3c4d5e","total_cost_usd":0.01,"usage":{"input_tokens":5,"output_tokens":3}}
