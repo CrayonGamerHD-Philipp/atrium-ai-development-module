@@ -173,7 +173,7 @@ export const taskEndpoints: AnyApiEndpoint[] = [
 		path: '/tasks/:id/retry',
 		summary: 'Auftrag neu starten',
 		description:
-			'Beendete, fehlgeschlagene, abgebrochene oder auf Rückmeldung wartende Aufträge (Versuche = 0). Body optional: `subtasks` = `failed` (Standard, nur fehlgeschlagene/abgebrochene Teilaufträge) oder `all` (alle Teilaufträge, Plan wird erneut ausgeliefert). Teilaufträge eines gescheiterten Elternauftrags öffnen diesen wieder.',
+			'Beendete, fehlgeschlagene, abgebrochene, auf Rückmeldung wartende sowie wartende (`queued`) oder blockierte (`blocked`) Aufträge (Versuche = 0). Bei wartenden/blockierten Aufträgen werden hängengebliebene eigene Läufe abgebrochen. Body optional: `subtasks` = `failed` (Standard, nur fehlgeschlagene/abgebrochene Teilaufträge) oder `all` (alle Teilaufträge, Plan wird erneut ausgeliefert). Teilaufträge eines gescheiterten Elternauftrags öffnen diesen wieder.',
 		tags,
 		permission: PERM.projectView,
 		params: idParams,
@@ -186,7 +186,7 @@ export const taskEndpoints: AnyApiEndpoint[] = [
 				assertCanEditTask(ctx, task);
 				if (!RESTARTABLE.includes(String(task.status) as TaskStatus)) {
 					throw errors.conflict(
-						'Nur beendete, fehlgeschlagene, abgebrochene oder auf Rückmeldung wartende Aufträge lassen sich neu starten'
+						'Nur beendete, fehlgeschlagene, abgebrochene, wartende, blockierte oder auf Rückmeldung wartende Aufträge lassen sich neu starten'
 					);
 				}
 				const reset = await restartTask(tx, fx, task, { subtasks, reopenParents: true });
