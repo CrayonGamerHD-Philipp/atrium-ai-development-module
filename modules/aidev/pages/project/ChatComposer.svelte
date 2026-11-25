@@ -2,8 +2,9 @@
 	// Chat-Eingabe als eine kompakte Zeile: [Modus] [Optionen] [mitwachsendes Textfeld] [Senden].
 	// Modus per Menü (mit Live-Erkennung im Auto-Modus), erweiterte Optionen im Popover (Desktop) bzw.
 	// Blatt von unten (mobil); abweichende Optionen stehen als entfernbare Chips über der Eingabe.
-	// Entwurf pro Projekt und Modus werden im Browser gemerkt.
-	import { onMount, untrack } from 'svelte';
+	// Entwurf (pro Benutzer und Projekt) und Modus werden im Browser gemerkt.
+	import { onMount } from 'svelte';
+	import { page } from '$app/state';
 	import { MediaQuery } from 'svelte/reactivity';
 	import { toast } from 'svelte-sonner';
 	import ArrowUp from '@lucide/svelte/icons/arrow-up';
@@ -49,6 +50,8 @@
 	let busy = $state(false);
 	let textarea = $state<HTMLTextAreaElement | null>(null);
 	let optionsOpen = $state(false);
+	/** „Optionen …“ im Modus-Menü gewählt → Blatt erst öffnen, wenn das Menü den Fokus abgegeben hat */
+	let pendingOptions = false;
 	/** Browser ohne `field-sizing: content` → Höhe per JS anpassen */
 	let manualGrow = $state(false);
 
@@ -112,25 +115,18 @@
 	const customized = $derived(chips.length > 0);
 	const showAutoChip = $derived(mode === 'auto' && hasText);
 
-	// --- Entwurf pro Projekt ------------------------------------------------------------
-	const draftKey = $derived(DRAFT_PREFIX + store.id);
-	/** Schlüssel, dessen Entwurf bereits geladen ist (vorher nichts speichern) */
-	let loadedKey = $state<string | null>(null);
-	$effect(() => {
-		const key = draftKey;
-		untrack(() => {
-			const saved = storage.get(key);
-			// beim ersten Laden gewinnt ein von außen gesetzter Text; beim Projektwechsel der Entwurf
-			if (loadedKey === null) {
-				if (saved && !body.trim()) body = saved;
-			} else body = saved ?? '';
-			loadedKey = key;
-		});
-	});
+	// --- Entwurf pro Benutzer und Projekt ---------------------------------------------------
+	// An den Benutzer gebunden, damit auf geteilten Geräten niemand den Entwurf eines anderen sieht. Ohne
+	// bekannten Benutzer wird nichts gespeichert. Die Komponente wird beim Projektwechsel neu aufgebaut
+	// (`{#key store}` in ProjectPage), daher genügt einmaliges Laden in `onMount`.
+	const userId = $derived((page.data as { user?: { id?: string } | null }).user?.id ?? null);
+	const draftKey = $derived(userId ? `${DRAFT_PREFIX}${userId}.${store.id}` : null);
+	/** Entwurf geladen (vorher nichts speichern, sonst würde er beim Start gelöscht) */
+	let draftLoaded = $state(false);
 	$effect(() => {
 		const key = draftKey;
 		const text = body;
-		if (loadedKey !== key) return;
+		if (!draftLoaded || !key) return;
 		if (text.trim()) storage.set(key, text);
 		else storage.remove(key);
 	});
@@ -146,6 +142,12 @@
 	onMount(() => {
 		const saved = storage.get(MODE_KEY);
 		if (isChatMode(saved)) mode = saved;
+		// ein von außen gesetzter Text (z. B. Vorschlag) hat Vorrang vor dem gespeicherten Entwurf
+		const draft = draftKey ? storage.get(draftKey) : null;
+		if (draft && !body.trim()) body = draft;
+		draftLoaded = true;
+		// alter, nicht benutzergebundener Schlüssel (bis 0.3.0) – nicht übernehmen, nur aufräumen
+		storage.remove(DRAFT_PREFIX + store.id);
 		manualGrow = !(typeof CSS !== 'undefined' && CSS.supports?.('field-sizing', 'content'));
 	});
 
@@ -197,9 +199,12 @@
 		if (e.ctrlKey || e.metaKey || (enterSends && !e.shiftKey && !e.altKey)) void send(e);
 	}
 
-	function openOptions() {
-		// erst nach dem Schließen des Menüs öffnen, damit der Fokus ins Blatt wandert
-		setTimeout(() => (optionsOpen = true), 0);
+	/** Menü gibt beim Schließen den Fokus zurück – bei „Optionen …“ stattdessen das Blatt öffnen */
+	function onMenuCloseAutoFocus(e: Event) {
+		if (!pendingOptions) return;
+		pendingOptions = false;
+		e.preventDefault();
+		optionsOpen = true;
 	}
 
 	const iconBtn =
@@ -345,7 +350,13 @@
 					</Button>
 				{/snippet}
 			</DropdownMenu.Trigger>
-			<DropdownMenu.Content align="start" side="top" sideOffset={8} class="w-72">
+			<DropdownMenu.Content
+				align="start"
+				side="top"
+				sideOffset={8}
+				class="w-72"
+				onCloseAutoFocus={onMenuCloseAutoFocus}
+			>
 				<DropdownMenu.Label class="text-xs text-muted-foreground"
 					>Wie soll die Nachricht wirken?</DropdownMenu.Label
 				>
@@ -362,7 +373,7 @@
 				</DropdownMenu.RadioGroup>
 				{#if !sm.current && hasOptions}
 					<DropdownMenu.Separator />
-					<DropdownMenu.Item class="min-h-11" onSelect={openOptions}>
+					<DropdownMenu.Item class="min-h-11" onSelect={() => (pendingOptions = true)}>
 						<SlidersHorizontal class="size-4" aria-hidden="true" />
 						<span class="flex-1">Optionen …</span>
 						{#if customized}
