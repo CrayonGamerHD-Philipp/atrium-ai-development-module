@@ -126,13 +126,18 @@ export async function insertChat(
 	const id = crypto.randomUUID();
 	await tx.execute(
 		sql`INSERT INTO chat_message (id, project_id, task_id, author_user_id, kind, body)
-			VALUES (${id}, ${m.projectId}, ${m.taskId}, ${m.authorUserId ?? null}, ${m.kind}, ${clip(m.body, 20_000)})`
+			VALUES (${id}, ${m.projectId}, ${m.taskId}, ${m.authorUserId ?? null}, ${m.kind}, ${clip(m.body, m.kind === 'agent' ? 40_000 : 20_000)})`
 	);
 	fx.chat.add(id);
 	return id;
 }
 
 function agentText(task: Row, status: TaskStatus): string {
+	if (task.chat_question === true) {
+		if (status === 'done') return str(task.result_summary) ?? 'Keine Antwort erhalten.';
+		if (status === 'cancelled') return 'Frage abgebrochen.';
+		return `Frage fehlgeschlagen: ${str(task.error_message) ?? 'Unbekannter Fehler'}`;
+	}
 	const title = `„${String(task.title)}“`;
 	const summary = str(task.result_summary);
 	const error = str(task.error_message);
@@ -156,6 +161,9 @@ function agentText(task: Row, status: TaskStatus): string {
 			parts.push(`Auftrag ${title}: ${status}`);
 	}
 	if (prLine) parts.push(prLine);
+	if (status === 'done' && task.branch_pushed === true && task.branch) {
+		parts.push(`Branch bereitgestellt: ${String(task.branch)} (ohne Pull Request).`);
+	}
 	if (summary && (status === 'done' || status === 'review')) parts.push(clip(summary, 4000));
 	return parts.join('\n\n');
 }
@@ -195,7 +203,9 @@ export async function transition(
 	if (status === 'queued') fx.dispatch = true;
 	const hasParent = !!row.parent_id;
 	if (
-		(!hasParent && ['done', 'review', 'failed', 'needs-input'].includes(status)) ||
+		(!hasParent &&
+			(['done', 'review', 'failed', 'needs-input'].includes(status) ||
+				(row.chat_question === true && status === 'cancelled'))) ||
 		(hasParent && status === 'needs-input')
 	) {
 		await insertChat(tx, fx, {
@@ -307,10 +317,10 @@ export async function createTask(
 	const role: Role = input.decompose ? 'orchestrate' : input.role;
 	await tx.execute(
 		sql`INSERT INTO task (id, project_id, title, prompt, role, status, priority, max_attempts,
-				provider_hint, created_by)
+				provider_hint, created_by, delivery)
 			VALUES (${id}, ${project.id}, ${title}, ${input.prompt}, ${role},
 				${input.draft ? 'draft' : 'queued'}, ${input.priority}, ${input.maxAttempts},
-				${input.providerHint}, ${ctx.userId})`
+				${input.providerHint}, ${ctx.userId}, ${input.delivery})`
 	);
 	for (const dep of deps) {
 		await tx.execute(sql`INSERT INTO task_dep (task_id, depends_on_id) VALUES (${id}, ${dep})`);

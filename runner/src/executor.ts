@@ -124,6 +124,8 @@ export class Executor {
 			return reject(`Unbekanntes Konto „${offer.account.key}“`);
 		if (!acct.ok) return reject(`CLI für Konto „${offer.account.key}“ nicht verfügbar`);
 		if (!acct.loggedIn) return reject(`Konto „${offer.account.key}“ ist nicht angemeldet`);
+		if (offer.delivery.mode === 'branch' && offer.branch === offer.project.defaultBranch)
+			return reject('Der Ergebnis-Branch darf nicht der Haupt-Branch sein');
 		try {
 			assertRefName(offer.branch);
 			assertRefName(offer.baseRef, 'Basis');
@@ -211,6 +213,7 @@ export class Executor {
 			commits: [],
 			pr: null,
 			merged: false,
+			branchPushed: false,
 			summary: null,
 			errorKind: null,
 			errorMessage: null,
@@ -260,7 +263,7 @@ export class Executor {
 			});
 
 			// 2. setupCmd
-			if (offer.project.setupCmd.trim()) {
+			if (!offer.question && offer.project.setupCmd.trim()) {
 				emit('status', { text: 'Projekt wird eingerichtet (setupCmd)' });
 				const r = await this.shell(offer.project.setupCmd, wtDir, publicEnv(baseEnv), signal, timeoutMs, emit);
 				checkAbort();
@@ -279,6 +282,7 @@ export class Executor {
 				resumeSessionId: offer.resumeSessionId,
 				env: baseEnv,
 				readOnly: offer.readOnly,
+				question: offer.question === true,
 				signal,
 				account: acct,
 				tmpDir
@@ -336,7 +340,9 @@ export class Executor {
 			const newCommits = await countCommits(ws, wtDir, prepared.startSha);
 			finish.branch = offer.branch;
 			finish.headSha = await headSha(ws, wtDir);
-			if (newCommits === 0) {
+			// Ein wiederaufgenommener oder zusammengeführter Branch kann bereits auszuliefernde Commits enthalten.
+			const pendingCommits = newCommits || await countCommits(ws, wtDir, `origin/${offer.baseRef}`);
+			if (pendingCommits === 0) {
 				emit('status', { text: NO_CHANGES });
 				finish.status = 'succeeded';
 				finish.summary = summary ? `${summary}\n\n(${NO_CHANGES})` : NO_CHANGES;
@@ -359,7 +365,10 @@ export class Executor {
 			let commitBase = prepared.startSha;
 			const d = offer.delivery;
 			const gitEmit = (k: RunEventKind, p: Record<string, unknown>) => emit(k, p);
-			if (d.mode === 'pr') {
+			if (d.mode === 'branch') {
+				await pushBranch(ws, repo, wtDir, offer.branch, prepared.remoteSha, gitEmit);
+				finish.branchPushed = true;
+			} else if (d.mode === 'pr') {
 				await pushBranch(ws, repo, wtDir, offer.branch, prepared.remoteSha, gitEmit);
 				const pr = await ensurePullRequest(
 					ws,
@@ -446,13 +455,14 @@ export class Executor {
 			const cache = await ws.ensureCache(repo);
 			const dir = ws.runDir(offer.runId);
 			return await ws.withRepo(repo, async () => {
-				const remoteSha = await ws.revParse(cache, `refs/remotes/origin/${offer.branch}`);
+				const remoteSha = offer.question ? null : await ws.revParse(cache, `refs/remotes/origin/${offer.branch}`);
 				let start: string;
 				if (remoteSha) {
 					start = remoteSha;
 					emit('git', { action: 'worktree', detail: `Fortsetzung auf origin/${offer.branch}` });
 				} else {
 					let base = await ws.revParse(cache, `refs/remotes/origin/${offer.baseRef}`);
+					if (!base && offer.question) throw new RunError('git', `Basis ${offer.baseRef} fehlt`);
 					if (!base) {
 						emit('git', {
 							action: 'branch',
@@ -464,7 +474,7 @@ export class Executor {
 					emit('git', { action: 'worktree', detail: `Neuer Branch ${offer.branch} von origin/${offer.baseRef}` });
 				}
 				// Der Haupt-Branch bleibt der Arbeitskopie vorbehalten → dann ohne lokalen Branch
-				const branch = offer.branch === offer.project.defaultBranch ? null : offer.branch;
+				const branch = offer.question || offer.branch === offer.project.defaultBranch ? null : offer.branch;
 				await ws.addWorktree(cache, dir, start, branch);
 				return { dir, startSha: start, remoteSha };
 			});

@@ -87,7 +87,14 @@ const register = (who: string, accounts: string[]) =>
 			name: `Runner ${who}`,
 			version: '0.1.0',
 			maxSlots: 4,
-			capabilities: { git: true, gh: true, pty: true, os: 'linux' },
+			capabilities: {
+				question: true,
+				branchDelivery: true,
+				git: true,
+				gh: true,
+				pty: true,
+				os: 'linux'
+			},
 			accounts: accounts.map((key) => ({
 				key,
 				provider: 'fake',
@@ -279,6 +286,7 @@ describe('aidev', () => {
 	it('Auftrag → Angebot → Annahme → Ereignisse → Verbrauch → Abschluss mit PR', async () => {
 		const t = await createTask({ prompt: 'Füge eine README mit Installationsanleitung hinzu' });
 		expect(t.status).toBe('queued');
+		expect(t.delivery).toBe('project');
 		const offer = await offerFor(t.id);
 		firstRunId = offer.runId;
 		expect(offer).toMatchObject({
@@ -521,6 +529,86 @@ describe('aidev', () => {
 		expect((await task(parent.id)).task).toMatchObject({ status: 'review', prNumber: 9 });
 	});
 
+	it('Orchestrierung: Branch ohne PR gemeinsam ausliefern', async () => {
+		const parent = await createTask({
+			prompt: 'Großes Feature als Branch',
+			decompose: true,
+			delivery: 'branch'
+		});
+		expect(parent.role).toBe('orchestrate');
+		const plan = await offerFor(parent.id);
+		expect(plan).toMatchObject({ role: 'orchestrate', readOnly: true, expectPlan: true });
+		expect(plan.delivery.mode).toBe('none');
+		ok(await call('runner', 'POST', `/runner/runs/${plan.runId}/accept`), 201);
+		ok(
+			await finish(plan.runId, {
+				status: 'succeeded',
+				summary: 'Plan erstellt',
+				plan: {
+					summary: 'Erst recherchieren, dann bauen',
+					subtasks: [
+						{ key: 'a', title: 'Recherche', prompt: 'Recherchiere', role: 'research' },
+						{ key: 'b', title: 'Umsetzung', prompt: 'Baue es', role: 'implement', dependsOn: ['a'] }
+					]
+				}
+			}),
+			201
+		);
+		const d = await task(parent.id);
+		expect(d.task.status).toBe('blocked');
+		expect(d.task.branch).toMatch(/^aidev\/[0-9a-f]{8}-/);
+		expect(d.children.map((c) => [c.position, c.role, c.status])).toEqual([
+			[0, 'research', 'queued'],
+			[1, 'implement', 'queued']
+		]);
+		const [a, b] = d.children;
+		expect(b!.dependsOn).toEqual([a!.id]);
+
+		// nur a ist einplanbar (b wartet auf a)
+		const list = await offers();
+		expect(list.map((o) => o.taskId)).toContain(a!.id);
+		expect(list.map((o) => o.taskId)).not.toContain(b!.id);
+		const oa = list.find((o) => o.taskId === a!.id)!;
+		expect(oa).toMatchObject({ role: 'research', readOnly: true });
+		ok(await call('runner', 'POST', `/runner/runs/${oa.runId}/accept`), 201);
+		ok(await finish(oa.runId, { status: 'succeeded', summary: 'Ergebnis der Recherche' }), 201);
+
+		const ob = await offerFor(b!.id);
+		expect(ob.branch).toMatch(new RegExp(`^aidev/${parent.id.replace(/-/g, '').slice(0, 8)}/2-`));
+		expect(ob.baseRef).toBe(d.task.branch);
+		expect(ob.delivery).toEqual({ mode: 'integrate', integrationBranch: d.task.branch });
+		expect(ob.prompt).toContain('Ergebnis der Recherche');
+		ok(await call('runner', 'POST', `/runner/runs/${ob.runId}/accept`), 201);
+		ok(await finish(ob.runId, { status: 'succeeded', summary: 'gebaut', merged: true }), 201);
+
+		// alle Teilaufträge fertig → Ausliefern auf dem Integrations-Branch
+		expect((await task(parent.id)).task.status).toBe('queued');
+		const deliver = await offerFor(parent.id);
+		expect(deliver).toMatchObject({
+			role: 'implement',
+			readOnly: false,
+			branch: d.task.branch,
+			baseRef: 'main'
+		});
+		expect(deliver.delivery.mode).toBe('branch');
+		ok(await call('runner', 'POST', `/runner/runs/${deliver.runId}/accept`), 201);
+		ok(
+			await finish(deliver.runId, {
+				status: 'succeeded',
+				summary: 'ausgeliefert',
+				branch: deliver.branch,
+				branchPushed: true
+			}),
+			201
+		);
+		expect((await task(parent.id)).task).toMatchObject({
+			status: 'done',
+			prNumber: null,
+			delivery: 'branch',
+			branchPushed: true
+		});
+	});
+
 	it('Plan mit Zyklus wird abgelehnt', async () => {
 		const parent = await createTask({ prompt: 'Zyklus', decompose: true, maxAttempts: 1 });
 		const o = await offerFor(parent.id);
@@ -604,6 +692,54 @@ describe('aidev', () => {
 		expect((await call('admin', 'GET', `/tasks/${foreignTask.id}`)).status).toBe(404);
 	});
 
+	it('Chat-Fragen liefern Antworten und übernehmen nur früheren Fragenkontext', async () => {
+		const note = ok<{ task: TaskDto | null }>(
+			await call('admin', 'POST', `/projects/${projectId}/chat`, {
+				body: 'Geheime Notiz',
+				mode: 'note'
+			}),
+			201
+		);
+		expect(note.task).toBeNull();
+		const first = ok<{ task: TaskDto }>(
+			await call('admin', 'POST', `/projects/${projectId}/chat`, {
+				body: 'Wie funktioniert das?',
+				mode: 'question',
+				role: 'implement',
+				decompose: true
+			}),
+			201
+		);
+		expect(first.task.role).toBe('research');
+		const offer = await offerFor(first.task.id);
+		expect(offer).toMatchObject({ question: true, readOnly: true, expectPlan: false });
+		ok(await call('runner', 'POST', `/runner/runs/${offer.runId}/accept`), 201);
+		const answer = 'Antwort '.repeat(900).trim();
+		ok(await finish(offer.runId, { status: 'succeeded', summary: answer }), 201);
+		ok(await finish(offer.runId, { status: 'succeeded', summary: answer }), 201);
+		const chat = ok<ChatMessageDto[]>(await call('admin', 'GET', `/projects/${projectId}/chat`));
+		expect(chat.filter((m) => m.taskId === first.task.id && m.kind === 'agent')).toHaveLength(1);
+		expect(chat.find((m) => m.taskId === first.task.id && m.kind === 'agent')?.body).toBe(answer);
+		const second = ok<{ task: TaskDto }>(
+			await call('admin', 'POST', `/projects/${projectId}/chat`, {
+				body: 'Und warum?',
+				mode: 'question'
+			}),
+			201
+		);
+		const next = await offerFor(second.task.id);
+		expect(next.prompt).toContain('Wie funktioniert das?');
+		expect(next.prompt).toContain('Antwort');
+		expect(next.prompt).not.toContain('Geheime Notiz');
+		ok(await call('runner', 'POST', `/runner/runs/${next.runId}/accept`), 201);
+		ok(await call('admin', 'PATCH', `/tasks/${second.task.id}`, { maxAttempts: 1 }));
+		ok(await finish(next.runId, { status: 'succeeded', summary: '' }), 201);
+		const after = ok<ChatMessageDto[]>(await call('admin', 'GET', `/projects/${projectId}/chat`));
+		expect(after.find((m) => m.taskId === second.task.id && m.kind === 'agent')?.body).toContain(
+			'keine Antwort'
+		);
+	});
+
 	it('Chat im Modus „task“ legt einen Auftrag an', async () => {
 		const res = ok<{ message: ChatMessageDto; task: TaskDto }>(
 			await call('admin', 'POST', `/projects/${projectId}/chat`, {
@@ -615,6 +751,67 @@ describe('aidev', () => {
 		expect(res.task).toMatchObject({ role: 'implement', status: 'queued' });
 		expect(res.message).toMatchObject({ kind: 'user', taskId: res.task.id });
 		ok(await call('admin', 'POST', `/tasks/${res.task.id}/cancel`), 201);
+	});
+
+	it('Chat übernimmt die Auslieferungswahl und ungültige Werte werden abgelehnt', async () => {
+		const invalid = await call('admin', 'POST', `/projects/${projectId}/tasks`, {
+			prompt: 'Test',
+			delivery: 'direct'
+		});
+		expect(invalid.status).toBe(422);
+		const res = ok<{ message: ChatMessageDto; task: TaskDto }>(
+			await call('admin', 'POST', `/projects/${projectId}/chat`, {
+				body: 'Als Branch ausliefern',
+				delivery: 'branch'
+			}),
+			201
+		);
+		expect(res.task.delivery).toBe('branch');
+		const o = await offerFor(res.task.id);
+		expect(o.delivery).toEqual({ mode: 'branch' });
+		ok(await call('runner', 'POST', `/runner/runs/${o.runId}/accept`), 201);
+		ok(await finish(o.runId, { status: 'succeeded', branch: o.branch, branchPushed: true }), 201);
+		expect((await task(res.task.id)).task).toMatchObject({
+			status: 'done',
+			branch: o.branch,
+			branchPushed: true,
+			prNumber: null
+		});
+	});
+
+	it('Branch-Auslieferung geht nur an Runner, die den Modus kennen', async () => {
+		// alter Runner ohne Capability `branchDelivery` (gestaffeltes Upgrade)
+		const old = ok<{ runnerId: string }>(
+			await call('runner2', 'POST', '/runner/register', {
+				protocol: 1,
+				name: 'Runner alt',
+				version: '0.0.9',
+				maxSlots: 4,
+				capabilities: { git: true, gh: true, pty: true, os: 'linux' },
+				accounts: [{ key: 'fake-x', provider: 'fake', label: 'fake-x', loggedIn: true, models: [] }]
+			}),
+			201
+		);
+		ok(await call('admin', 'PATCH', `/runners/${old.runnerId}`, { status: 'approved' }));
+		ok(await heartbeat('runner2'), 201);
+		ok(await call('admin', 'PATCH', `/runners/${runnerId}`, { maxSlots: 0 }));
+		try {
+			const branch = await createTask({ prompt: 'Nur Branch', delivery: 'branch' });
+			const pr = await createTask({ prompt: 'Mit PR' });
+			const oldOffers = await offers('runner2');
+			expect(oldOffers.map((o) => o.taskId)).toContain(pr.id);
+			expect(oldOffers.map((o) => o.taskId)).not.toContain(branch.id);
+			expect((await task(branch.id)).task.status).toBe('queued');
+			ok(await call('admin', 'POST', `/tasks/${pr.id}/cancel`), 201);
+
+			ok(await call('admin', 'PATCH', `/runners/${runnerId}`, { maxSlots: 4 }));
+			const o = await offerFor(branch.id);
+			expect(o.delivery).toEqual({ mode: 'branch' });
+			ok(await call('admin', 'POST', `/tasks/${branch.id}/cancel`), 201);
+		} finally {
+			ok(await call('admin', 'PATCH', `/runners/${runnerId}`, { maxSlots: 4 }));
+			ok(await call('admin', 'PATCH', `/runners/${old.runnerId}`, { maxSlots: 0 }));
+		}
 	});
 
 	it('SSE: Projekt-Stream und Runner-Stream mit RPC (Repo prüfen)', async () => {

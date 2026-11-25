@@ -97,6 +97,8 @@ export function runDto(r: Row, commits: CommitDto[]): RunDto {
 export function taskDto(r: Row, dependsOn: string[], lastRun: RunSummaryDto | null): TaskDto {
 	return {
 		id: String(r.id),
+		delivery: r.delivery === 'branch' ? 'branch' : 'project',
+		branchPushed: r.branch_pushed === true,
 		projectId: String(r.project_id),
 		parentId: str(r.parent_id),
 		position: num(r.position),

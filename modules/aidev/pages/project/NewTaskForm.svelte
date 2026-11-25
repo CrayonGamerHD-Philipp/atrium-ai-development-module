@@ -21,12 +21,17 @@
 	let title = $state('');
 	let role = $state<Role>('implement');
 	let decompose = $state(false);
+	let delivery = $state<'project' | 'branch'>('project');
 	let priority = $state(0);
 	let providerHint = $state<Provider | null>(null);
 	let draft = $state(false);
 	let more = $state(false);
 	let busy = $state(false);
 
+	const deliveryOptions = [
+		{ value: 'project', label: 'Projektvorgabe' },
+		{ value: 'branch', label: 'Branch bereitstellen (ohne PR)' }
+	];
 	const roleOptions = ROLES.filter((r) => r !== 'orchestrate').map((r) => ({
 		value: r,
 		label: ROLE_LABELS[r]
@@ -47,6 +52,7 @@
 				title: title.trim() || undefined,
 				role,
 				decompose,
+				delivery,
 				priority,
 				providerHint,
 				draft
@@ -89,6 +95,15 @@
 			class="w-36"
 			disabled={busy || decompose}
 		/>
+		<SelectField
+			label="Auslieferung"
+			options={deliveryOptions}
+			value={delivery}
+			onchange={(v) => v && (delivery = v as 'project' | 'branch')}
+			size="sm"
+			class="w-64"
+			disabled={busy}
+		/>
 		<label class="inline-flex items-center gap-2 text-sm">
 			<Switch bind:checked={decompose} size="sm" disabled={busy} />
 			Planen & aufteilen
@@ -109,6 +124,10 @@
 			{busy ? BUSY_SAVE : draft ? 'Entwurf speichern' : 'Auftrag geben'}
 		</Button>
 	</div>
+	<p class="text-xs text-muted-foreground">
+		Branch bereitstellen pusht einen eigenen Branch ohne Pull Request; der Hauptbranch bleibt
+		unverändert. Leseaufträge liefern keine Änderungen aus.
+	</p>
 	{#if more}
 		<div id="new-task-more" class="grid gap-3 border-t pt-3 sm:grid-cols-3">
 			<div class="space-y-1">
