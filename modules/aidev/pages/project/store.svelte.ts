@@ -139,8 +139,12 @@ export class ProjectStore {
 		}
 	}
 
+	/** Neue Nachricht einfügen; eine bekannte (z. B. geänderte Aktionsvorschläge) wird ersetzt */
 	addChat(message: ChatMessageDto) {
-		if (this.chat.some((m) => m.id === message.id)) return;
+		if (this.chat.some((m) => m.id === message.id)) {
+			this.chat = this.chat.map((m) => (m.id === message.id ? message : m));
+			return;
+		}
 		this.chat = [...this.chat, message].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
 	}
 

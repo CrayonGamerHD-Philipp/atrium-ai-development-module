@@ -20,7 +20,7 @@ export interface Effects {
 	runs: Set<string>;
 	/** geänderte Projekte (→ `project`-Ereignis) */
 	projects: Set<string>;
-	/** neue Chat-Nachrichten (→ `chat`) */
+	/** neue oder geänderte Chat-Nachrichten (→ `chat`, bekannte IDs werden erneut gesendet) */
 	chat: Set<string>;
 	/** geänderte Pull Requests `projectId:number` (→ `pr`) */
 	pulls: Set<string>;
@@ -50,4 +50,18 @@ export function newEffects(): Effects {
 
 export function sendCommand(fx: Effects, runnerId: string | null, command: RunnerCommand): void {
 	if (runnerId) fx.commands.push({ runnerId, command });
+}
+
+/** Nebenwirkungen eines erfolgreichen Teilschritts übernehmen (z. B. nach einem Savepoint) */
+export function mergeEffects(into: Effects, from: Effects): void {
+	for (const id of from.tasks) into.tasks.add(id);
+	into.deletedTasks.push(...from.deletedTasks);
+	for (const id of from.runs) into.runs.add(id);
+	for (const id of from.projects) into.projects.add(id);
+	for (const id of from.chat) into.chat.add(id);
+	for (const key of from.pulls) into.pulls.add(key);
+	into.commands.push(...from.commands);
+	into.audits.push(...from.audits);
+	into.overview ||= from.overview;
+	into.dispatch ||= from.dispatch;
 }

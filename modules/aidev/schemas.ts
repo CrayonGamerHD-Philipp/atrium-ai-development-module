@@ -3,6 +3,7 @@
  * Live-Ereignisse. Reine Datei ohne Server-Importe (Client + Server). Endpunkte: siehe `API` unten.
  */
 import { z } from 'zod';
+import type { StoredChatAction } from './actions';
 import {
 	commitPolicySchema,
 	taskDeliverySchema,
@@ -249,9 +250,21 @@ export const chatInput = z.object({
 	mode: z.enum(['task', 'note', 'question', 'auto']).default('task'),
 	role: roleSchema.default('implement'),
 	decompose: z.boolean().default(false),
-	providerHint: providerSchema.nullable().default(null)
+	providerHint: providerSchema.nullable().default(null),
+	/**
+	 * „Umsetzen“: ID einer `agent`-Nachricht desselben Projekts, auf die sich die Nachricht bezieht. Nur im
+	 * Modus `task` wirksam – Frage und Antwort kommen als Kontext in den neuen Auftrag.
+	 */
+	replyTo: z.string().uuid().nullable().default(null)
 });
 export type ChatInput = z.infer<typeof chatInput>;
+/** Aktionsvorschlag einer Chatnachricht übernehmen oder verwerfen */
+export const chatActionDecision = z.object({ decision: z.enum(['apply', 'reject']) });
+export type ChatActionDecision = z.infer<typeof chatActionDecision>;
+export const chatActionParams = z.object({
+	id: z.string().uuid(),
+	index: z.coerce.number().int().min(0)
+});
 export const chatQuery = z.object({
 	before: z.string().datetime({ offset: true }).optional(),
 	limit: z.coerce.number().int().min(1).max(200).default(50)
@@ -429,7 +442,12 @@ export interface ChatMessageDto {
 	body: string;
 	author: { id: string; name: string } | null;
 	createdAt: string;
+	/** Aktionsvorschläge des Agents (nur `agent`-Nachrichten, sonst leer) */
+	actions: ChatActionDto[];
 }
+
+/** Gespeicherter Aktionsvorschlag mit seiner Position (`index` für `POST /chat/:id/actions/:index`) */
+export type ChatActionDto = StoredChatAction & { index: number };
 
 export interface PullRequestDto {
 	projectId: string;
@@ -616,7 +634,8 @@ export type TerminalLiveEvent =
  * | GET | /tasks/:id/diff | project.view | – | DiffDto (Branch gegen Basis, über Runner) |
  * | GET | /runs/:id/events | project.view | runEventsQuery | RunEventDto[] |
  * | GET | /projects/:id/chat | project.view | chatQuery | ChatMessageDto[] (neueste zuerst) |
- * | POST | /projects/:id/chat | task.create | chatInput | { message: ChatMessageDto, task: TaskDto \| null, mode: 'task' \| 'question' \| 'note' } (wirksamer Modus) |
+ * | POST | /projects/:id/chat | task.create | chatInput | { message: ChatMessageDto, task: TaskDto \| null, mode: 'task' \| 'question' \| 'note' } (wirksamer Modus; `replyTo` → Frage/Antwort als Kontext) |
+ * | POST | /chat/:id/actions/:index | task.create (ändern/abbrechen: eigene, fremde mit task.manage) | chatActionDecision | { message: ChatMessageDto, task: TaskDto \| null } (Vorschlag übernehmen/verwerfen; Fehler → Zustand `failed`) |
  * | GET | /projects/:id/pulls | project.view | – | PullRequestDto[] |
  * | POST | /projects/:id/pulls/sync | project.view | – | PullRequestDto[] |
  * | POST | /projects/:id/pulls/:number/merge | project.manage | mergeInput | PullRequestDto |

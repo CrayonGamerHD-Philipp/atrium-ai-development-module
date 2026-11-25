@@ -25,6 +25,7 @@ function msg(over: Partial<ChatMessageDto> = {}): ChatMessageDto {
 		body: 'Hallo',
 		author: { id: 'u1', name: 'Anna' },
 		createdAt: at(2026, 11, 25),
+		actions: [],
 		...over
 	};
 }
