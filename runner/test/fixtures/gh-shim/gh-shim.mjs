@@ -97,8 +97,8 @@ if (args[0] === 'api') {
 	const m = /^repos\/([^/]+\/[^/]+)\/pulls\/(\d+)\/comments$/.exec(args[1] ?? '');
 	const pr = m && state.prs.find((p) => p.repo === m[1] && String(p.number) === m[2]);
 	save();
-	if (!pr) {
-		process.stderr.write('HTTP 404: Not Found\n');
+	if (!pr || pr.failApi) {
+		process.stderr.write(pr ? 'HTTP 502: Bad Gateway\n' : 'HTTP 404: Not Found\n');
 		process.exit(1);
 	}
 	// wie `--paginate`: Seiten als aneinandergehängte JSON-Arrays

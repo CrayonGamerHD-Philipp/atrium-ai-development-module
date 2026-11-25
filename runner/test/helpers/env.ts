@@ -41,6 +41,8 @@ export interface GhPr {
 	inlineComments?: { path: string; line: number | null; body: string; user: { login: string } }[];
 	/** `gh pr view` schlägt fehl */
 	failView?: boolean;
+	/** `gh api …/comments` (Inline-Kommentare) schlägt fehl */
+	failApi?: boolean;
 	/** `gh pr comment` schlägt fehl */
 	failComment?: boolean;
 }

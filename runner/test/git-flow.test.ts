@@ -306,21 +306,45 @@ describe('pr-update', () => {
 		const { branch, pr } = existingPull();
 		const s = remote.scratch;
 		// testCmd läuft nach dem Agent und vor der Auslieferung → simuliert einen parallelen Push
-		const testCmd = [
+		// (beim erneuten Test nach dem Rebase ist PARALLEL.md schon da → nichts mehr zu tun)
+		const testCmd = `[ -f PARALLEL.md ] || (${[
 			`git -C "${s}" fetch -q origin`,
 			`git -C "${s}" checkout -q -B ${branch} origin/${branch}`,
 			`node -e "require('fs').writeFileSync(process.argv[1], 'parallel')" "${s}/PARALLEL.md"`,
 			`git -C "${s}" add -A`,
 			`git -C "${s}" commit -q -m "Parallel gepusht"`,
 			`git -C "${s}" push -q origin HEAD:refs/heads/${branch}`
-		].join(' && ');
+		].join(' && ')})`;
 		const o = prOffer(branch, pr.number, { project: { ...offer().project, testCmd } });
 		const fin = await runOffer(o);
 		expect(fin.status).toBe('succeeded');
+		expect(eventsOf(o.runId).some((e) => e.payload.text?.includes('Tests laufen erneut'))).toBe(true);
 		expect(remote.log(branch).slice(0, 3)).toEqual(['README ergänzen', 'Parallel gepusht', 'Vorhandener PR-Commit']);
 		expect(remote.read(branch, 'PARALLEL.md')).toBe('parallel');
 		expect(fin.commits.map((c) => c.message.split('\n')[0])).toEqual(['README ergänzen']);
 		expect(eventsOf(o.runId).some((e) => e.payload.detail?.includes('rebased'))).toBe(true);
+	});
+
+	it('Tests brechen erst mit parallel gepushtem Commit → failed tests, nichts gepusht', async () => {
+		const { branch, pr } = existingPull();
+		const s = remote.scratch;
+		// Erster Testlauf: paralleler Push, Tests grün. Nach dem Rebase ist PARALLEL.md im Worktree → Tests rot.
+		const testCmd = `if [ -f PARALLEL.md ]; then exit 4; fi; ${[
+			`git -C "${s}" fetch -q origin`,
+			`git -C "${s}" checkout -q -B ${branch} origin/${branch}`,
+			`node -e "require('fs').writeFileSync(process.argv[1], 'parallel')" "${s}/PARALLEL.md"`,
+			`git -C "${s}" add -A`,
+			`git -C "${s}" commit -q -m "Parallel gepusht"`,
+			`git -C "${s}" push -q origin HEAD:refs/heads/${branch}`
+		].join(' && ')}`;
+		const o = prOffer(branch, pr.number, { project: { ...offer().project, testCmd } });
+		const fin = await runOffer(o);
+		expect(fin).toMatchObject({ status: 'failed', errorKind: 'tests', branchPushed: false, pr: null });
+		expect(fin.errorMessage).toContain('nach Rebase');
+		expect(fin.errorMessage).toContain('nichts gepusht');
+		// Remote steht auf dem parallelen Commit, der eigene Commit wurde nicht gepusht
+		expect(remote.log(branch)[0]).toBe('Parallel gepusht');
+		expect(env.ghPrs().find((p) => p.number === pr.number)?.comments ?? []).toEqual([]);
 	});
 
 	it('abgelehnter Push → failed git, kein Force-Push, kein Kommentar', async () => {
@@ -378,15 +402,21 @@ describe('pr-update', () => {
 		expect(remote.sha(branch)).toBeNull();
 	});
 
-	it('PR-Kontext nicht ladbar → Lauf ohne Kontext, Fehler als Ereignis', async () => {
-		const { branch, pr } = existingPull({ failView: true });
+	it('PR nicht ladbar → failed git vor dem Agent, nichts gepusht', async () => {
+		const { branch, pr, sha } = existingPull({ failView: true });
 		const o = prOffer(branch, pr.number);
 		const fin = await runOffer(o);
+		expect(fin).toMatchObject({ status: 'failed', errorKind: 'git', branchPushed: false, pr: null });
+		expect(fin.errorMessage).toContain('konnte nicht geladen werden');
+		expect(remote.sha(branch)).toBe(sha);
+		expect(existsSync(path.join(env.workDir, 'wt', o.runId, 'AIDEV_FAKE.md'))).toBe(false);
+	});
+
+	it('nur Inline-Kommentare nicht ladbar → Lauf mit Kontext, Hinweis im Kontext', async () => {
+		const { branch, pr } = existingPull({ failApi: true });
+		const fin = await runOffer(prOffer(branch, pr.number));
 		expect(fin).toMatchObject({ status: 'succeeded', branchPushed: true });
-		expect(fin.pr?.number).toBe(pr.number);
-		expect(fin.pr?.url).toMatch(new RegExp(`/pull/${pr.number}$`));
-		expect(remote.read(branch, 'AIDEV_FAKE.md')).not.toContain('## Pull request');
-		expect(eventsOf(o.runId).some((e) => e.kind === 'error' && e.payload.text?.includes('PR-Kontext nicht verfügbar'))).toBe(true);
+		expect(remote.read(branch, 'AIDEV_FAKE.md')).toContain('(konnten nicht geladen werden');
 	});
 
 	it('Kommentar schlägt fehl → trotzdem succeeded, Fehler als Ereignis', async () => {
@@ -395,6 +425,59 @@ describe('pr-update', () => {
 		const fin = await runOffer(o);
 		expect(fin).toMatchObject({ status: 'succeeded', branchPushed: true });
 		expect(eventsOf(o.runId).some((e) => e.kind === 'error' && e.payload.text?.includes('Kommentar an PR'))).toBe(true);
+	});
+
+	it('Abschluss einer Orchestrierung ohne neuen Commit → PR aktualisiert, Kommentar mit Hinweis', async () => {
+		const { branch, pr, sha } = existingPull();
+		const o = prOffer(branch, pr.number, {
+			prompt: '[fake:noop]',
+			delivery: { mode: 'pr-update', number: pr.number, integrated: true }
+		});
+		const fin = await runOffer(o);
+		expect(fin).toMatchObject({ status: 'succeeded', branchPushed: true, branch, commits: [] });
+		expect(fin.pr).toEqual({ number: pr.number, url: pr.url });
+		expect(remote.sha(branch)).toBe(sha);
+		const mine = env.ghPrs().find((p) => p.number === pr.number)?.comments?.at(-1)?.body ?? '';
+		expect(mine).toContain('bereits einzeln in den PR-Branch gemergt');
+		expect(mine).toContain(`Aidev-Task: ${o.taskId}`);
+	});
+
+	describe('Teilauftrag einer PR-Orchestrierung (integrate mit pullNumber)', () => {
+		const subOffer = (prBranch: string, number: number, over: Partial<RunOffer> = {}) =>
+			offer({
+				branch: `aidev/${randomUUID().slice(0, 8)}/1-teil`,
+				baseRef: prBranch,
+				prompt: 'Teil A',
+				delivery: { mode: 'integrate', integrationBranch: prBranch, pullNumber: number },
+				...over
+			});
+
+		it('mergt in den PR-Branch', async () => {
+			const { branch, pr, sha } = existingPull();
+			const fin = await runOffer(subOffer(branch, pr.number));
+			expect(fin).toMatchObject({ status: 'succeeded', merged: true });
+			expect(git(remote.bare, 'merge-base', '--is-ancestor', sha, branch)).toBe('');
+			expect(remote.read(branch, 'AIDEV_FAKE.md')).toContain('Teil A');
+		});
+
+		it('geschlossener PR → failed git, nichts gemergt', async () => {
+			const { branch, pr, sha } = existingPull({ state: 'CLOSED' });
+			const o = subOffer(branch, pr.number);
+			const fin = await runOffer(o);
+			expect(fin).toMatchObject({ status: 'failed', errorKind: 'git', merged: false });
+			expect(fin.errorMessage).toContain('nicht offen');
+			expect(remote.sha(branch)).toBe(sha);
+			expect(remote.sha(o.branch)).toBeNull();
+		});
+
+		it('fehlender PR-Branch → failed git, Branch wird nicht angelegt', async () => {
+			const prBranch = `aidev/${randomUUID().slice(0, 8)}-weg`;
+			const pr = env.addGhPr({ repo: 'acme/shop', head: prBranch });
+			const fin = await runOffer(subOffer(prBranch, pr.number));
+			expect(fin).toMatchObject({ status: 'failed', errorKind: 'git', merged: false });
+			expect(fin.errorMessage).toBe(`Branch des PR #${pr.number} existiert nicht mehr`);
+			expect(remote.sha(prBranch)).toBeNull();
+		});
 	});
 
 	it('keine Änderungen → kein Push, kein Kommentar', async () => {
