@@ -67,5 +67,6 @@ export async function findDuplicate(
 }
 
 export async function assertNoDuplicate(tx: Tx, owner: string, name: string, exceptId?: string) {
-	if (await findDuplicate(tx, owner, name, exceptId)) throw errors.conflict('Für dieses Repo gibt es bereits ein Projekt');
+	if (await findDuplicate(tx, owner, name, exceptId))
+		throw errors.conflict('Für dieses Repo gibt es bereits ein Projekt');
 }

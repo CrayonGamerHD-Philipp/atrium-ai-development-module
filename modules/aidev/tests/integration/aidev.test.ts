@@ -1779,7 +1779,11 @@ describe('aidev', () => {
 			// vorhandenes Projekt (Groß-/Kleinschreibung egal, Link-Form)
 			const pending = probe('admin', 'https://github.com/ACME/Widgets.git');
 			const rpc = await nextCheck();
-			expect(rpc.project).toMatchObject({ repoOwner: 'ACME', repoName: 'Widgets', defaultBranch: '' });
+			expect(rpc.project).toMatchObject({
+				repoOwner: 'ACME',
+				repoName: 'Widgets',
+				defaultBranch: ''
+			});
 			expect(rpc.project.id).not.toBe(projectId);
 			expect(rpc.target).toBe('main');
 			ok(
