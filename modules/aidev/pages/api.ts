@@ -20,6 +20,7 @@ import type {
 	ProjectInput,
 	ProjectPatch,
 	PullRequestDto,
+	RepoProbeDto,
 	RunEventDto,
 	RunnerDto,
 	Routing,
@@ -44,6 +45,8 @@ export type RepoCheck = {
 	message: string;
 	defaultBranch: string | null;
 	canPush: boolean;
+	/** Branches des Repos (Haupt-Branch zuerst); leer bei älteren Runnern */
+	branches: string[];
 };
 export type MergeMethod = 'squash' | 'merge' | 'rebase';
 
@@ -82,6 +85,13 @@ export const archiveProject = (id: string) =>
 	apiFetch<Ok>(`${API}/projects/${id}`, { method: 'DELETE' });
 export const checkProject = (id: string) =>
 	apiFetch<RepoCheck>(`${API}/projects/${id}/check`, { method: 'POST' });
+/** Repo vor dem Anlegen prüfen (Namensvorschlag, Haupt-Branch, Branches); ungültig → 422, ohne Runner → 503 */
+export const probeRepo = (repo: string, init?: { signal?: AbortSignal }) =>
+	apiFetch<RepoProbeDto>(`${API}/projects/probe`, {
+		method: 'POST',
+		body: json({ repo }),
+		signal: init?.signal
+	});
 
 // ---------------------------------------------------------------- Aufträge
 
