@@ -24,3 +24,10 @@
 *.zip binary
 *.gz binary
 *.epbackup binary
+
+# GitHub-Archive (ZIP/tar.gz) enthalten nur modules/: Der Atrium-Modul-Installer lädt das ganze Repo
+# und lehnt fremde Dateitypen ab (z. B. runner/Dockerfile). Betrifft nur Archive, nicht git clone –
+# Runner, Skripte & Co. bleiben im Repo, Dokploy baut den Runner weiterhin aus runner/.
+/* export-ignore
+/.* export-ignore
+/modules -export-ignore
