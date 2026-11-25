@@ -1,6 +1,6 @@
 <script lang="ts">
 	// Startseite des Moduls: Kennzahlen (live), Projekte, aktive Läufe aller Projekte, Auslastung je Konto
-	import { goto } from '$app/navigation';
+	import { afterNavigate, goto } from '$app/navigation';
 	import { page } from '$app/state';
 	import { onMount } from 'svelte';
 	import Activity from '@lucide/svelte/icons/activity';
@@ -111,6 +111,17 @@
 	const view = $derived<ProjectView>(viewChoice ?? defaultView(active.length));
 	const filtered = $derived(tokens.length > 0 || status !== 'all');
 
+	// Link/Zurück auf dieselbe Seite mit anderem Query: Zustand aus der URL übernehmen
+	afterNavigate(({ type }) => {
+		if (type !== 'link' && type !== 'popstate') return;
+		const params = page.url.searchParams;
+		const s = params.get('status');
+		const o = params.get('sort');
+		query = params.get('q') ?? '';
+		status = isStatusFilter(s) ? s : 'all';
+		sort = isProjectSort(o) ? o : 'activity';
+	});
+
 	let urlTimer: ReturnType<typeof setTimeout> | undefined;
 	function syncUrl() {
 		clearTimeout(urlTimer);
@@ -188,7 +199,7 @@
 	// „/“ fokussiert die Suche. Strg/⌘+K bleibt der globalen Befehlspalette des Cores vorbehalten.
 	function onWindowKeydown(e: KeyboardEvent) {
 		if (e.key !== '/' || e.ctrlKey || e.metaKey || e.altKey || e.defaultPrevented) return;
-		if (!searchInput || isEditable(e.target)) return;
+		if (!searchInput || createOpen || isEditable(e.target)) return;
 		e.preventDefault();
 		searchInput.focus();
 		searchInput.select();
