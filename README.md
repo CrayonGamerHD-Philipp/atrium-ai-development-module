@@ -29,6 +29,26 @@ Browser ──REST + SSE──▶ Atrium (Modul aidev: Projekte, Warteschlange, 
   Runner sein, auf Servern oder deinem PC. Einrichtung: [`runner/README.md`](runner/README.md).
 - Atrium selbst braucht weder git noch Agent-CLIs. Der Container bleibt gehärtet.
 
+### Projekte finden
+
+Die Projektübersicht (Startseite des Moduls) ist auch bei vielen Projekten schnell durchsuchbar:
+
+- **Suche**: durchsucht Projektname, `owner/repo`, Standard-Branch und Commit-Policy, unabhängig von Groß-/Kleinschreibung
+  und Umlauten. Bei mehreren Wörtern müssen alle vorkommen. Treffer werden hervorgehoben, „x von y Projekten“ zeigt die
+  Trefferzahl.
+- **Tastenkürzel**: `/` oder `Strg`/`⌘`+`K` fokussiert die Suche, `Esc` leert sie, `Enter` öffnet das Projekt, wenn es
+  genau einen Treffer gibt.
+- **Statusfilter**: Alle, Rückfragen, Laufend, PR offen und Favoriten, jeweils mit Anzahl.
+- **Sortierung**: Aktivität (Standard, laufende Aufträge und Rückfragen zuerst), Name oder Zuletzt geändert. Bei aktiver
+  Suche stehen die relevantesten Treffer oben.
+- **Favoriten** (Stern) stehen immer oben. Sie werden nur im Browser gespeichert (`localStorage`), gelten also je Gerät
+  und Browser und nicht serverseitig.
+- **Ansicht**: Kacheln oder kompakte Liste. Ab 12 Projekten ist die Liste voreingestellt; die eigene Wahl merkt sich der
+  Browser.
+- Suchbegriff, Filter und Sortierung stehen in der URL (`?q=…&status=…&sort=…`). So lässt sich eine Ansicht als Link
+  teilen oder per Zurück wiederherstellen.
+- Archivierte Projekte erscheinen nicht in der Übersicht.
+
 ### Rollen und Verteilung
 
 | Rolle | Zweck | Vorliebe (Standard) |
