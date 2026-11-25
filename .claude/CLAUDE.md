@@ -1,27 +1,27 @@
-# Atrium KI-Entwicklung (`aidev`) – Projekthinweise für Claude
+# Atrium AI Development (`aidev`) – Project notes for Claude
 
-Modul-Repo für **Kalypzo Atrium**. Der Core liegt als Git-Submodul unter `.core` (fester Tag `v2.0.0-pre.2`); seine Regeln gelten
-weiter: `.core/.claude/CLAUDE.md` und `.core/.claude/rules/*.md` (vor allem `modules.md`, `architecture.md`, `ui-design.md`,
-`testing-and-verification.md`). Der Nutzer ist deutschsprachig.
+Module repository for **Kalypzo Atrium**. The core is a Git submodule at `.core` (pinned to tag `v2.0.0-pre.2`); its rules
+still apply: `.core/.claude/CLAUDE.md` and `.core/.claude/rules/*.md` (especially `modules.md`, `architecture.md`, `ui-design.md`,
+`testing-and-verification.md`). The user speaks German.
 
-## Aufbau
-- `modules/aidev/` – Atrium-Modul (Steuerzentrale): `protocol.ts` (Runner ↔ Atrium, auch vom Runner gebündelt – nur `zod`),
-  `schemas.ts` (Rechte, DTOs, Endpunkt-Tabelle), `scheduler.ts` + `prompts.ts` (reine Logik), `*.endpoints.ts`/`*.service.ts`,
-  `live.ts` (SSE-Hubs), `jobs.ts`, `migrations/`, `pages/` + `ui.ts` (Oberfläche), `tests/`.
-- `runner/` – eigenständiger Node-Dienst (Docker) mit git, gh und den Agent-CLIs; nicht von Atrium geladen.
+## Structure
+- `modules/aidev/` – Atrium module (control center): `protocol.ts` (Runner ↔ Atrium, also bundled by the runner – only `zod`),
+  `schemas.ts` (permissions, DTOs, endpoint table), `scheduler.ts` + `prompts.ts` (pure logic), `*.endpoints.ts`/`*.service.ts`,
+  `live.ts` (SSE hubs), `jobs.ts`, `migrations/`, `pages/` + `ui.ts` (interface), `tests/`.
+- `runner/` – standalone Node service (Docker) with git, gh, and the agent CLIs; not loaded by Atrium.
 
-## Befehle
-| Befehl | Zweck |
+## Commands
+| Command | Purpose |
 |---|---|
-| `npm run setup` | Core installieren, `node_modules` → `.core/node_modules`, Modul-Pakete |
-| `npm run check` / `npm run lint` / `npm run format:check` | Typen / ESLint / Prettier |
-| `npm test` | Modultests (Vitest im Core mit `ATRIUM_MODULES_DIR`) |
-| `npm run build` / `npm run demo` | Build / Demo (:4300) |
-| `npm run runner:test` | Tests des Runners |
+| `npm run setup` | Install core, `node_modules` → `.core/node_modules`, module packages |
+| `npm run check` / `npm run lint` / `npm run format:check` | Types / ESLint / Prettier |
+| `npm test` | Module tests (Vitest in core with `ATRIUM_MODULES_DIR`) |
+| `npm run build` / `npm run demo` | Build / demo (:4300) |
+| `npm run runner:test` | Runner tests |
 
-## Regeln
-1. Nie in `.core` ändern. Module importieren nur `$lib/sdk/*`, `$lib/components/{ui,layout,forms}`, `$lib/utils`.
-2. `protocol.ts` ändert beide Seiten – abwärtskompatibel, `PROTOCOL_VERSION` beachten, Runner-Tests mitlaufen lassen.
-3. Migrationen additiv und unveränderlich (`check:migrations`), neue Rechte in Manifest **und** `atrium-module.json`.
-4. Agent-Ausgaben nie als `{@html}`; Geheimnisse bleiben auf dem Runner.
-5. Nichts committen oder pushen, solange der Nutzer es nicht verlangt.
+## Rules
+1. Never modify `.core`. Modules import only `$lib/sdk/*`, `$lib/components/{ui,layout,forms}`, `$lib/utils`.
+2. `protocol.ts` affects both sides – maintain backward compatibility, observe `PROTOCOL_VERSION`, and run the runner tests.
+3. Migrations are additive and immutable (`check:migrations`); add new permissions to both the manifest **and** `atrium-module.json`.
+4. Never render agent output as `{@html}`; secrets stay on the runner.
+5. Do not commit or push anything unless the user requests it.
