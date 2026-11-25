@@ -16,6 +16,7 @@ import {
 import { publish } from './publish.service';
 import { rejectAllRpc } from './rpc.service';
 import { loseRun } from './runs.service';
+import { storeLimitSnapshot } from './limits.service';
 import { HEARTBEAT_SEC } from './db';
 
 /** API-Key des aufrufenden Runners (nur technische Konten per API-Key) */
@@ -125,10 +126,14 @@ export async function heartbeat(
 			WHERE id = ${runnerId}`
 	);
 	for (const a of input.accounts) {
-		await tx.execute(
+		const account = await oneOf(
+			tx,
 			sql`UPDATE provider_account SET logged_in = ${a.loggedIn}
-				WHERE runner_id = ${runnerId} AND key = ${a.key}`
+				WHERE runner_id = ${runnerId} AND key = ${a.key}
+				RETURNING id`
 		);
+		// Limit-Stand nur von Runnern, die ihn melden (ältere Runner: Feld fehlt → nichts ändern)
+		if (account && a.limits) await storeLimitSnapshot(tx, String(account.id), a.limits);
 	}
 	const reported = [...new Set(input.runIds)];
 	let keep = new Set<string>();
