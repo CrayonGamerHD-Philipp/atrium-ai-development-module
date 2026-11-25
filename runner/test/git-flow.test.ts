@@ -660,6 +660,15 @@ describe('Anhänge', () => {
 		expect(remote.read(o.branch, 'AIDEV_FAKE.md')).not.toContain('## Anhänge');
 	});
 
+	it('vom Agent mit git add -f vorgemerkte Anhänge werden nicht committet', async () => {
+		const o = offer({ prompt: 'Anhang ansehen [fake:stage-ignored]', attachments: attach({ name: 'bild.png', bytes: png }) });
+		const fin = await runOffer(o);
+		expect(fin.status).toBe('succeeded');
+		expect(fin.commits).toHaveLength(1);
+		expect(fin.commits[0]?.files).toContain('AIDEV_FAKE.md');
+		expectNotCommitted(o, fin, o.branch);
+	});
+
 	it('branch, direct und integrate: Anhänge werden nicht ausgeliefert', async () => {
 		const b = offer({ delivery: { mode: 'branch' }, attachments: attach({ name: 'bild.png', bytes: png }) });
 		expectNotCommitted(b, await runOffer(b), b.branch);
@@ -703,11 +712,42 @@ describe('Anhänge', () => {
 		expect(existsSync(path.join(wtOf(o), '.aidev', 'attachments', 'bild.png'))).toBe(true);
 	});
 
+	it('versionierte Dateien unter .aidev/attachments/ → failed setup, nichts überschrieben oder gepusht', async () => {
+		const branch = `aidev/${randomUUID().slice(0, 8)}-versioniert`;
+		const before = remote.commitFile(branch, '.aidev/attachments/config.json', '{"echt":true}\n', 'Versionierte Ablage');
+		const o = offer({ branch, attachments: attach({ name: 'config.json', bytes: txt }) });
+		const fin = await runOffer(o);
+		expect(fin).toMatchObject({ status: 'failed', errorKind: 'setup', pr: null });
+		expect(fin.errorMessage).toContain('versionierte Dateien');
+		expect(fin.errorMessage).toContain('.aidev/attachments/config.json');
+		expect(remote.sha(branch)).toBe(before);
+		expect(remote.read(branch, '.aidev/attachments/config.json')).toBe('{"echt":true}\n');
+		expect(readFileSync(path.join(wtOf(o), '.aidev', 'attachments', 'config.json'), 'utf8')).toBe('{"echt":true}\n');
+		expect(eventsOf(o.runId).some((e) => (e.payload.text ?? '').startsWith('Agent startet'))).toBe(false);
+	});
+
+	it('umbenannter Name (älteres Backend): Hinweis nennt den tatsächlich gespeicherten Pfad', async () => {
+		const attachments = attach({ name: 'con.txt', bytes: txt, mime: 'text/plain' }, { name: 'bild.png', bytes: png, mime: 'image/png' });
+		// Prompt eines Backends, das `con.txt` unverändert nennt
+		const o = offer({
+			prompt: 'Siehe Anhänge:\n- `.aidev/attachments/con.txt` (text/plain)\n- `.aidev/attachments/bild.png` (image/png)',
+			attachments
+		});
+		const fin = await runOffer(o);
+		expect(fin.status).toBe('succeeded');
+		expectNotCommitted(o, fin, o.branch);
+		expect(readFileSync(path.join(wtOf(o), '.aidev', 'attachments', '_con.txt'))).toEqual(txt);
+		expect(existsSync(path.join(wtOf(o), '.aidev', 'attachments', 'con.txt'))).toBe(false);
+		const written = remote.read(o.branch, 'AIDEV_FAKE.md') ?? '';
+		expect(written).toContain('## Anhänge');
+		expect(written).toContain('`.aidev/attachments/_con.txt` (text/plain');
+	});
+
 	it('vorübergehender Fehler beim Laden wird wiederholt', async () => {
 		atrium.failAttachments = 1;
 		const o = offer({ attachments: attach({ name: 'bild.png', bytes: png }) });
 		const fin = await runOffer(o);
-		expect(fin.status).toBe('succeeded');
+		expect(fin.status, fin.errorMessage ?? '').toBe('succeeded');
 		expect(atrium.byPath(new RegExp(`/runs/${o.runId}/attachments/`))).toHaveLength(2);
 	});
 

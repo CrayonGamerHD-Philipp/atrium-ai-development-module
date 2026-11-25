@@ -2,6 +2,7 @@
  * Deterministischer Agent für Tests und Vorführungen (kein externer Prozess). Szenarien über Marker im Auftrag:
  * `[fake:fail]` (Fehler), `[fake:limit]` (5-Stunden-Limit), `[fake:plan]` (gültiger Plan als ```json-Block),
  * `[fake:slow]` (läuft bis zum Abbruch bzw. höchstens 60 s), `[fake:commit]` (Agent committet selbst).
+ * `[fake:stage-ignored]` (Agent merkt ignorierte Dateien mit `git add -f .` vor, ohne zu committen).
  * Meldet außerdem einen Limit-Stand (`limits`, 5-Stunden-Fenster).
  * Schreibt `AIDEV_FAKE.md` mit einem Auszug des Auftrags (nicht bei `readOnly`).
  */
@@ -71,6 +72,7 @@ export const fakeAdapter: ProviderAdapter = {
 					queue.push({ kind: 'tool', payload: { name: 'write_file', input: { path: 'AIDEV_FAKE.md' } } });
 					await writeFile(file, `# Fake-Agent\n\n${excerpt}\n`, 'utf8');
 					queue.push({ kind: 'tool-result', payload: { name: 'write_file', output: 'ok', isError: false } });
+					if (p.includes('[fake:stage-ignored]')) await exec('git', ['add', '-f', '.'], { cwd: o.cwd, env: o.env });
 					if (p.includes('[fake:commit]')) {
 						await exec('git', ['add', '-A'], { cwd: o.cwd, env: o.env });
 						await exec('git', ['commit', '-m', 'Fake-Agent: eigener Commit'], { cwd: o.cwd, env: o.env });
