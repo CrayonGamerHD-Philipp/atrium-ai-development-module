@@ -68,6 +68,7 @@
 	import { has, PERM } from './perms';
 	import { ProjectStore } from './project/store.svelte';
 	import Markdown from './components/Markdown.svelte';
+	import AttachmentView from './project/AttachmentView.svelte';
 	import DiffView from './task/DiffView.svelte';
 	import RunLog from './task/RunLog.svelte';
 	import RestartDialog from './task/RestartDialog.svelte';
@@ -581,6 +582,12 @@
 				</summary>
 				<div class="min-w-0 border-t px-3 py-3 break-words">
 					<Markdown text={task.prompt} />
+					{#if task.attachments?.length}
+						<section class="mt-3 space-y-1.5" aria-label="Anhänge">
+							<p class="text-xs text-muted-foreground">Anhänge ({task.attachments.length})</p>
+							<AttachmentView attachments={task.attachments} compact />
+						</section>
+					{/if}
 					{#if detail.dependencies.length}
 						<div class="mt-3 flex flex-wrap items-center gap-2 text-xs">
 							<span class="text-muted-foreground">Wartet auf:</span>

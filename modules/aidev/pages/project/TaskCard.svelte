@@ -4,6 +4,7 @@
 	import Lock from '@lucide/svelte/icons/lock';
 	import MessageCircleQuestion from '@lucide/svelte/icons/message-circle-question';
 	import Network from '@lucide/svelte/icons/network';
+	import Paperclip from '@lucide/svelte/icons/paperclip';
 	import { cn } from '$lib/utils';
 	import type { TaskDto } from '../../schemas';
 	import { taskPath } from '../api';
@@ -82,6 +83,15 @@
 			{:else if task.prNumber}
 				<span class="inline-flex items-center gap-0.5"
 					><GitPullRequest class="size-3" aria-hidden="true" />#{task.prNumber}</span
+				>
+			{/if}
+			{#if task.attachments?.length}
+				<!-- Karte ist selbst ein Link – Anhänge daher nur als Anzahl, Links auf der Auftragsseite -->
+				<span
+					class="inline-flex items-center gap-0.5"
+					title={task.attachments.map((a) => a.name).join(', ')}
+					><Paperclip class="size-3" aria-hidden="true" /><span class="sr-only">Anhänge:</span>{task
+						.attachments.length}</span
 				>
 			{/if}
 			{#if task.status === 'needs-input'}
