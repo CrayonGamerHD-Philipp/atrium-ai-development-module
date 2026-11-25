@@ -237,7 +237,7 @@ export const chatInput = z.object({
 	delivery: taskDeliverySchema.default('project'),
 	body: z.string().trim().min(1).max(20_000),
 	/** `task` = Nachricht wird ein Auftrag, `note` = nur Notiz im Verlauf */
-	mode: z.enum(['task', 'note']).default('task'),
+	mode: z.enum(['task', 'note', 'question']).default('task'),
 	role: roleSchema.default('implement'),
 	decompose: z.boolean().default(false),
 	providerHint: providerSchema.nullable().default(null)
@@ -447,7 +447,14 @@ export interface RunnerDto {
 	lastSeenAt: string | null;
 	maxSlots: number;
 	slotsUsed: number;
-	capabilities: { git?: boolean; gh?: boolean; pty?: boolean; os?: string };
+	capabilities: {
+		question?: boolean;
+		branchDelivery?: boolean;
+		git?: boolean;
+		gh?: boolean;
+		pty?: boolean;
+		os?: string;
+	};
 	createdAt: string;
 	accounts: AccountDto[];
 }

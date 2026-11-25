@@ -60,7 +60,7 @@ export const chatEndpoints: AnyApiEndpoint[] = [
 			const { row, task } = await mdb().transaction(async (tx) => {
 				const project = await requireProject(tx, params.id);
 				let taskId: string | null = null;
-				if (body.mode === 'task') {
+				if (body.mode === 'task' || body.mode === 'question') {
 					taskId = await createTask(
 						tx,
 						fx,
@@ -69,10 +69,31 @@ export const chatEndpoints: AnyApiEndpoint[] = [
 						taskInput.parse({
 							prompt: body.body,
 							delivery: body.delivery,
-							role: body.role,
-							decompose: body.decompose,
+							role: body.mode === 'question' ? 'research' : body.role,
+							decompose: body.mode === 'question' ? false : body.decompose,
 							providerHint: body.providerHint
 						})
+					);
+				}
+				if (body.mode === 'question' && taskId) {
+					const history = await rowsOf(
+						tx,
+						sql`SELECT m.kind, m.body FROM chat_message m
+						JOIN task t ON t.id = m.task_id
+						WHERE m.project_id = ${params.id} AND t.chat_question = true
+						AND m.kind IN ('user', 'agent')
+						ORDER BY m.created_at DESC, m.id DESC LIMIT 12`
+					);
+					const context = history
+						.reverse()
+						.map(
+							(m) =>
+								`${m.kind === 'user' ? 'Question' : 'Answer'}: ${String(m.body).slice(0, 2000)}`
+						)
+						.join('\n\n')
+						.slice(-12000);
+					await tx.execute(
+						sql`UPDATE task SET chat_question = true, chat_context = ${context} WHERE id = ${taskId}`
 					);
 				}
 				const id = await insertChat(tx, fx, {

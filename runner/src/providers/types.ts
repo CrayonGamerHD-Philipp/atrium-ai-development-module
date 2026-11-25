@@ -49,6 +49,7 @@ export interface StartOptions {
 	resumeSessionId: string | null;
 	env: NodeJS.ProcessEnv;
 	readOnly: boolean;
+	question?: boolean;
 	signal: AbortSignal;
 	account: AccountConfig;
 	/** Verzeichnis für temporäre Dateien dieses Laufs (außerhalb des Worktrees) */

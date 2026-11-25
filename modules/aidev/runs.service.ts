@@ -362,6 +362,10 @@ export async function finishRun(
 
 	switch (input.status) {
 		case 'succeeded':
+			if (task.chat_question === true && !input.summary?.trim()) {
+				await failAttempt(tx, fx, task, 'Der Agent hat keine Antwort geliefert');
+				break;
+			}
 			await succeed(tx, fx, task, input, pr);
 			break;
 		case 'failed':

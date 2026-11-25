@@ -123,6 +123,8 @@ async function promptContext(tx: Tx, task: Row, project: Row, role: Role): Promi
 	const readOnly = READ_ONLY_ROLES.includes(role);
 	return {
 		role,
+		question: task.chat_question === true,
+		chatContext: String(task.chat_context ?? ''),
 		project: {
 			name: String(project.name),
 			repoOwner: String(project.repo_owner),
@@ -192,9 +194,12 @@ export async function buildOffer(
 		branch: str(run.branch) ?? plan.branch,
 		baseRef: plan.baseRef,
 		readOnly: ctx.readOnly,
+		question: ctx.question,
 		expectPlan: ctx.expectPlan,
 		resumeSessionId:
-			sessionAccount && sessionAccount === str(run.account_id) ? str(task.session_id) : null,
+			!ctx.question && sessionAccount && sessionAccount === str(run.account_id)
+				? str(task.session_id)
+				: null,
 		delivery: ctx.delivery,
 		leaseSec: LEASE_SEC,
 		timeoutSec: settings.limits.runTimeoutMin * 60
@@ -265,6 +270,37 @@ async function dispatchIn(tx: Tx, fx: Effects, settings: AidevSettings): Promise
 	const now = Date.now();
 	const accounts = await loadAccountViews(tx, now);
 	if (!accounts.length) return 0;
+	const runnerCaps = await rowsOf(
+		tx,
+		sql`SELECT id, capabilities->>'question' = 'true' AS question,
+				capabilities->>'branchDelivery' = 'true' AS branch FROM runner`
+	);
+	const questionRunners = new Set(
+		runnerCaps.filter((r) => r.question === true).map((r) => String(r.id))
+	);
+	const branchRunners = new Set(
+		runnerCaps.filter((r) => r.branch === true).map((r) => String(r.id))
+	);
+	// Branch-Auslieferung nur an Runner, die den Modus kennen (gemischte Runner-Versionen beim Upgrade)
+	const branchTasks = new Set<string>();
+	const maybeBranch = rows.filter((r) => r.delivery === 'branch' || r.role === 'resolve');
+	if (maybeBranch.length) {
+		const projects = new Map(
+			(
+				await rowsOf(
+					tx,
+					sql`SELECT * FROM project WHERE id IN (${inList([...new Set(maybeBranch.map((r) => String(r.project_id)))])})`
+				)
+			).map((p) => [String(p.id), p])
+		);
+		for (const r of maybeBranch) {
+			const project = projects.get(String(r.project_id));
+			if (project && (await deliveryOf(tx, r, project)).mode === 'branch')
+				branchTasks.add(String(r.id));
+		}
+	}
+	const without = (caps: Set<string>) =>
+		accounts.filter((a) => !caps.has(a.state.runnerId)).map((a) => a.state.id);
 	const byId = new Map(rows.map((r) => [String(r.id), r]));
 	const tasks: TaskCandidate[] = rows.map((r) => ({
 		id: String(r.id),
@@ -274,7 +310,11 @@ async function dispatchIn(tx: Tx, fx: Effects, settings: AidevSettings): Promise
 		createdAt: ms(r.created_at),
 		requiredContextK: num(r.required_context_k),
 		providerHint: (str(r.provider_hint) as Provider | null) ?? null,
-		excludedAccountIds: stringList(r.excluded_account_ids),
+		excludedAccountIds: [
+			...stringList(r.excluded_account_ids),
+			...(r.chat_question === true ? without(questionRunners) : []),
+			...(branchTasks.has(String(r.id)) ? without(branchRunners) : [])
+		],
 		sessionAccountId: str(r.session_account_id),
 		estimatedUnits: settings.limits.estimatedUnitsPerRun
 	}));
