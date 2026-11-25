@@ -44,10 +44,10 @@ describe('uniqueAttachmentNames', () => {
 	it('macht Duplikate eindeutig (Groß-/Kleinschreibung egal)', () => {
 		expect(uniqueAttachmentNames(['bild.png', 'Bild.PNG', 'a/bild.png', 'notiz', 'notiz', '..'])).toEqual([
 			'bild.png',
-			'Bild (2).PNG',
-			'bild (3).png',
+			'Bild-2.PNG',
+			'bild-3.png',
 			'notiz',
-			'notiz (2)',
+			'notiz-2',
 			'datei'
 		]);
 	});
@@ -57,7 +57,7 @@ describe('uniqueAttachmentNames', () => {
 		const [a, b] = uniqueAttachmentNames([long, long]);
 		expect(a).not.toBe(b);
 		expect([...(b ?? '')].length).toBeLessThanOrEqual(120);
-		expect(b?.endsWith(' (2).txt')).toBe(true);
+		expect(b?.endsWith('-2.txt')).toBe(true);
 	});
 });
 
@@ -68,9 +68,28 @@ describe('attachmentPromptHint', () => {
 		expect(hint).toContain('## Anhänge');
 		expect(hint).toContain('- `.aidev/attachments/bild.png` (image/png, 2,0 KB)');
 	});
-	it('kein Hinweis ohne Anhänge oder wenn der Auftrag den Pfad schon nennt', () => {
+	it('kein Hinweis ohne Anhänge oder wenn der Auftrag jeden Pfad schon nennt', () => {
 		expect(attachmentPromptHint('x', [])).toBeNull();
-		expect(attachmentPromptHint('Anhänge unter .aidev/attachments/ ansehen', stored)).toBeNull();
+		expect(attachmentPromptHint('- `.aidev/attachments/bild.png` (image/png, 2,0 KB)', stored)).toBeNull();
+		expect(attachmentPromptHint('Siehe .aidev/attachments/bild.png.', stored)).toBeNull();
+	});
+	it('Hinweis mit den tatsächlichen Pfaden, wenn der Auftrag einen anderen Namen nennt', () => {
+		const renamed = [{ path: '.aidev/attachments/_con.txt', name: '_con.txt', mime: 'text/plain', size: 3 }];
+		const hint = attachmentPromptHint('- `.aidev/attachments/con.txt` (text/plain, 3 B)', renamed) ?? '';
+		expect(hint).toContain('maßgeblich');
+		expect(hint).toContain('- `.aidev/attachments/_con.txt` (text/plain, 3 B)');
+		// nur der Anfang eines längeren Namens zählt nicht
+		expect(attachmentPromptHint('Siehe `.aidev/attachments/bild.png.txt`', stored)).toContain('bild.png');
+		expect(attachmentPromptHint('Anhänge unter .aidev/attachments/ ansehen', stored)).toContain('bild.png');
+	});
+});
+
+describe('gemeinsame Namensregel', () => {
+	it('ist idempotent: bereinigte, eindeutige Namen bleiben unverändert', () => {
+		const raw = ['con.txt', 'Bild.png', 'bild.png', '.env', 'a b?.md', `${'z'.repeat(200)}.txt`, '', 'x.'];
+		const once = uniqueAttachmentNames(raw);
+		expect(uniqueAttachmentNames(once)).toEqual(once);
+		expect(once.slice(0, 3)).toEqual(['_con.txt', 'Bild.png', 'bild-2.png']);
 	});
 });
 

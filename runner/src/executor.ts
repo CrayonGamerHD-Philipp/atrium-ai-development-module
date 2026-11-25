@@ -4,7 +4,13 @@
  */
 import { mkdir, rm } from 'node:fs/promises';
 import path from 'node:path';
-import { attachmentPromptHint, excludeAidevDir, storeAttachments } from './attachments.ts';
+import {
+	assertAttachmentsUntracked,
+	ATTACHMENTS_DIR,
+	attachmentPromptHint,
+	excludeAidevDir,
+	storeAttachments
+} from './attachments.ts';
 import { accountEnv, publicEnv, type AccountConfig, type RunnerConfig } from './config.ts';
 import { ApiError, EventBatcher, type RunnerApi } from './client.ts';
 import {
@@ -399,7 +405,9 @@ export class Executor {
 			}
 
 			// 5. Schreibend: Commit
-			const committed = await commitAll(ws, wtDir, offer.title, offer.taskId);
+			// Anhangsablage nie in den Index aufnehmen (zusätzlich zu `info/exclude`)
+			const exclude = offer.attachments?.length ? [ATTACHMENTS_DIR] : [];
+			const committed = await commitAll(ws, wtDir, offer.title, offer.taskId, exclude);
 			if (committed) emit('git', { action: 'commit', detail: 'Änderungen committet' });
 			const newCommits = await countCommits(ws, wtDir, prepared.startSha);
 			finish.branch = offer.branch;
@@ -571,6 +579,8 @@ export class Executor {
 			await ws.withRepo({ repoOwner: offer.project.repoOwner, repoName: offer.project.repoName }, () =>
 				excludeAidevDir(ws, dir)
 			);
+			// versionierte Dateien im Ablageordner würden überschrieben bzw. gelöscht und committet
+			await assertAttachmentsUntracked(ws, dir);
 			const stored = await storeAttachments(dir, list, (a) => this.o.api.attachment(offer.runId, a, signal));
 			emit('system', {
 				text: `${stored.length === 1 ? 'Anhang' : 'Anhänge'} bereitgestellt: ${stored.map((s) => s.path).join(', ')}`

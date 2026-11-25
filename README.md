@@ -127,13 +127,14 @@ keinen Commit mehr beiträgt. Ein PR-Sync überträgt Merge oder Schließen auf 
 Aufträge und Chatnachrichten (Modus Auftrag, Frage und Notiz) können Dateien mitbringen, etwa Screenshots oder Logs.
 Jede Datei wird einzeln hochgeladen (`POST /projects/:id/attachments`, Multipart-Feld `file`) und beim Absenden über
 `attachmentIds` verknüpft. Es gelten **höchstens 10 Dateien je Auftrag bzw. Nachricht** und **10 MB je Datei**.
-Dateinamen werden bereinigt. Hochgeladene Dateien, die nach 24 Stunden noch nicht verwendet wurden, löscht der Job
-`attachment-cleanup`. Teilaufträge einer Orchestrierung und per „Umsetzen“ angelegte Aufträge sehen die Anhänge ihres
+Dateinamen werden bereinigt. Im Entwurf entfernte bzw. verworfene Uploads werden sofort gelöscht; übrige hochgeladene
+Dateien, die nach 24 Stunden noch nicht verwendet wurden, löscht der Job `attachment-cleanup`. Teilaufträge einer Orchestrierung und per „Umsetzen“ angelegte Aufträge sehen die Anhänge ihres
 Ursprungsauftrags. Die Dateien liegen als `bytea` in der Modul-Datenbank; Backups werden dadurch entsprechend größer.
 
 Solche Aufträge gehen nur an Runner mit `capabilities.attachments`. Der Runner lädt die Dateien für seinen eigenen
 Lauf, prüft die SHA-256 und legt sie unter `.aidev/attachments/` im Arbeitsverzeichnis ab. `.aidev/` steht in
-`info/exclude` und wird nicht committet. Im Browser werden nur Rasterbilder (PNG, JPEG, GIF, WebP) inline angezeigt.
+`info/exclude` und wird nicht committet; versioniert das Repository bereits Dateien unter `.aidev/attachments/`,
+bricht der Lauf ab. Im Browser werden nur Rasterbilder (PNG, JPEG, GIF, WebP) inline angezeigt.
 Alles andere, auch SVG und HTML, kommt als Download mit `nosniff`.
 
 ### Parallelisierung und Modellwahl
