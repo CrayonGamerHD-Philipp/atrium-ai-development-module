@@ -2,7 +2,7 @@
  * Verbindung zu Atrium: JSON-Anfragen mit Wiederholung (Netzfehler, 5xx, 429 mit `retry-after`), SSE-Befehlsstrom
  * mit automatischem Neuverbinden und Ereignis-Batcher je Lauf.
  */
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { backoffMs, errorMessage, sleep } from './util/async.ts';
 import type { Logger } from './log.ts';
 import { silentLogger } from './log.ts';
@@ -13,6 +13,7 @@ import {
 	MAX_EVENTS_PER_BATCH,
 	runnerCommandSchema,
 	runOfferSchema,
+	type AttachmentOffer,
 	type FinishInput,
 	type HeartbeatInput,
 	type HeartbeatResult,
@@ -165,6 +166,64 @@ export class AtriumClient {
 		throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
 	}
 
+	/**
+	 * Binäre Antwort (`GET`) mit Größenbegrenzung. Wiederholung wie bei `request` (Netzfehler, 5xx, 429);
+	 * endgültige 4xx-Fehler sofort. Mehr als `maxBytes` Byte (laut `content-length` oder beim Lesen) → `DownloadError`.
+	 */
+	async download(path: string, maxBytes: number, opts: RequestOptions = {}): Promise<Buffer> {
+		const attempts = opts.attempts ?? 4;
+		let lastErr: unknown;
+		for (let attempt = 0; attempt < attempts; attempt++) {
+			if (opts.signal?.aborted) throw new Error('Abgebrochen');
+			let waitMs = backoffMs(attempt, this.backoffBaseMs);
+			const ctrl = new AbortController();
+			const timer = setTimeout(() => ctrl.abort(), opts.timeoutMs ?? 120_000);
+			const onAbort = () => ctrl.abort();
+			opts.signal?.addEventListener('abort', onAbort, { once: true });
+			try {
+				const res = await this.fetchFn(this.base + path, {
+					method: 'GET',
+					headers: { ...this.headers(false), accept: 'application/octet-stream, */*' },
+					signal: ctrl.signal
+				});
+				if (res.ok) {
+					const declared = Number(res.headers.get('content-length') ?? '');
+					if (Number.isFinite(declared) && declared > maxBytes) {
+						await res.body?.cancel().catch(() => undefined);
+						throw new DownloadError(`zu groß (${declared} Byte, erlaubt sind ${maxBytes})`);
+					}
+					return await readLimited(res, maxBytes);
+				}
+				const text = await res.text().catch(() => '');
+				let errObj: { code?: string; message?: string } = {};
+				try {
+					errObj = (JSON.parse(text) as { error?: typeof errObj }).error ?? {};
+				} catch {
+					// kein JSON
+				}
+				const err = new ApiError(
+					res.status,
+					errObj.code ?? `http_${res.status}`,
+					errObj.message ?? (text.slice(0, 300) || res.statusText || `HTTP ${res.status}`)
+				);
+				if (err.permanent) throw err;
+				lastErr = err;
+				if (res.status === 429) waitMs = parseRetryAfter(res.headers.get('retry-after')) ?? Math.max(waitMs, 2000);
+			} catch (e) {
+				if ((e instanceof ApiError && e.permanent) || e instanceof DownloadError) throw e;
+				lastErr = e;
+			} finally {
+				clearTimeout(timer);
+				opts.signal?.removeEventListener('abort', onAbort);
+			}
+			if (attempt < attempts - 1) {
+				this.log.debug(`GET ${path} fehlgeschlagen, neuer Versuch in ${waitMs} ms`, errorMessage(lastErr));
+				await sleep(waitMs, opts.signal);
+			}
+		}
+		throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
+	}
+
 	/** Offener SSE-Strom (`GET /runner/stream`) als Byte-Leser */
 	async openStream(signal: AbortSignal): Promise<ReadableStreamDefaultReader<Uint8Array>> {
 		const res = await this.fetchFn(`${this.base}/runner/stream?client=${this.clientId}`, {
@@ -187,6 +246,33 @@ export class AtriumClient {
 		}
 		return res.body.getReader();
 	}
+}
+
+/** Endgültiger Fehler beim Herunterladen (Größe, Prüfsumme) – keine Wiederholung */
+export class DownloadError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = 'DownloadError';
+	}
+}
+
+/** Antwortkörper lesen; Abbruch, sobald mehr als `maxBytes` Byte ankommen */
+async function readLimited(res: Response, maxBytes: number): Promise<Buffer> {
+	if (!res.body) return Buffer.alloc(0);
+	const reader = res.body.getReader();
+	const chunks: Buffer[] = [];
+	let total = 0;
+	for (;;) {
+		const { value, done } = await reader.read();
+		if (done) break;
+		total += value.byteLength;
+		if (total > maxBytes) {
+			await reader.cancel().catch(() => undefined);
+			throw new DownloadError(`zu groß (mehr als ${maxBytes} Byte)`);
+		}
+		chunks.push(Buffer.from(value));
+	}
+	return Buffer.concat(chunks, total);
 }
 
 /** Typisierte Endpunkte des Runner-Protokolls */
@@ -223,6 +309,21 @@ export class RunnerApi {
 	}
 	finish(runId: string, input: FinishInput): Promise<unknown> {
 		return this.client.request('POST', `/runner/runs/${runId}/finish`, input, { attempts: 12 });
+	}
+	/**
+	 * Bytes eines Anhangs dieses Laufs (`GET /runner/runs/:id/attachments/:attachmentId`, binär). Höchstens die im
+	 * Angebot genannte Größe; Größe und SHA-256 müssen mit dem Angebot übereinstimmen.
+	 */
+	async attachment(runId: string, a: AttachmentOffer, signal?: AbortSignal): Promise<Buffer> {
+		const bytes = await this.client.download(
+			`/runner/runs/${encodeURIComponent(runId)}/attachments/${encodeURIComponent(a.id)}`,
+			a.size,
+			{ signal }
+		);
+		if (bytes.length !== a.size) throw new DownloadError(`unerwartete Größe (${bytes.length} statt ${a.size} Byte)`);
+		if (a.sha256 && createHash('sha256').update(bytes).digest('hex') !== a.sha256)
+			throw new DownloadError('Prüfsumme (SHA-256) stimmt nicht');
+		return bytes;
 	}
 	rpc(reqId: string, input: RpcResponseInput): Promise<unknown> {
 		return this.client.request('POST', `/runner/rpc/${reqId}`, input, { attempts: 3 });

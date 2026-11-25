@@ -102,6 +102,12 @@ der Runner Aufträge. Konten, deren CLI fehlt oder die nicht angemeldet sind, me
    (Integrations-Branch beim ersten Teilauftrag), wird sie aus dem Haupt-Branch angelegt und gepusht – außer beim
    Head-Branch eines PR (`pr-update`, `integrate` mit `pullNumber`): dann bricht der Lauf ab.
 2. **setupCmd** in der Shell im Worktree (Ausgabe als Ereignisse; Fehlschlag → `setup`).
+   Danach **Anhänge** (`offer.attachments`, Fähigkeit `capabilities.attachments`): binär über
+   `GET /runner/runs/<runId>/attachments/<attachmentId>` laden (höchstens die angekündigte Größe, SHA-256 geprüft,
+   Wiederholung bei 5xx/429), nach `.aidev/attachments/<name>` schreiben (Namen erneut abgesichert, Duplikate als
+   `name (2).ext`). `/.aidev/` steht in `info/exclude` des gemeinsamen git-dir, daher committet weder der Runner
+   (`git add -A`) noch der Agent die Dateien – in keinem Auslieferungsmodus. Nennt der Auftrag den Pfad nicht schon,
+   wird ein Abschnitt „Anhänge“ an den Prompt angehängt. Fehlschlag → `setup` mit Dateinamen und Ursache.
 3. **Agent** mit Auftrag, Systemanweisung, Modell, ggf. Fortsetzung der Sitzung. Limit erkannt → `/limit`, Abbruch,
    `limited`. Zeitlimit → `timeout`. Abbruch durch Atrium → `cancelled`.
 4. **Nur-Lese-Rollen**: Änderungen verwerfen (`reset --hard`, `clean -fd`), Zusammenfassung = letzte Antwort; bei
