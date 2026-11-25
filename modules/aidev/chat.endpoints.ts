@@ -1,8 +1,12 @@
-/** Projekt-Chat: Verlauf (neueste zuerst) und neue Nachricht – im Modus `task` wird daraus ein Auftrag. */
+/**
+ * Projekt-Chat: Verlauf (neueste zuerst) und neue Nachricht – im Modus `task` wird daraus ein Auftrag, im Modus
+ * `question` eine Frage an einen lesenden Agenten; `auto` erkennt Frage/Auftrag regelbasiert (`intent.ts`).
+ */
 import { sql } from 'drizzle-orm';
 import { type AnyApiEndpoint, defineEndpoint, rowsOf } from '$lib/sdk/server';
 import { mdb, oneOf, type Tx } from './db';
 import { newEffects } from './effects';
+import { classifyChatIntent } from './intent';
 import { chatDto } from './mappers';
 import { publish, userNames } from './publish.service';
 import { loadTaskDto } from './queries';
@@ -67,7 +71,7 @@ export const chatEndpoints: AnyApiEndpoint[] = [
 	defineEndpoint({
 		method: 'POST',
 		path: '/projects/:id/chat',
-		summary: 'Nachricht senden (Modus `task` legt einen Auftrag an)',
+		summary: 'Nachricht senden (Modus `task` legt einen Auftrag an, `auto` erkennt Frage/Auftrag)',
 		tags,
 		permission: PERM.taskCreate,
 		params: idParams,
@@ -76,12 +80,18 @@ export const chatEndpoints: AnyApiEndpoint[] = [
 			ctx,
 			params,
 			body
-		}): Promise<{ message: ChatMessageDto; task: TaskDto | null }> => {
+		}): Promise<{
+			message: ChatMessageDto;
+			task: TaskDto | null;
+			mode: 'task' | 'question' | 'note';
+		}> => {
+			// wirksamer Modus: `auto` wird regelbasiert zu `task` oder `question`
+			const mode = body.mode === 'auto' ? classifyChatIntent(body.body).mode : body.mode;
 			const fx = newEffects();
 			const { row, task } = await mdb().transaction(async (tx) => {
 				const project = await requireProject(tx, params.id);
 				let taskId: string | null = null;
-				if (body.mode === 'task' || body.mode === 'question') {
+				if (mode === 'task' || mode === 'question') {
 					taskId = await createTask(
 						tx,
 						fx,
@@ -91,8 +101,8 @@ export const chatEndpoints: AnyApiEndpoint[] = [
 							prompt: body.body,
 							delivery: body.delivery,
 							targetPr: body.targetPr,
-							role: body.mode === 'question' ? 'research' : body.role,
-							decompose: body.mode === 'question' ? false : body.decompose,
+							role: mode === 'question' ? 'research' : body.role,
+							decompose: mode === 'question' ? false : body.decompose,
 							providerHint: body.providerHint
 						})
 					);
@@ -101,7 +111,7 @@ export const chatEndpoints: AnyApiEndpoint[] = [
 					// Fragen und Aufträge sehen den bisherigen Frage-/Antwort-Verlauf; nur Fragen sind Chat-Fragen
 					const context = await chatHistoryContext(tx, params.id);
 					await tx.execute(
-						body.mode === 'question'
+						mode === 'question'
 							? sql`UPDATE task SET chat_question = true, chat_context = ${context} WHERE id = ${taskId}`
 							: sql`UPDATE task SET chat_context = ${context} WHERE id = ${taskId}`
 					);
@@ -120,7 +130,7 @@ export const chatEndpoints: AnyApiEndpoint[] = [
 			});
 			await publish(ctx, fx);
 			const names = await userNames([ctx.userId]);
-			return { message: chatDto(row, names), task };
+			return { message: chatDto(row, names), task, mode };
 		}
 	})
 ];
