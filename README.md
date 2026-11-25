@@ -29,6 +29,20 @@ Browser ──REST + SSE──▶ Atrium (Modul aidev: Projekte, Warteschlange, 
   Runner sein, auf Servern oder deinem PC. Einrichtung: [`runner/README.md`](runner/README.md).
 - Atrium selbst braucht weder git noch Agent-CLIs. Der Container bleibt gehärtet.
 
+### Projekte anlegen
+
+„Projekt anlegen“ (Recht „Projekte verwalten“) verbindet ein GitHub-Repo. Das Feld versteht `owner/repo`,
+`https://github.com/owner/repo(.git)`, `git@github.com:owner/repo.git` und Links mit Unterpfad wie `…/tree/<branch>`.
+
+- **Name**: Sobald das Repo-Feld einen gültigen Bezeichner enthält, wird der Repo-Name als Projektname eingetragen. Einen
+  selbst geänderten Namen überschreibt der Dialog nicht mehr. Wird das Feld geleert, füllt er es wieder automatisch.
+- **Repo-Prüfung**: Kurz nach der letzten Änderung fragt Atrium einen Runner (`POST /projects/probe`). Unter dem Feld steht
+  das Ergebnis: Zugriff ok, nur lesen, nicht erreichbar oder „Kein Runner erreichbar“. Ist das Repo schon als Projekt
+  angelegt, verlinkt der Dialog darauf. Die Prüfung blockiert das Anlegen nie.
+- **Haupt-Branch**: Der Standard-Branch des Repos wird übernommen (bei einem `/tree/<branch>`-Link dieser Branch), solange
+  du das Feld nicht selbst geändert hast. Alle Branches stehen als Vorschläge zur Auswahl. Freie Eingabe bleibt möglich.
+  In den Projekteinstellungen erscheinen die Vorschläge nach „Repo prüfen“.
+
 ### Projekte finden
 
 Die Projektübersicht (Startseite des Moduls) ist auch bei vielen Projekten schnell durchsuchbar:
