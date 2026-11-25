@@ -7,7 +7,7 @@ import { errors, num, rowsOf, str, toIso, type Row } from '$lib/sdk/server';
 import { clip, jsonb, LEASE_SEC, oneOf, type Tx } from './db';
 import { sendCommand, type Effects } from './effects';
 import { storeLimitSnapshot } from './limits.service';
-import { extractPlan } from './prompts';
+import { extractCoordination, extractPlan } from './prompts';
 import {
 	MAX_EVENT_TEXT,
 	type FinishInput,
@@ -18,10 +18,12 @@ import {
 import { backoffMs, calibrateBudget, unitsOf, weekStartOf } from './scheduler';
 import type { Limits } from './schemas';
 import {
+	applyCoordination,
 	applyOutcome,
 	applyPlan,
 	checkPlan,
 	createResolveTask,
+	effectiveRole,
 	excludeAccount,
 	getTask,
 	isFinal,
@@ -310,7 +312,8 @@ export async function finishRun(
 	fx: Effects,
 	runnerId: string,
 	runId: string,
-	input: FinishInput
+	input: FinishInput,
+	limits: Limits
 ): Promise<{ ok: true; taskStatus: string | null }> {
 	const run = await ownRun(tx, runnerId, runId);
 	if (!ACTIVE.includes(String(run.status))) {
@@ -376,7 +379,7 @@ export async function finishRun(
 				await failAttempt(tx, fx, task, 'Der Agent hat keine Antwort geliefert');
 				break;
 			}
-			await succeed(tx, fx, task, input, pr);
+			await succeed(tx, fx, task, input, pr, limits);
 			break;
 		case 'failed':
 			await fail(tx, fx, task, run, input);
@@ -414,10 +417,16 @@ async function succeed(
 	fx: Effects,
 	task: Row,
 	input: FinishInput,
-	pr: PullInfo | null
+	pr: PullInfo | null,
+	limits: Limits
 ): Promise<void> {
 	const summary = input.summary;
-	if (task.role === 'orchestrate' && !planOf(task)) {
+	const stored = planOf(task);
+	if (stored && stored.phase === 'coordinate') {
+		await coordinate(tx, fx, task, stored, input);
+		return;
+	}
+	if (task.role === 'orchestrate' && !stored) {
 		let check = checkPlan(input.plan);
 		if (!check.ok && summary) {
 			const extracted = checkPlan(extractPlan(summary));
@@ -427,7 +436,7 @@ async function succeed(
 			await failAttempt(tx, fx, task, check.error);
 			return;
 		}
-		await applyPlan(tx, fx, task, check.plan, summary);
+		await applyPlan(tx, fx, task, check.plan, summary, limits.coordinationRounds);
 		return;
 	}
 	if (task.role === 'resolve' && task.parent_id) {
@@ -449,6 +458,35 @@ async function succeed(
 	await applyOutcome(tx, fx, task, { pr, summary });
 }
 
+/**
+ * Koordinationslauf des Master-Agents abgeschlossen: Entscheidung aus der Zusammenfassung lesen (Ausweichweg:
+ * `finish.plan`, falls es `coordinationSchema` erfüllt) und übernehmen; ungültig → Fehlversuch
+ */
+async function coordinate(
+	tx: Tx,
+	fx: Effects,
+	task: Row,
+	plan: StoredPlan,
+	input: FinishInput
+): Promise<void> {
+	const keys = plan.subtasks.map((s) => s.key);
+	let decision = input.summary ? extractCoordination(input.summary, keys) : null;
+	if (!decision && input.plan !== undefined && input.plan !== null) {
+		decision = extractCoordination(JSON.stringify(input.plan), keys);
+	}
+	if (!decision) {
+		await failAttempt(
+			tx,
+			fx,
+			task,
+			'Koordination ungültig: kein gültiger json-Block mit der Entscheidung des Master-Agents (neue Schlüssel eindeutig, keine vorhandenen wiederverwenden)'
+		);
+		return;
+	}
+	const error = await applyCoordination(tx, fx, task, plan, decision, input.summary);
+	if (error) await failAttempt(tx, fx, task, error);
+}
+
 /** Ausliefern einer Orchestrierung abgeschlossen */
 async function markDelivered(tx: Tx, task: Row): Promise<void> {
 	const plan = planOf(task);
@@ -466,7 +504,8 @@ async function failAttempt(tx: Tx, fx: Effects, task: Row, message: string): Pro
 async function fail(tx: Tx, fx: Effects, task: Row, run: Row, input: FinishInput): Promise<void> {
 	const message =
 		input.errorMessage ?? `Lauf fehlgeschlagen${input.errorKind ? ` (${input.errorKind})` : ''}`;
-	const writes = !(task.role === 'orchestrate' && !planOf(task));
+	// Planungs- und Koordinationsläufe schreiben nicht (kein Konflikt möglich)
+	const writes = !(task.role === 'orchestrate' && effectiveRole(task) === 'orchestrate');
 	if (input.errorKind === 'conflict' && task.role !== 'resolve' && writes) {
 		const branch = input.branch ?? str(task.branch) ?? str(run.branch);
 		if (branch && !task.branch) {

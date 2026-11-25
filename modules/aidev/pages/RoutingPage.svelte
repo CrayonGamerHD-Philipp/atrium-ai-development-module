@@ -186,6 +186,14 @@
 			min: 100,
 			max: 1_000_000,
 			step: 1000
+		},
+		{
+			key: 'coordinationRounds',
+			label: 'Koordinationsrunden',
+			hint: 'Master-Agent prüft Ergebnisse und plant Folgeaufträge (0 = aus)',
+			min: 0,
+			max: 10,
+			step: 1
 		}
 	];
 </script>

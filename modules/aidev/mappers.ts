@@ -13,6 +13,7 @@ import type {
 	RunStatus,
 	RunSummaryDto,
 	RunnerDto,
+	TaskCoordinationDto,
 	TaskDto,
 	TaskStatus
 } from './schemas';
@@ -123,8 +124,22 @@ export function taskDto(r: Row, dependsOn: string[], lastRun: RunSummaryDto | nu
 		updatedAt: toIso(r.updated_at),
 		startedAt: toIsoOrNull(r.started_at),
 		finishedAt: toIsoOrNull(r.finished_at),
-		lastRun
+		lastRun,
+		coordination: coordinationOf(r)
 	};
+}
+
+const PHASES: TaskCoordinationDto['phase'][] = ['subtasks', 'coordinate', 'deliver'];
+
+/** Koordinationsstand aus `task.plan` (siehe `StoredPlan` in `tasks.service.ts`); alte Pläne → `null` */
+export function coordinationOf(r: Row): TaskCoordinationDto | null {
+	if (r.role !== 'orchestrate') return null;
+	const plan = jsonOf<Record<string, unknown> | null>(r.plan, null);
+	if (!plan || !Array.isArray(plan.subtasks)) return null;
+	const maxRounds = typeof plan.maxRounds === 'number' ? plan.maxRounds : 0;
+	if (maxRounds <= 0) return null;
+	const phase = PHASES.find((p) => p === plan.phase) ?? 'subtasks';
+	return { phase, round: typeof plan.round === 'number' ? plan.round : 1, maxRounds };
 }
 
 export function accountDto(
