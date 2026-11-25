@@ -165,6 +165,13 @@ export async function pickRunner(
 	return String(any.id);
 }
 
+/** Irgendein verbundener, freigegebener Runner (ohne Projektbezug, z. B. Repo vor dem Anlegen prüfen) */
+export async function pickAnyRunner(tx: Tx): Promise<string> {
+	const any = (await connectedRunners(tx))[0];
+	if (!any) throw errors.unavailable('Kein Runner erreichbar');
+	return String(any.id);
+}
+
 /** Projekt laden (404) und Runner wählen – in einer eigenen Transaktion */
 export async function projectAndRunner(
 	projectId: string,

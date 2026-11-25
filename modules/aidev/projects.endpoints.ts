@@ -7,10 +7,17 @@ import { projectHub } from './live';
 import { repoCheckResult } from './protocol';
 import { loadProjectDto, loadProjectDtos } from './queries';
 import { publish } from './publish.service';
-import { callRunner, parseResult, projectAndRunner, rpcProjectOf } from './rpc.service';
+import {
+	callRunner,
+	parseResult,
+	pickAnyRunner,
+	projectAndRunner,
+	rpcProjectOf
+} from './rpc.service';
 import {
 	assertNoDuplicate,
 	assertRunnerExists,
+	findDuplicate,
 	requireProject,
 	requireRepo
 } from './projects.service';
@@ -20,11 +27,16 @@ import {
 	PERM,
 	projectInput,
 	projectPatch,
+	repoProbeInput,
 	type ProjectDto,
-	type ProjectLiveEvent
+	type ProjectLiveEvent,
+	type RepoProbeDto
 } from './schemas';
 
 const tags = ['Modul: aidev – Projekte'];
+
+/** Zeitlimit für `POST /projects/probe` (Runner fragt `git ls-remote` und `gh repo view` ab) */
+const PROBE_TIMEOUT_MS = 15_000;
 
 export const projectEndpoints: AnyApiEndpoint[] = [
 	defineEndpoint({
@@ -68,6 +80,51 @@ export const projectEndpoints: AnyApiEndpoint[] = [
 			});
 			await publish(ctx, fx);
 			return dto;
+		}
+	}),
+	defineEndpoint({
+		method: 'POST',
+		path: '/projects/probe',
+		summary: 'Repo vor dem Anlegen über einen Runner prüfen',
+		description:
+			'Liefert Namensvorschlag, Haupt-Branch, Branch-Liste (Autovervollständigung), Schreibrecht und ein schon vorhandenes Projekt zum Repo. Ungültiges Format → 422, kein Runner → 503. Nur lesend (kein Audit).',
+		tags,
+		permission: PERM.projectManage,
+		body: repoProbeInput,
+		handler: async ({ body }): Promise<RepoProbeDto> => {
+			const repo = requireRepo(body.repo);
+			const { existingProjectId, runnerId } = await mdb().transaction(async (tx) => ({
+				existingProjectId: await findDuplicate(tx, repo.owner, repo.name),
+				runnerId: await pickAnyRunner(tx)
+			}));
+			// Zufällige Id: `repo.check` nutzt nur Remote-URL/gh, legt also keine Arbeitskopie an;
+			// leerer Haupt-Branch → der Runner meldet den Default-Branch von GitHub bzw. des Remotes.
+			const result = parseResult(
+				repoCheckResult,
+				await callRunner(
+					runnerId,
+					'repo.check',
+					{
+						id: crypto.randomUUID(),
+						repoOwner: repo.owner,
+						repoName: repo.name,
+						defaultBranch: ''
+					},
+					'main',
+					{},
+					PROBE_TIMEOUT_MS
+				)
+			);
+			return {
+				owner: repo.owner,
+				name: repo.name,
+				ok: result.ok,
+				message: result.message,
+				defaultBranch: result.defaultBranch,
+				branches: result.branches ?? [],
+				canPush: result.canPush,
+				existingProjectId
+			};
 		}
 	}),
 	defineEndpoint({
@@ -166,7 +223,8 @@ export const projectEndpoints: AnyApiEndpoint[] = [
 				ok: result.ok,
 				message: result.message,
 				defaultBranch: result.defaultBranch,
-				canPush: result.canPush
+				canPush: result.canPush,
+				branches: result.branches ?? []
 			};
 		}
 	}),
