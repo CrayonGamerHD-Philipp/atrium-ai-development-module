@@ -150,7 +150,12 @@ npm test               # Vitest: modules/aidev/tests
 npm run build          # Produktions-Build des Core mit diesem Modul
 npm run demo           # Demo-Server http://localhost:4300 (admin@demo.test / Demo-Admin-2026!)
 npm run runner:install && npm run runner:test   # Runner
+npm run branches:prune # gemergte Branches (lokal + origin) auflisten; mit `-- --apply` löschen
 ```
+
+`branches:prune` erkennt normale Merges, Squash-Merges, Rebases und Teil-Branches gemergter Sammel-Branches. Den
+Basis-Branch, in einem Worktree ausgecheckte Branches und Branches mit Commits aus der letzten Stunde (`--min-age`) lässt
+es stehen. Worktrees räumt der Runner selbst auf (nach 48 h bzw. ab 30 Stück).
 
 ## Installation in Atrium
 
