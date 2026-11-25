@@ -257,6 +257,8 @@ export const replyInput = z.object({ message: z.string().trim().min(1).max(20_00
 /**
  * Auftrag neu starten (`POST /tasks/:id/retry`, Body optional). `subtasks` gilt für Orchestrierungen:
  * `failed` setzt nur fehlgeschlagene/abgebrochene Teilaufträge zurück, `all` auch erledigte (alles neu).
+ * Auch wartende (`queued`) und blockierte (`blocked`) Aufträge lassen sich neu starten; deren eigene aktive
+ * (hängengebliebene) Läufe werden dabei abgebrochen.
  */
 export const restartInput = z
 	.object({ subtasks: z.enum(['failed', 'all']).default('failed') })
@@ -685,7 +687,7 @@ export type TerminalLiveEvent =
  * | PATCH | /tasks/:id | task.create (eigene) / task.manage | taskPatch | TaskDto |
  * | POST | /tasks/:id/queue | task.create | – | TaskDto (Entwurf → Wartet) |
  * | POST | /tasks/:id/cancel | task.create (eigene) / task.manage | – | TaskDto |
- * | POST | /tasks/:id/retry | task.create (eigene) / task.manage | restartInput (optional) | TaskDto (neu starten; subtasks=all auch erledigte Teilaufträge) |
+ * | POST | /tasks/:id/retry | task.create (eigene) / task.manage | restartInput (optional) | TaskDto (neu starten, auch wartend/blockiert; subtasks=all auch erledigte Teilaufträge) |
  * | POST | /tasks/:id/reply | task.create | replyInput | TaskDto (Rückfrage beantworten, Sitzung fortsetzen) |
  * | DELETE | /tasks/:id | task.manage | – | { ok } (nur Endzustand/Entwurf) |
  * | GET | /tasks/:id/diff | project.view | – | DiffDto (Branch gegen Basis, über Runner) |

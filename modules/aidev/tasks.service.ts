@@ -681,23 +681,27 @@ export async function descendantIds(tx: Tx, id: string): Promise<string[]> {
 }
 
 /**
- * Auftrag und offene Nachfahren abbrechen. Angebotene Läufe enden sofort (`cancelled`), laufende bekommen einen
- * `cancel`-Befehl und behalten ihren Status bis `finish`/Heartbeat.
+ * Aktive Läufe der Aufträge abbrechen: `cancel`-Befehl an den Runner, angebotene Läufe enden sofort
+ * (Reservierung entfällt). `finishRunning`: auch laufende sofort als `cancelled` beenden (Reservierung wie bei
+ * `loseRun` abrechnen), damit direkt ein neuer Lauf geplant werden kann – spätere Meldungen des Runners zu
+ * diesem Lauf ändern nichts mehr (`finishRun` nur für aktive Läufe, der Heartbeat bricht ihn ab).
  */
-export async function cancelTask(tx: Tx, fx: Effects, task: Row): Promise<void> {
-	if (isFinal(task.status)) throw errors.conflict('Der Auftrag ist bereits beendet');
-	const ids = [String(task.id), ...(await descendantIds(tx, String(task.id)))];
+async function cancelActiveRuns(
+	tx: Tx,
+	fx: Effects,
+	taskIds: string[],
+	reason: string,
+	finishRunning = false
+): Promise<Row[]> {
+	if (!taskIds.length) return [];
 	const runs = await rowsOf(
 		tx,
 		sql`SELECT id, runner_id, status FROM run
-			WHERE task_id IN (${inList(ids)}) AND status IN ('offered', 'running')`
+			WHERE task_id IN (${inList(taskIds)}) AND status IN ('offered', 'running')
+			FOR UPDATE`
 	);
 	for (const r of runs) {
-		sendCommand(fx, str(r.runner_id), {
-			type: 'cancel',
-			runId: String(r.id),
-			reason: 'Auftrag abgebrochen'
-		});
+		sendCommand(fx, str(r.runner_id), { type: 'cancel', runId: String(r.id), reason });
 		fx.runs.add(String(r.id));
 		if (r.status === 'offered') {
 			await tx.execute(
@@ -708,8 +712,39 @@ export async function cancelTask(tx: Tx, fx: Effects, task: Row): Promise<void> 
 			await tx.execute(
 				sql`DELETE FROM usage_ledger WHERE run_id = ${r.id} AND source = 'reserved'`
 			);
+		} else if (finishRunning) {
+			await tx.execute(
+				sql`UPDATE run SET status = 'cancelled', finished_at = now(), lease_expires_at = NULL,
+						error_kind = 'cancelled', error_message = ${reason}
+					WHERE id = ${r.id}`
+			);
+			// wie `settleReservation`: gemeldeter Verbrauch ersetzt die Reservierung, sonst bleibt sie als Schätzung
+			const reported = await oneOf(
+				tx,
+				sql`SELECT 1 FROM usage_ledger WHERE run_id = ${r.id} AND source = 'reported' LIMIT 1`
+			);
+			await tx.execute(
+				reported
+					? sql`DELETE FROM usage_ledger WHERE run_id = ${r.id} AND source = 'reserved'`
+					: sql`UPDATE usage_ledger SET source = 'estimated' WHERE run_id = ${r.id} AND source = 'reserved'`
+			);
 		}
 	}
+	if (runs.length) {
+		fx.overview = true;
+		fx.dispatch = true;
+	}
+	return runs;
+}
+
+/**
+ * Auftrag und offene Nachfahren abbrechen. Angebotene Läufe enden sofort (`cancelled`), laufende bekommen einen
+ * `cancel`-Befehl und behalten ihren Status bis `finish`/Heartbeat.
+ */
+export async function cancelTask(tx: Tx, fx: Effects, task: Row): Promise<void> {
+	if (isFinal(task.status)) throw errors.conflict('Der Auftrag ist bereits beendet');
+	const ids = [String(task.id), ...(await descendantIds(tx, String(task.id)))];
+	const runs = await cancelActiveRuns(tx, fx, ids, 'Auftrag abgebrochen');
 	const rest = ids.slice(1);
 	if (rest.length) {
 		const rows = await rowsOf(
@@ -842,7 +877,10 @@ export async function restartTask(
 	const subtasks = opts.subtasks ?? 'failed';
 	const ancestors = opts.reopenParents ? await reopenableAncestors(tx, task) : [];
 	if (!opts.reopenParents) await assertParentAllowsRestart(tx, task);
-	if (await hasActiveRun(tx, String(task.id))) {
+	if (WAITING.includes(String(task.status) as TaskStatus)) {
+		// wartender/blockierter (z. B. hängengebliebener) Auftrag: eigene Läufe abbrechen statt ablehnen
+		await cancelActiveRuns(tx, fx, [String(task.id)], 'Auftrag neu gestartet', true);
+	} else if (await hasActiveRun(tx, String(task.id))) {
 		throw errors.conflict('Der Auftrag hat noch einen aktiven Lauf');
 	}
 	const plan = planOf(task);
@@ -909,8 +947,18 @@ export async function restartTask(
 	return count;
 }
 
-/** Manuell neu startbar (`POST /tasks/:id/retry`) */
-export const RESTARTABLE: TaskStatus[] = ['failed', 'cancelled', 'needs-input', 'done', 'review'];
+/** Wartende Zustände: der Neustart bricht die eigenen aktiven Läufe ab, statt mit 409 abzulehnen */
+const WAITING: TaskStatus[] = ['queued', 'blocked'];
+/** Manuell neu startbar (`POST /tasks/:id/retry`), auch wartende/blockierte (hängengebliebene) Aufträge */
+export const RESTARTABLE: TaskStatus[] = [
+	'failed',
+	'cancelled',
+	'needs-input',
+	'done',
+	'review',
+	'queued',
+	'blocked'
+];
 /** @deprecated Bitte `RESTARTABLE` verwenden (gleiche Liste) */
 export const RETRYABLE: TaskStatus[] = RESTARTABLE;
 /** Antwort setzt diese Zustände fort (Sitzung wird fortgesetzt) */
