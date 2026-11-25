@@ -410,6 +410,16 @@
 				<h1 class="text-title break-words">{taskTitle(task)}</h1>
 				<div class="flex flex-wrap items-center gap-2 text-sm">
 					<StatusBadge status={task.status} />
+					{#if task.coordination}
+						<span class="text-xs text-muted-foreground">
+							{task.coordination.phase === 'subtasks'
+								? 'Teilaufträge laufen'
+								: task.coordination.phase === 'coordinate'
+									? 'Master-Agent koordiniert'
+									: 'Ausliefern'}
+							· Runde {task.coordination.round} von maximal {task.coordination.maxRounds + 1}
+						</span>
+					{/if}
 					<span class="rounded-sm bg-muted px-1.5 py-0.5 text-xs text-muted-foreground">
 						{roleLabel(task.role)}
 					</span>

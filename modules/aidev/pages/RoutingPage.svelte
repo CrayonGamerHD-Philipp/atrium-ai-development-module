@@ -189,8 +189,8 @@
 		},
 		{
 			key: 'coordinationRounds',
-			label: 'Koordinationsrunden',
-			hint: 'Master-Agent prüft Ergebnisse und plant Folgeaufträge (0 = aus)',
+			label: 'Master-Agent: Koordinationsrunden',
+			hint: '0 = aus: einmal planen, dann ausliefern. Sonst prüft der planende Agent nach jeder Runde die Ergebnisse, vermittelt sie an weitere Agents und legt Folgeaufträge an.',
 			min: 0,
 			max: 10,
 			step: 1

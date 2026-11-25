@@ -108,6 +108,17 @@ der Scheduler parallel auf freie Konten und Runner. Welcher Anbieter welche Roll
 **Administration → KI-Verteilung** ein. Der Orchestrator setzt `provider` für einen Teilauftrag nur, wenn ein Anbieter
 dafür klar geeignet ist; sonst gilt die Verteilung.
 
+Der planende Agent arbeitet als Master-Agent: Nach jeder Runde prüft er Ergebnisse und Fehler, vermittelt Ergebnisse
+an weitere Agents und legt bei Bedarf Folgeaufträge an. So kann etwa Codex für eine Aufgabe von Claude recherchieren.
+Sind keine weiteren Aufträge nötig oder ist die Höchstzahl erreicht, wird ausgeliefert. Bei einem Fehlschlag kann der
+Master-Agent in einer verbleibenden Koordinationsrunde nachsteuern; schlägt ein Teilauftrag in der letzten Runde fehl,
+scheitert der Auftrag.
+Unter **Administration → KI-Verteilung** legt „Master-Agent: Koordinationsrunden“ die Zahl von 0 bis 10 fest
+(Standard 2). Bei 0 wird einmal geplant und danach ausgeliefert, ohne Koordinationsrunde.
+
+Der Scheduler bevorzugt für gleichzeitig laufende Teilaufträge derselben Orchestrierung unterschiedliche Anbieter und
+Konten, soweit Verteilung, Verfügbarkeit und Budgets es erlauben.
+
 ### Limit-Analyse
 
 Neben der eigenen Schätzung über die Budgets wertet Atrium den **echten Limit-Stand der Anbieter** aus. Du siehst ihn
