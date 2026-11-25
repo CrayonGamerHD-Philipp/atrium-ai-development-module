@@ -41,6 +41,10 @@ export class FakeAtrium {
 	cancel: string[] = [];
 	/** Nächste Antworten für events (Fehler simulieren) */
 	failEvents = 0;
+	/** Anhänge für `GET /runner/runs/:id/attachments/:attachmentId` (binär); fehlende → 404 */
+	attachments = new Map<string, Buffer>();
+	/** Nächste Antworten für Anhänge mit 503 (Wiederholung prüfen) */
+	failAttachments = 0;
 	private waiters: { pred: (r: Recorded) => boolean; resolve: (r: Recorded) => void }[] = [];
 
 	constructor() {
@@ -118,6 +122,20 @@ export class FakeAtrium {
 			res.write(`data: ${JSON.stringify({ type: 'hello', runnerId: RUNNER_ID, status: 'approved' })}\n\n`);
 			req.on('close', () => this.streams.delete(res));
 			this.record({ method: 'GET', path: p, body: null });
+			return;
+		}
+
+		const att = /^\/runner\/runs\/([0-9a-f-]+)\/attachments\/([0-9a-f-]+)$/.exec(p);
+		if (req.method === 'GET' && att) {
+			this.record({ method: 'GET', path: p, body: null });
+			if (this.failAttachments > 0) {
+				this.failAttachments--;
+				return this.json(res, 503, { error: { code: 'unavailable', message: 'kurz weg' } });
+			}
+			const bytes = this.attachments.get(att[2] ?? '');
+			if (!bytes) return this.json(res, 404, { error: { code: 'not_found', message: 'Anhang nicht gefunden' } });
+			res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': String(bytes.length) });
+			res.end(bytes);
 			return;
 		}
 
