@@ -37,7 +37,7 @@
 		() => projectId,
 		(m) => toast.error(m)
 	);
-	onDestroy(() => attachments.clear());
+	onDestroy(() => attachments.discard());
 
 	const deliveryOptions = [
 		{ value: 'project', label: 'Projektvorgabe' },
