@@ -22,8 +22,10 @@
  *    direkt). Erfolg → `plan.delivered = true`, danach wie jeder Auftrag (`review` bzw. `done`).
  *    Sind alle Teilaufträge abgebrochen, wird der Elternauftrag `cancelled`.
  * 4. Ein Teilauftrag endgültig `failed` → Elternauftrag `failed`; offene Teilaufträge ohne aktiven Lauf werden
- *    abgebrochen (laufende enden regulär, ändern den Elternauftrag aber nicht mehr). „Wiederholen“ am
- *    Elternauftrag setzt fehlgeschlagene/abgebrochene Teilaufträge zurück und blockiert ihn erneut.
+ *    abgebrochen (laufende enden regulär, ändern den Elternauftrag aber nicht mehr). „Neu starten“ am
+ *    Elternauftrag setzt fehlgeschlagene/abgebrochene (`subtasks: 'all'`: alle) Teilaufträge zurück und blockiert
+ *    ihn erneut. „Neu starten“ an einem Teilauftrag öffnet gescheiterte Vorfahren wieder (→ `blocked`), samt der
+ *    nur deshalb abgebrochenen Geschwister.
  *
  * Konflikte (`finish.status = failed`, `errorKind = conflict`)
  * - Es entsteht ein Kind-Auftrag Rolle `resolve` (Konfliktdateien in `plan.conflictFiles` und im Prompt), auf
@@ -338,12 +340,15 @@ async function propagate(tx: Tx, fx: Effects, task: Row): Promise<void> {
 	}
 }
 
+/** Begründung an Geschwistern, die `failChildrenOf` abbricht (erkennt der Neustart eines Teilauftrags wieder) */
+const CANCELLED_BY_SIBLING = 'Abgebrochen, weil ein anderer Teilauftrag fehlgeschlagen ist';
+
 /** Offene Geschwister ohne aktiven Lauf abbrechen (Elternauftrag scheitert) */
 async function failChildrenOf(tx: Tx, fx: Effects, parentId: string, exceptId: string) {
 	const rows = await rowsOf(
 		tx,
 		sql`UPDATE task t SET status = 'cancelled', updated_at = now(), finished_at = now(),
-				error_message = 'Abgebrochen, weil ein anderer Teilauftrag fehlgeschlagen ist'
+				error_message = ${CANCELLED_BY_SIBLING}
 			WHERE t.parent_id = ${parentId} AND t.id <> ${exceptId}
 				AND t.status NOT IN ('done', 'failed', 'cancelled')
 				AND NOT EXISTS (SELECT 1 FROM run r WHERE r.task_id = t.id AND r.status IN ('offered', 'running'))
@@ -742,20 +747,137 @@ async function hasActiveRun(tx: Tx, taskId: string): Promise<boolean> {
 	));
 }
 
+async function anyActiveRun(tx: Tx, taskIds: string[]): Promise<boolean> {
+	if (!taskIds.length) return false;
+	return !!(await oneOf(
+		tx,
+		sql`SELECT 1 FROM run WHERE task_id IN (${inList(taskIds)}) AND status IN ('offered', 'running') LIMIT 1`
+	));
+}
+
+/** Elternaufträge, die ein manueller Neustart eines Teilauftrags wieder öffnen darf (Plan nicht ausgeliefert) */
+const REOPENABLE_PARENT: TaskStatus[] = ['failed', 'cancelled', 'needs-input'];
+
+/**
+ * Vorfahren, die beim manuellen Neustart wieder `blocked` werden (innerster zuerst). Der Aufstieg endet am ersten
+ * blockierten Vorfahren; ein aktiver (`queued`/`running`) oder bereits ausgelieferter (`done`/`review`)
+ * Vorfahre verhindert den Neustart.
+ */
+async function reopenableAncestors(tx: Tx, task: Row): Promise<Row[]> {
+	const out: Row[] = [];
+	let current = task;
+	while (current.parent_id) {
+		const parent = await getTask(tx, String(current.parent_id), true);
+		if (!parent || parent.status === 'blocked') break;
+		const delivered = planOf(parent)?.delivered === true;
+		if (!REOPENABLE_PARENT.includes(String(parent.status) as TaskStatus) || delivered) {
+			throw errors.conflict('Bitte den übergeordneten Auftrag neu starten');
+		}
+		if (await hasActiveRun(tx, String(parent.id))) {
+			throw errors.conflict('Der übergeordnete Auftrag hat noch einen aktiven Lauf');
+		}
+		out.push(parent);
+		current = parent;
+	}
+	return out;
+}
+
+/**
+ * Vorfahren wieder blockieren (Fehler, Versuche, Ende zurücksetzen). Geschwister, die nur wegen des
+ * Fehlschlags abgebrochen wurden (`failChildrenOf`), laufen ebenfalls neu; liefert die Zahl der Geschwister.
+ */
+async function reopenAncestors(tx: Tx, fx: Effects, task: Row, ancestors: Row[]): Promise<number> {
+	let siblings = 0;
+	let child = task;
+	for (const parent of ancestors) {
+		const rows = await rowsOf(
+			tx,
+			sql`UPDATE task SET status = 'queued', attempts = 0, error_message = NULL, finished_at = NULL,
+					excluded_account_ids = '[]'::jsonb, updated_at = now()
+				WHERE parent_id = ${parent.id} AND id <> ${child.id} AND role <> 'resolve'
+					AND status = 'cancelled' AND error_message = ${CANCELLED_BY_SIBLING}
+				RETURNING id`
+		);
+		for (const r of rows) fx.tasks.add(String(r.id));
+		siblings += rows.length;
+		await tx.execute(
+			sql`UPDATE task SET excluded_account_ids = '[]'::jsonb WHERE id = ${parent.id}`
+		);
+		await transition(tx, fx, String(parent.id), 'blocked', { error: null, resetAttempts: true });
+		child = parent;
+	}
+	return siblings;
+}
+
+export interface RestartOptions {
+	/** Teilaufträge einer Orchestrierung: nur fehlgeschlagene/abgebrochene (Standard) oder alle außer `resolve` */
+	subtasks?: 'failed' | 'all';
+	/**
+	 * Manueller Neustart (`POST /tasks/:id/retry`): nicht blockierte Vorfahren mit nicht ausgeliefertem Plan
+	 * wieder blockieren statt abzulehnen. Ohne (Antwort im Chat) gilt weiter: Elternauftrag muss `blocked` sein.
+	 */
+	reopenParents?: boolean;
+}
+
 /**
  * Neu starten (Versuche = 0, Ausschlüsse leeren). Orchestrierung mit Plan: fehlgeschlagene/abgebrochene
- * Teilaufträge zurücksetzen und wieder blockieren (alle erledigt → Ausliefern).
+ * (`subtasks: 'all'`: alle) Teilaufträge zurücksetzen und wieder blockieren (alle erledigt → Ausliefern).
+ * Bei `all` werden offene Konfliktlösungen im Baum abgebrochen und `plan.delivered` zurückgesetzt, damit die
+ * Auslieferung erneut läuft. Liefert die Zahl der zusätzlich zurückgesetzten Aufträge (Teilaufträge,
+ * Geschwister und wieder geöffnete Vorfahren).
  */
-export async function restartTask(tx: Tx, fx: Effects, task: Row): Promise<void> {
-	await assertParentAllowsRestart(tx, task);
+export async function restartTask(
+	tx: Tx,
+	fx: Effects,
+	task: Row,
+	opts: RestartOptions = {}
+): Promise<number> {
+	const subtasks = opts.subtasks ?? 'failed';
+	const ancestors = opts.reopenParents ? await reopenableAncestors(tx, task) : [];
+	if (!opts.reopenParents) await assertParentAllowsRestart(tx, task);
 	if (await hasActiveRun(tx, String(task.id))) {
 		throw errors.conflict('Der Auftrag hat noch einen aktiven Lauf');
 	}
+	const plan = planOf(task);
+	const descendants = plan && subtasks === 'all' ? await descendantIds(tx, String(task.id)) : [];
+	if (await anyActiveRun(tx, descendants)) {
+		throw errors.conflict('Ein Teilauftrag hat noch einen aktiven Lauf');
+	}
+	let count = ancestors.length + (await reopenAncestors(tx, fx, task, ancestors));
 	await tx.execute(
 		sql`UPDATE task SET excluded_account_ids = '[]'::jsonb, attempts = 0 WHERE id = ${task.id}`
 	);
-	const plan = planOf(task);
-	if (plan && !plan.delivered) {
+	if (plan && subtasks === 'all') {
+		if (descendants.length) {
+			const cancelled = await rowsOf(
+				tx,
+				sql`UPDATE task SET status = 'cancelled', updated_at = now(), finished_at = now(),
+						error_message = 'Abgebrochen, weil der Auftrag neu gestartet wurde'
+					WHERE id IN (${inList(descendants)}) AND role = 'resolve'
+						AND status NOT IN ('done', 'failed', 'cancelled')
+					RETURNING id`
+			);
+			for (const r of cancelled) fx.tasks.add(String(r.id));
+		}
+		const reset = await rowsOf(
+			tx,
+			sql`UPDATE task SET status = 'queued', attempts = 0, error_message = NULL, finished_at = NULL,
+					excluded_account_ids = '[]'::jsonb, updated_at = now()
+				WHERE parent_id = ${task.id} AND role <> 'resolve'
+				RETURNING id`
+		);
+		for (const r of reset) fx.tasks.add(String(r.id));
+		count += reset.length;
+		if (plan.delivered) {
+			const next: StoredPlan = { ...plan, delivered: false };
+			await tx.execute(sql`UPDATE task SET plan = ${jsonb(next)} WHERE id = ${task.id}`);
+		}
+		if (reset.length) {
+			await transition(tx, fx, String(task.id), 'blocked', { error: null, resetAttempts: true });
+			fx.dispatch = true;
+			return count;
+		}
+	} else if (plan && !plan.delivered) {
 		const reset = await rowsOf(
 			tx,
 			sql`UPDATE task SET status = 'queued', attempts = 0, error_message = NULL, finished_at = NULL,
@@ -764,6 +886,7 @@ export async function restartTask(tx: Tx, fx: Effects, task: Row): Promise<void>
 				RETURNING id`
 		);
 		for (const r of reset) fx.tasks.add(String(r.id));
+		count += reset.length;
 		const open = await oneOf(
 			tx,
 			sql`SELECT 1 FROM task WHERE parent_id = ${task.id} AND role <> 'resolve'
@@ -772,13 +895,17 @@ export async function restartTask(tx: Tx, fx: Effects, task: Row): Promise<void>
 		if (open) {
 			await transition(tx, fx, String(task.id), 'blocked', { error: null, resetAttempts: true });
 			fx.dispatch = true;
-			return;
+			return count;
 		}
 	}
 	await transition(tx, fx, String(task.id), 'queued', { error: null, resetAttempts: true });
+	return count;
 }
 
-export const RETRYABLE: TaskStatus[] = ['failed', 'cancelled', 'needs-input'];
+/** Manuell neu startbar (`POST /tasks/:id/retry`) */
+export const RESTARTABLE: TaskStatus[] = ['failed', 'cancelled', 'needs-input', 'done', 'review'];
+/** @deprecated Bitte `RESTARTABLE` verwenden (gleiche Liste) */
+export const RETRYABLE: TaskStatus[] = RESTARTABLE;
 /** Antwort setzt diese Zustände fort (Sitzung wird fortgesetzt) */
 export const REPLY_RESTARTS: TaskStatus[] = [
 	'failed',

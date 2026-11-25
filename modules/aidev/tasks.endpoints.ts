@@ -1,5 +1,5 @@
 /**
- * Aufträge: Liste je Projekt, Anlegen, Detail, Ändern, Einplanen, Abbrechen, Wiederholen, Antworten, Löschen,
+ * Aufträge: Liste je Projekt, Anlegen, Detail, Ändern, Einplanen, Abbrechen, Neu starten, Antworten, Löschen,
  * Diff (über einen Runner) und Lauf-Ereignisse. Eigene Aufträge mit `task.create`, fremde mit `task.manage`.
  */
 import { sql } from 'drizzle-orm';
@@ -30,7 +30,7 @@ import {
 	REPLY_RESTARTS,
 	requireTask,
 	restartTask,
-	RETRYABLE,
+	RESTARTABLE,
 	transition,
 	updateTask
 } from './tasks.service';
@@ -38,6 +38,7 @@ import {
 	idParams,
 	PERM,
 	replyInput,
+	restartInput,
 	runEventsQuery,
 	taskInput,
 	taskPatch,
@@ -170,20 +171,30 @@ export const taskEndpoints: AnyApiEndpoint[] = [
 	defineEndpoint({
 		method: 'POST',
 		path: '/tasks/:id/retry',
-		summary: 'Auftrag wiederholen',
-		description: 'Nur fehlgeschlagene, abgebrochene oder auf Rückmeldung wartende Aufträge.',
+		summary: 'Auftrag neu starten',
+		description:
+			'Beendete, fehlgeschlagene, abgebrochene oder auf Rückmeldung wartende Aufträge (Versuche = 0). Body optional: `subtasks` = `failed` (Standard, nur fehlgeschlagene/abgebrochene Teilaufträge) oder `all` (alle Teilaufträge, Plan wird erneut ausgeliefert). Teilaufträge eines gescheiterten Elternauftrags öffnen diesen wieder.',
 		tags,
 		permission: PERM.projectView,
 		params: idParams,
-		handler: async ({ ctx, params }): Promise<TaskDto> => {
+		body: restartInput,
+		handler: async ({ ctx, params, body }): Promise<TaskDto> => {
 			const fx = newEffects();
+			const subtasks = body?.subtasks ?? 'failed';
 			const dto = await mdb().transaction(async (tx) => {
 				const task = await requireTask(tx, params.id, true);
 				assertCanEditTask(ctx, task);
-				if (!RETRYABLE.includes(String(task.status) as TaskStatus)) {
-					throw errors.conflict('Nur fehlgeschlagene, abgebrochene oder offene Rückfragen');
+				if (!RESTARTABLE.includes(String(task.status) as TaskStatus)) {
+					throw errors.conflict(
+						'Nur beendete, fehlgeschlagene, abgebrochene oder auf Rückmeldung wartende Aufträge lassen sich neu starten'
+					);
 				}
-				await restartTask(tx, fx, task);
+				const reset = await restartTask(tx, fx, task, { subtasks, reopenParents: true });
+				fx.audits.push({
+					action: 'aidev.task.restarted',
+					target: params.id,
+					metadata: { projectId: String(task.project_id), subtasks, reset }
+				});
 				return (await loadTaskDto(tx, params.id))!;
 			});
 			await publish(ctx, fx);
