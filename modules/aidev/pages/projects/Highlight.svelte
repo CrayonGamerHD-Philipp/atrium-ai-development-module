@@ -8,5 +8,5 @@
 </script>
 
 {#each parts as part, i (i)}{#if part.hit}<mark
-			class="rounded-sm bg-warning/25 px-px text-foreground dark:bg-warning/30">{part.text}</mark
+			class="rounded-sm bg-warning/25 text-foreground dark:bg-warning/30">{part.text}</mark
 		>{:else}{part.text}{/if}{/each}
