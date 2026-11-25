@@ -24,6 +24,7 @@
 
 <script lang="ts">
 	// Gemeinsame Felder für „Projekt anlegen“ und die Projekteinstellungen
+	import type { Snippet } from 'svelte';
 	import { FormField, NumberStepper } from '$lib/components/layout';
 	import { Input } from '$lib/components/ui/input';
 	import { SelectField } from '$lib/components/ui/select-field';
@@ -37,7 +38,9 @@
 		showRepo = true,
 		runners = null,
 		disabled = false,
-		idPrefix = 'project'
+		idPrefix = 'project',
+		branches = [],
+		repoStatus
 	}: {
 		values: ProjectFormValues;
 		errors?: Partial<Record<keyof ProjectFormValues, string>>;
@@ -46,6 +49,10 @@
 		runners?: { id: string; name: string }[] | null;
 		disabled?: boolean;
 		idPrefix?: string;
+		/** Vorschläge für den Haupt-Branch (Autovervollständigung, freie Eingabe bleibt möglich) */
+		branches?: string[];
+		/** Status unter dem Repo-Feld (z. B. Ergebnis der Repo-Prüfung) */
+		repoStatus?: Snippet;
 	} = $props();
 
 	const id = (k: string) => `${idPrefix}-${k}`;
@@ -57,28 +64,33 @@
 		<Input id={id('name')} bind:value={values.name} maxlength={120} {disabled} autocomplete="off" />
 	</FormField>
 	{#if showRepo}
-		<FormField
-			label="GitHub-Repository"
-			id={id('repo')}
-			required
-			hint="Link (https://github.com/owner/repo) oder owner/repo"
-			error={errors.repo}
-		>
-			<Input
+		<div class="min-w-0 space-y-1.5">
+			<FormField
+				label="GitHub-Repository"
 				id={id('repo')}
-				bind:value={values.repo}
-				placeholder="owner/repo"
-				maxlength={300}
-				{disabled}
-				autocomplete="off"
-				spellcheck={false}
-			/>
-		</FormField>
+				required
+				hint="Link (https://github.com/owner/repo) oder owner/repo"
+				error={errors.repo}
+			>
+				<Input
+					id={id('repo')}
+					bind:value={values.repo}
+					placeholder="owner/repo"
+					maxlength={300}
+					{disabled}
+					autocomplete="off"
+					spellcheck={false}
+				/>
+			</FormField>
+			{@render repoStatus?.()}
+		</div>
 	{/if}
 	<FormField
 		label="Haupt-Branch"
 		id={id('branch')}
-		hint="Basis für neue Arbeits-Branches"
+		hint={branches.length
+			? `Basis für neue Arbeits-Branches – ${branches.length === 1 ? '1 Branch' : `${branches.length} Branches`} zur Auswahl`
+			: 'Basis für neue Arbeits-Branches'}
 		error={errors.defaultBranch}
 	>
 		<Input
@@ -87,8 +99,18 @@
 			placeholder="main"
 			maxlength={200}
 			{disabled}
+			autocomplete="off"
 			spellcheck={false}
+			list={branches.length ? id('branch-list') : undefined}
 		/>
+		{#if branches.length}
+			<!-- Native Vorschlagsliste: freie Eingabe bleibt möglich -->
+			<datalist id={id('branch-list')}>
+				{#each branches as b (b)}
+					<option value={b}></option>
+				{/each}
+			</datalist>
+		{/if}
 	</FormField>
 	<FormField
 		label="Max. gleichzeitige Läufe"

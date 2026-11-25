@@ -138,6 +138,7 @@
 					bind:values
 					{errors}
 					showRepo={false}
+					branches={check?.branches ?? []}
 					runners={canRunners ? runners : null}
 					disabled={!canManage || busy}
 					idPrefix="project-settings"
