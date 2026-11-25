@@ -415,7 +415,11 @@
 						<ProviderBadge provider={task.providerHint} />
 						<span class="text-xs text-muted-foreground">erzwungen</span>
 					{/if}
-					{#if task.branchPushed}
+					{#if task.targetPr}
+						{#if task.branchPushed && (task.status === 'done' || task.status === 'review')}
+							<p class="text-sm">PR #{task.targetPr} aktualisiert</p>
+						{/if}
+					{:else if task.branchPushed}
 						<p class="text-sm">Branch bereitgestellt (ohne Pull Request)</p>
 					{:else if task.delivery === 'branch' && task.status === 'done'}
 						<p class="text-sm">Kein Branch bereitgestellt.</p>
@@ -425,7 +429,24 @@
 							<GitBranch class="size-3.5" aria-hidden="true" />{task.branch}
 						</span>
 					{/if}
-					{#if task.prUrl}
+					{#if task.targetPr}
+						{#if task.prUrl}
+							<a
+								href={task.prUrl}
+								target="_blank"
+								rel="noopener noreferrer"
+								class="inline-flex items-center gap-1 text-xs text-link hover:underline"
+								title="Dieser Auftrag aktualisiert einen bestehenden Pull Request"
+							>
+								<GitPullRequest class="size-3.5" aria-hidden="true" />PR #{task.targetPr} bearbeiten
+								<ExternalLink class="size-3" aria-hidden="true" />
+							</a>
+						{:else}
+							<Badge variant="info">
+								<GitPullRequest aria-hidden="true" />PR #{task.targetPr} bearbeiten
+							</Badge>
+						{/if}
+					{:else if task.prUrl}
 						<a
 							href={task.prUrl}
 							target="_blank"
