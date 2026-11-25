@@ -25,6 +25,7 @@ import m0003 from './migrations/0003_chat_question.sql?raw';
 import m0004 from './migrations/0004_task_target_pr.sql?raw';
 import m0005 from './migrations/0005_account_limits.sql?raw';
 import m0006 from './migrations/0006_runner_reported_slots.sql?raw';
+import m0007 from './migrations/0007_branch_cleanup.sql?raw';
 
 export default defineModule({
 	package: pkg,
@@ -107,7 +108,8 @@ export default defineModule({
 		{ name: '0003_chat_question', sql: m0003 },
 		{ name: '0004_task_target_pr', sql: m0004 },
 		{ name: '0005_account_limits', sql: m0005 },
-		{ name: '0006_runner_reported_slots', sql: m0006 }
+		{ name: '0006_runner_reported_slots', sql: m0006 },
+		{ name: '0007_branch_cleanup', sql: m0007 }
 	],
 	jobs: aidevJobs,
 	onUserDeleted,
