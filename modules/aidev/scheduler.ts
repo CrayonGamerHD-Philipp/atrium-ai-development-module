@@ -53,6 +53,10 @@ export interface TaskCandidate {
 	/** Sitzung fortsetzen: gleiches Konto bevorzugen, wenn verfügbar */
 	sessionAccountId: string | null;
 	estimatedUnits: number;
+	/** Elternauftrag und aktive Geschwisterläufe je Anbieter bzw. Konto */
+	groupId?: string | null;
+	groupProviders?: Partial<Record<Provider, number>>;
+	groupAccounts?: Record<string, number>;
 }
 
 export interface ProjectState {
@@ -92,6 +96,9 @@ export const HINT_DEFAULT_WEIGHT = 5;
 export const SESSION_BONUS = 0.25;
 /** Bonus für den bevorzugten Runner des Projekts */
 export const PREFERRED_RUNNER_BONUS = 0.1;
+/** Abzug je aktivem Geschwisterlauf beim gleichen Anbieter bzw. Konto (höchstens drei Läufe) */
+export const DIVERSITY_PROVIDER_PENALTY = 0.15;
+export const DIVERSITY_ACCOUNT_PENALTY = 0.1;
 
 /** Endliche Zahl oder 0 (NaN/±∞ → 0) */
 function num(n: number): number {
@@ -141,7 +148,8 @@ function routingEntry(routing: Routing, role: Role, provider: Provider) {
 
 /**
  * Punktzahl eines Kontos für einen Auftrag; `null` = nicht geeignet.
- * weight_role(provider) · (1 − max(u5h, uWeek)) + 0.5 · pace − 0.3 · running/maxConcurrency (+ Boni)
+ * weight_role(provider) · (1 − max(u5h, uWeek)) + 0.5 · pace − 0.3 · running/maxConcurrency
+ * + Boni − Abzüge für Geschwisterläufe beim Anbieter und Konto (ohne providerHint, je höchstens drei).
  */
 export function scoreAccount(
 	task: TaskCandidate,
@@ -182,6 +190,11 @@ export function scoreAccount(
 	if (preferredRunnerId != null && account.runnerId === preferredRunnerId) {
 		score += PREFERRED_RUNNER_BONUS;
 	}
+	if (!task.providerHint) {
+		score -=
+			DIVERSITY_PROVIDER_PENALTY * clamp(num(task.groupProviders?.[account.provider] ?? 0), 0, 3);
+		score -= DIVERSITY_ACCOUNT_PENALTY * clamp(num(task.groupAccounts?.[account.id] ?? 0), 0, 3);
+	}
 
 	const model = entry?.model || account.defaultModel || null;
 	return { score, model };
@@ -203,8 +216,17 @@ export function planAssignments(input: PlanInput): Assignment[] {
 	const tasks = [...input.tasks].sort(compareTasks);
 	const assigned = new Set<string>();
 	const result: Assignment[] = [];
+	const groups = new Map<
+		string,
+		{ providers: Partial<Record<Provider, number>>; accounts: Record<string, number> }
+	>();
 
 	for (const task of tasks) {
+		let group = task.groupId != null ? groups.get(task.groupId) : undefined;
+		if (task.groupId != null && !group) {
+			group = { providers: { ...task.groupProviders }, accounts: { ...task.groupAccounts } };
+			groups.set(task.groupId, group);
+		}
 		if (assigned.has(task.id)) continue; // doppelte Einträge nur einmal zuteilen
 		const project = projects.get(task.projectId);
 		if (project && project.running >= project.maxParallel) continue;
@@ -212,7 +234,18 @@ export function planAssignments(input: PlanInput): Assignment[] {
 		let best: { account: AccountState; score: number; model: string | null; load: number } | null =
 			null;
 		for (const account of accounts) {
-			const s = scoreAccount(task, account, routing, now, project?.preferredRunnerId ?? null);
+			const scoringTask = {
+				...task,
+				groupProviders: group?.providers,
+				groupAccounts: group?.accounts
+			};
+			const s = scoreAccount(
+				scoringTask,
+				account,
+				routing,
+				now,
+				project?.preferredRunnerId ?? null
+			);
 			if (!s) continue;
 			const { u5h, uWeek } = utilization(account);
 			const load = Math.max(u5h, uWeek);
@@ -237,6 +270,10 @@ export function planAssignments(input: PlanInput): Assignment[] {
 			score: best.score
 		});
 		assigned.add(task.id);
+		if (group) {
+			group.providers[chosen.provider] = num(group.providers[chosen.provider] ?? 0) + 1;
+			group.accounts[chosen.id] = num(group.accounts[chosen.id] ?? 0) + 1;
+		}
 
 		// Vorbuchen: Konto, Runner-Slots (alle Konten des Runners) und Verbrauchsschätzung
 		const units = Math.max(0, num(task.estimatedUnits));

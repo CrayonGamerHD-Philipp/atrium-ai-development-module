@@ -160,6 +160,15 @@ describe('accountAvailable', () => {
 });
 
 describe('scoreAccount', () => {
+	it('begrenzt die Abzüge für Geschwister und ignoriert sie bei providerHint', () => {
+		const grouped = task({ groupProviders: { claude: 20 }, groupAccounts: { 'acc-a': 20 } });
+		expect(scoreAccount(grouped, account(), ROUTING, NOW)!.score).toBeCloseTo(
+			0.9 - 3 * 0.15 - 3 * 0.1
+		);
+		expect(
+			scoreAccount({ ...grouped, providerHint: 'claude' }, account(), ROUTING, NOW)!.score
+		).toBeCloseTo(0.9);
+	});
 	it('Grundformel ohne Budget', () => {
 		const s = scoreAccount(task(), account(), ROUTING, NOW);
 		expect(s).not.toBeNull();
@@ -239,6 +248,54 @@ describe('scoreAccount', () => {
 });
 
 describe('planAssignments', () => {
+	it('verteilt Geschwister auf Anbieter und verändert Gruppenstände nicht', () => {
+		const routing: Routing = {
+			...ROUTING,
+			implement: [
+				{ provider: 'claude', weight: 9 },
+				{ provider: 'codex', weight: 9 }
+			]
+		};
+		const input = plan({
+			routing,
+			accounts: [
+				account({ id: 'a', maxConcurrency: 10 }),
+				account({ id: 'b', runnerId: 'r2', provider: 'codex', maxConcurrency: 10 })
+			],
+			tasks: [
+				task({ id: 't1', groupId: 'g', groupProviders: {}, groupAccounts: {} }),
+				task({ id: 't2', groupId: 'g' })
+			]
+		});
+		const snapshot = structuredClone(input);
+		expect(planAssignments(input).map((a) => a.provider)).toEqual(['claude', 'codex']);
+		expect(input).toEqual(snapshot);
+	});
+	it('berücksichtigt bestehende Geschwister nur bei einer Gruppe', () => {
+		const accounts = [
+			account({ id: 'a' }),
+			account({ id: 'b', runnerId: 'r2', provider: 'codex' })
+		];
+		const counts = { groupProviders: { claude: 2 } };
+		expect(
+			planAssignments(plan({ accounts, tasks: [task({ ...counts, groupId: 'g' })] }))[0]!.provider
+		).toBe('codex');
+		expect(planAssignments(plan({ accounts, tasks: [task(counts)] }))[0]!.provider).toBe('claude');
+	});
+	it('ein großer Routing-Unterschied bleibt trotz Geschwisterläufen ausschlaggebend', () => {
+		const accounts = [
+			account({ id: 'a' }),
+			account({ id: 'b', runnerId: 'r2', provider: 'codex' })
+		];
+		expect(
+			planAssignments(
+				plan({
+					accounts,
+					tasks: [task({ role: 'research', groupId: 'g', groupProviders: { codex: 3 } })]
+				})
+			)[0]!.provider
+		).toBe('codex');
+	});
 	it('verteilt mehrere Aufgaben über Vorbuchung auf verschiedene Konten', () => {
 		const a = account({ id: 'acc-a', runnerId: 'r1', budget5h: 1000, budgetWeek: 10000 });
 		const b = account({ id: 'acc-b', runnerId: 'r2', budget5h: 1000, budgetWeek: 10000 });
