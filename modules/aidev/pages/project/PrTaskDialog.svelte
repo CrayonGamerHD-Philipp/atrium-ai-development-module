@@ -48,7 +48,7 @@
 		() => projectId,
 		(m) => toast.error(m)
 	);
-	onDestroy(() => attachments.clear());
+	onDestroy(() => attachments.discard());
 
 	$effect(() => {
 		if (open) {
@@ -58,7 +58,7 @@
 			errors = {};
 			error = '';
 			// ohne Abhängigkeit auf die Anhänge, sonst würde jeder neue Anhang sofort wieder entfernt
-			untrack(() => attachments.clear());
+			untrack(() => attachments.discard());
 		}
 	});
 

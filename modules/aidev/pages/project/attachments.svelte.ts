@@ -1,9 +1,11 @@
 /**
  * Anhänge eines Entwurfs (Chat-Nachricht oder Auftrag): Dateien hinzufügen (Auswahl, Strg+V, Drag & Drop), sofort
  * einzeln hochladen (`POST /projects/:id/attachments`, Multipart-Feld `file`), Fortschritt und Fehler je Datei,
- * Entfernen, Bildvorschau per Objekt-URL. Beim Absenden `ids` mitsenden und danach `clear()` aufrufen.
+ * Entfernen (auch serverseitig), Bildvorschau per Objekt-URL. Beim Absenden `ids` mitsenden und danach `clear()`
+ * aufrufen; ohne Absenden `discard()` (löscht die noch unverknüpften Uploads).
  */
 import { ApiClientError } from '$lib/sdk/client';
+import { deleteAttachment } from '../api';
 import type { AttachmentDto } from '../../schemas';
 import {
 	attachmentUploadUrl,
@@ -104,15 +106,26 @@ export class AttachmentDraft {
 	readonly count = $derived(this.items.length);
 
 	#aborts = new Map<string, () => void>();
+	/** Entfernte Einträge, deren Upload noch läuft: kommt die Antwort doch noch, wird der Upload gelöscht */
+	#discarded = new Set<string>();
 	#depth = 0;
 
 	#projectId: () => string;
 	#onreject?: (message: string) => void;
+	#deleteUpload: (id: string) => Promise<unknown>;
 
-	/** `projectId` als Getter (Projektwechsel), `onreject` meldet abgelehnte Dateien (z. B. per Toast) */
-	constructor(projectId: () => string, onreject?: (message: string) => void) {
+	/**
+	 * `projectId` als Getter (Projektwechsel), `onreject` meldet abgelehnte Dateien (z. B. per Toast),
+	 * `deleteUpload` löscht einen fertigen, noch unverknüpften Upload auf dem Server (Standard: `DELETE`-Endpunkt).
+	 */
+	constructor(
+		projectId: () => string,
+		onreject?: (message: string) => void,
+		deleteUpload: (id: string) => Promise<unknown> = deleteAttachment
+	) {
 		this.#projectId = projectId;
 		this.#onreject = onreject;
+		this.#deleteUpload = deleteUpload;
 	}
 
 	/** Dateien hinzufügen (Grenzen prüfen, Namen vergeben, Upload starten); `pasted` = aus der Zwischenablage */
@@ -152,8 +165,13 @@ export class AttachmentDraft {
 		);
 		this.#aborts.set(key, abort);
 		promise.then(
-			(attachment) => this.#update(key, { status: 'done', progress: 1, attachment }),
+			(attachment) => {
+				// schon entfernt bzw. verworfen, die Antwort kam trotzdem → Upload serverseitig löschen
+				if (this.#discarded.delete(key)) return this.#drop(attachment.id);
+				this.#update(key, { status: 'done', progress: 1, attachment });
+			},
 			(err: unknown) => {
+				this.#discarded.delete(key);
 				if (err instanceof ApiClientError && err.code === 'aborted') return;
 				this.#update(key, {
 					status: 'error',
@@ -169,21 +187,53 @@ export class AttachmentDraft {
 		if (item) Object.assign(item, patch);
 	}
 
-	/** Anhang entfernen (laufenden Upload abbrechen, Vorschau freigeben) */
+	/** Upload serverseitig löschen; Fehler (z. B. 409 schon verwendet) übernimmt notfalls der Aufräumjob */
+	#drop(id: string) {
+		this.#deleteUpload(id).catch(() => {});
+	}
+
+	/**
+	 * Eintrag verwerfen: fertige Uploads auf dem Server löschen (zählen sonst bis zum Aufräumen gegen das Kontingent
+	 * offener Uploads). Ist der Body schon vollständig gesendet, wird nicht abgebrochen, sondern die Antwort
+	 * abgewartet und der Upload danach gelöscht – sonst wäre er gespeichert, ohne dass die ID bekannt ist.
+	 */
+	#discard(item: DraftAttachment) {
+		if (item.status === 'done' && item.attachment) {
+			this.#drop(item.attachment.id);
+		} else if (item.status === 'uploading') {
+			this.#discarded.add(item.key);
+			if (item.progress < 1) this.#aborts.get(item.key)?.();
+		}
+		this.#aborts.delete(item.key);
+		if (item.preview) URL.revokeObjectURL(item.preview);
+	}
+
+	/** Anhang entfernen (laufenden Upload abbrechen, fertigen Upload löschen, Vorschau freigeben) */
 	remove(key: string) {
 		const item = this.items.find((i) => i.key === key);
 		if (!item) return;
-		this.#aborts.get(key)?.();
-		this.#aborts.delete(key);
-		if (item.preview) URL.revokeObjectURL(item.preview);
+		this.#discard(item);
 		this.items = this.items.filter((i) => i.key !== key);
 	}
 
-	/** Alles zurücksetzen (nach dem Absenden bzw. beim Verlassen) */
+	/** Entwurf verwerfen (Dialog geschlossen, Seite verlassen): wie `remove` für alle Einträge */
+	discard() {
+		for (const i of this.items) this.#discard(i);
+		this.#reset();
+	}
+
+	/** Nach dem Absenden zurücksetzen – die Uploads sind jetzt verknüpft und bleiben erhalten */
 	clear() {
-		for (const abort of this.#aborts.values()) abort();
+		for (const i of this.items) {
+			// noch laufende Uploads wurden nicht mitgesendet → verwerfen
+			if (i.status === 'uploading') this.#discard(i);
+			else if (i.preview) URL.revokeObjectURL(i.preview);
+		}
 		this.#aborts.clear();
-		for (const i of this.items) if (i.preview) URL.revokeObjectURL(i.preview);
+		this.#reset();
+	}
+
+	#reset() {
 		this.items = [];
 		this.notice = '';
 		this.dragging = false;

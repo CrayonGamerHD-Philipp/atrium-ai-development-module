@@ -130,6 +130,9 @@ export const retryTask = (id: string, opts?: RetryTaskOptions) =>
 export const replyTask = (id: string, message: string) =>
 	apiFetch<TaskDto>(`${API}/tasks/${id}/reply`, { method: 'POST', body: json({ message }) });
 export const deleteTask = (id: string) => apiFetch<Ok>(`${API}/tasks/${id}`, { method: 'DELETE' });
+/** Eigenen, noch nicht verwendeten Upload löschen (verknüpft → 409, fremd/unbekannt → 404) */
+export const deleteAttachment = (id: string) =>
+	apiFetch<Ok>(`${API}/attachments/${encodeURIComponent(id)}`, { method: 'DELETE' });
 export const getTaskDiff = (id: string) => apiFetch<DiffDto>(`${API}/tasks/${id}/diff`);
 export const getRunEvents = (runId: string, afterSeq = -1, limit = 2000) =>
 	apiFetch<RunEventDto[]>(`${API}/runs/${runId}/events${qs({ afterSeq, limit })}`);

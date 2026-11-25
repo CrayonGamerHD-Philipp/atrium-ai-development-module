@@ -70,7 +70,7 @@
 		() => store.id,
 		(m) => toast.error(m)
 	);
-	onDestroy(() => attachments.clear());
+	onDestroy(() => attachments.discard());
 
 	/** ab sm: eigener Optionen-Knopf (darunter steckt er im Modus-Menü) */
 	const sm = new MediaQuery('(min-width: 640px)', true);
