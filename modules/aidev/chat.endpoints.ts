@@ -68,6 +68,7 @@ export const chatEndpoints: AnyApiEndpoint[] = [
 						project,
 						taskInput.parse({
 							prompt: body.body,
+							delivery: body.delivery,
 							role: body.role,
 							decompose: body.decompose,
 							providerHint: body.providerHint

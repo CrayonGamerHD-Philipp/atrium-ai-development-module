@@ -80,3 +80,15 @@ anschließend unter **Runner & Konten** frei.
   (`aidev.workspace.terminal`, `aidev.workspace.files`). Jede Sitzung wird protokolliert.
 - Externe Empfänger sind GitHub und die KI-Anbieter (Anthropic, OpenAI, Google bzw. die eingestellte API). Sie werden
   ausschließlich vom Runner aus angesprochen.
+
+### Auslieferung pro Auftrag
+
+Bei neuen Aufträgen im Board oder Chat bestimmt „Auslieferung“ das Ergebnis: „Projektvorgabe“
+verwendet weiterhin die aktuelle Commit-Policy des Projekts. „Branch bereitstellen (ohne PR)“
+pusht getestete Änderungen auf einen eigenen Remote-Branch, erstellt keinen Pull Request und
+ändert den Hauptbranch nicht. Bei aufgeteilten Aufträgen werden die Teilaufträge zunächst auf
+dem Integrations-Branch zusammengeführt; die Wahl gilt für die abschließende Auslieferung.
+Leseaufträge liefern keine Änderungen aus. Die Auftragsansicht zeigt, ob ein Branch tatsächlich
+bereitgestellt wurde; ohne Änderungen wird kein Branch gepusht. API-Aufrufe können optional
+`delivery: "branch"` setzen; ohne Angabe gilt `delivery: "project"`, auch für bestehende Aufträge.
+Runner müssen für die neue Option aktualisiert werden.

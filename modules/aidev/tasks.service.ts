@@ -156,6 +156,9 @@ function agentText(task: Row, status: TaskStatus): string {
 			parts.push(`Auftrag ${title}: ${status}`);
 	}
 	if (prLine) parts.push(prLine);
+	if (status === 'done' && task.branch_pushed === true && task.branch) {
+		parts.push(`Branch bereitgestellt: ${String(task.branch)} (ohne Pull Request).`);
+	}
 	if (summary && (status === 'done' || status === 'review')) parts.push(clip(summary, 4000));
 	return parts.join('\n\n');
 }
@@ -307,10 +310,10 @@ export async function createTask(
 	const role: Role = input.decompose ? 'orchestrate' : input.role;
 	await tx.execute(
 		sql`INSERT INTO task (id, project_id, title, prompt, role, status, priority, max_attempts,
-				provider_hint, created_by)
+				provider_hint, created_by, delivery)
 			VALUES (${id}, ${project.id}, ${title}, ${input.prompt}, ${role},
 				${input.draft ? 'draft' : 'queued'}, ${input.priority}, ${input.maxAttempts},
-				${input.providerHint}, ${ctx.userId})`
+				${input.providerHint}, ${ctx.userId}, ${input.delivery})`
 	);
 	for (const dep of deps) {
 		await tx.execute(sql`INSERT INTO task_dep (task_id, depends_on_id) VALUES (${id}, ${dep})`);

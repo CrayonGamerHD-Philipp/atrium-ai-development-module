@@ -67,7 +67,7 @@
 	} from './format';
 	import { has, PERM } from './perms';
 	import { ProjectStore } from './project/store.svelte';
-	import AgentText from './task/AgentText.svelte';
+	import Markdown from './components/Markdown.svelte';
 	import DiffView from './task/DiffView.svelte';
 	import RunLog from './task/RunLog.svelte';
 	import TaskEditDialog from './task/TaskEditDialog.svelte';
@@ -415,6 +415,11 @@
 						<ProviderBadge provider={task.providerHint} />
 						<span class="text-xs text-muted-foreground">erzwungen</span>
 					{/if}
+					{#if task.branchPushed}
+						<p class="text-sm">Branch bereitgestellt (ohne Pull Request)</p>
+					{:else if task.delivery === 'branch' && task.status === 'done'}
+						<p class="text-sm">Kein Branch bereitgestellt.</p>
+					{/if}
 					{#if task.branch}
 						<span class="inline-flex items-center gap-1 font-mono text-xs text-muted-foreground">
 							<GitBranch class="size-3.5" aria-hidden="true" />{task.branch}
@@ -497,7 +502,7 @@
 				</Label>
 				{#if task.status === 'needs-input' && (task.resultSummary || selectedRun?.summary)}
 					<div class="rounded-md bg-background p-2">
-						<AgentText text={task.resultSummary || selectedRun?.summary || ''} />
+						<Markdown text={task.resultSummary || selectedRun?.summary || ''} />
 					</div>
 				{/if}
 				<Textarea
@@ -531,7 +536,7 @@
 				</span>
 			</summary>
 			<div class="border-t px-3 py-3">
-				<AgentText text={task.prompt} />
+				<Markdown text={task.prompt} />
 				{#if detail.dependencies.length}
 					<div class="mt-3 flex flex-wrap items-center gap-2 text-xs">
 						<span class="text-muted-foreground">Wartet auf:</span>
@@ -746,7 +751,7 @@
 					{#if task.resultSummary}
 						<div class="rounded-lg border bg-card p-4">
 							<h2 class="mb-2 text-sm font-medium">Zusammenfassung des Agents</h2>
-							<AgentText text={task.resultSummary} />
+							<Markdown text={task.resultSummary} />
 						</div>
 					{:else if !task.errorMessage}
 						<EmptyState
