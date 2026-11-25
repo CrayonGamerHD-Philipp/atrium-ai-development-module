@@ -86,7 +86,7 @@ export async function registerRunner(
 		runner = await oneOf(
 			tx,
 			sql`UPDATE runner SET name = ${input.name}, version = ${input.version},
-					capabilities = ${jsonb(input.capabilities)}, last_seen_at = now(),
+					capabilities = ${jsonb(input.capabilities)}, last_seen_at = now(), draining = false,
 					max_slots = ${slotsChanged ? input.maxSlots : Number(runner.max_slots)},
 					reported_max_slots = ${input.maxSlots}
 				WHERE id = ${runner.id} RETURNING *`
@@ -157,7 +157,7 @@ export async function heartbeat(
 	const runnerId = String(runner.id);
 	await tx.execute(
 		sql`UPDATE runner SET last_seen_at = now(), online = ${status !== 'disabled'},
-				slots_used = ${input.slotsUsed}
+				slots_used = ${input.slotsUsed}, draining = ${input.draining === true}
 			WHERE id = ${runnerId}`
 	);
 	for (const a of input.accounts) {

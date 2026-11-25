@@ -169,6 +169,7 @@ export function runnerDto(r: Row, accounts: AccountDto[]): RunnerDto {
 		lastSeenAt: toIsoOrNull(r.last_seen_at),
 		maxSlots: num(r.max_slots),
 		slotsUsed: num(r.slots_used),
+		draining: r.draining === true,
 		capabilities: jsonOf<RunnerDto['capabilities']>(r.capabilities, {}),
 		createdAt: toIso(r.created_at),
 		accounts

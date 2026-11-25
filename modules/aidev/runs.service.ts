@@ -134,7 +134,13 @@ export async function rejectRun(
 ) {
 	const run = await ownRun(tx, runnerId, runId);
 	if (run.status !== 'offered') return { ok: true };
-	if (run.account_id) await excludeAccount(tx, String(run.task_id), String(run.account_id));
+	// Ein Runner, der gerade beendet wird, lehnt alles ab – das Konto bleibt für den Auftrag zulässig
+	const draining = await oneOf(
+		tx,
+		sql`SELECT 1 FROM runner WHERE id = ${runnerId} AND draining LIMIT 1`
+	);
+	if (run.account_id && !draining)
+		await excludeAccount(tx, String(run.task_id), String(run.account_id));
 	await loseRun(tx, fx, run, `Vom Runner abgelehnt: ${reason || 'ohne Grund'}`, false);
 	return { ok: true };
 }

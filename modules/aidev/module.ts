@@ -27,6 +27,7 @@ import m0005 from './migrations/0005_account_limits.sql?raw';
 import m0006 from './migrations/0006_runner_reported_slots.sql?raw';
 import m0007 from './migrations/0007_branch_cleanup.sql?raw';
 import m0008 from './migrations/0008_branch_cleanup_safety.sql?raw';
+import m0009 from './migrations/0009_runner_draining.sql?raw';
 
 export default defineModule({
 	package: pkg,
@@ -111,7 +112,8 @@ export default defineModule({
 		{ name: '0005_account_limits', sql: m0005 },
 		{ name: '0006_runner_reported_slots', sql: m0006 },
 		{ name: '0007_branch_cleanup', sql: m0007 },
-		{ name: '0008_branch_cleanup_safety', sql: m0008 }
+		{ name: '0008_branch_cleanup_safety', sql: m0008 },
+		{ name: '0009_runner_draining', sql: m0009 }
 	],
 	jobs: aidevJobs,
 	onUserDeleted,

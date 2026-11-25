@@ -85,7 +85,8 @@ const register = (
 	who: string,
 	accounts: string[],
 	maxSlots = 4,
-	extraCapabilities: Record<string, boolean> = {}
+	extraCapabilities: Record<string, boolean> = {},
+	extra: Record<string, unknown> = {}
 ) =>
 	call<{ runnerId: string; status: string; heartbeatSec: number }>(
 		who,
@@ -112,7 +113,8 @@ const register = (
 				label: key,
 				loggedIn: true,
 				models: []
-			}))
+			})),
+			...extra
 		}
 	);
 
@@ -480,6 +482,76 @@ describe('aidev', () => {
 		const cancelled = ok<TaskDto>(await call('admin', 'POST', `/tasks/${t.id}/cancel`), 201);
 		expect(cancelled.status).toBe('cancelled');
 		expect((await task(t.id)).runs[0]!.status).toBe('cancelled');
+	});
+
+	it('Neustart: Anmeldung mit runIds gibt verwaiste Läufe sofort frei', async () => {
+		const t = await createTask({ prompt: 'Neustart-Test' });
+		const offer = await offerFor(t.id);
+		ok(await call('runner', 'POST', `/runner/runs/${offer.runId}/accept`), 201);
+		// andere laufende Läufe meldet der Runner weiter → sie bleiben
+		const others = (
+			await q<{ id: string }>(
+				sql`SELECT id FROM run WHERE runner_id = ${runnerId} AND status = 'running'
+					AND id <> ${offer.runId}`
+			)
+		).map((r) => String(r.id));
+		ok(await register('runner', ['fake-a', 'fake-b'], 4, {}, { runIds: others }), 201);
+		await whenDispatchIdle();
+		const detail = await task(t.id);
+		const lost = detail.runs.find((r) => r.id === offer.runId)!;
+		expect(lost).toMatchObject({ status: 'lost' });
+		expect(lost.errorMessage).toContain('neu gestartet');
+		expect(detail.task.status).toBe('queued');
+		if (others.length) {
+			const still = await q<{ status: string }>(
+				sql`SELECT DISTINCT status FROM run WHERE id IN (${sql.join(
+					others.map((id) => sql`${id}`),
+					sql`, `
+				)})`
+			);
+			expect(still.map((r) => r.status)).toEqual(['running']);
+		}
+		// ohne runIds (ältere Runner) bleibt es beim Lease-Ablauf
+		const again = await offerFor(t.id);
+		ok(await call('runner', 'POST', `/runner/runs/${again.runId}/accept`), 201);
+		ok(await register('runner', ['fake-a', 'fake-b'], 4), 201);
+		expect((await task(t.id)).runs.find((r) => r.id === again.runId)!.status).toBe('running');
+		ok<TaskDto>(await call('admin', 'POST', `/tasks/${t.id}/cancel`), 201);
+		ok(await finish(again.runId, { status: 'cancelled', errorKind: 'cancelled' }), 201);
+	});
+
+	it('Draining: keine neuen Angebote, Ablehnung schließt das Konto nicht aus', async () => {
+		const t = await createTask({ prompt: 'Draining-Test' });
+		const offer = await offerFor(t.id);
+		ok(
+			await call('runner', 'POST', '/runner/heartbeat', {
+				slotsUsed: 0,
+				runIds: [],
+				draining: true
+			}),
+			201
+		);
+		const runners = ok<RunnerDto[]>(await call('admin', 'GET', '/runners'));
+		expect(runners.find((r) => r.id === runnerId)!.draining).toBe(true);
+		ok(
+			await call('runner', 'POST', `/runner/runs/${offer.runId}/reject`, {
+				reason: 'Runner wird beendet'
+			}),
+			201
+		);
+		const [row] = await q<{ excluded_account_ids: string[] }>(
+			sql`SELECT excluded_account_ids FROM task WHERE id = ${t.id}`
+		);
+		expect(row!.excluded_account_ids).toEqual([]);
+		expect((await offers()).some((o) => o.taskId === t.id)).toBe(false);
+		// nächste Anmeldung (Neustart) hebt draining auf → Auftrag wird wieder angeboten
+		ok(await register('runner', ['fake-a', 'fake-b'], 4), 201);
+		expect(
+			ok<RunnerDto[]>(await call('admin', 'GET', '/runners')).find((r) => r.id === runnerId)!
+				.draining
+		).toBe(false);
+		expect((await offerFor(t.id)).taskId).toBe(t.id);
+		ok<TaskDto>(await call('admin', 'POST', `/tasks/${t.id}/cancel`), 201);
 	});
 
 	it('Limit → Wartezeit → zweites Konto übernimmt', async () => {

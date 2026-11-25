@@ -212,9 +212,18 @@
 						{r.name}
 					</span>
 				</Table.Cell>
-				<Table.Cell
-					><Badge variant={STATUS[r.status].tone}>{STATUS[r.status].label}</Badge></Table.Cell
-				>
+				<Table.Cell>
+					<span class="inline-flex flex-wrap gap-1">
+						<Badge variant={STATUS[r.status].tone}>{STATUS[r.status].label}</Badge>
+						{#if r.draining && r.online}
+							<Badge
+								variant="warning"
+								title="Der Runner wird beendet: laufende Läufe dürfen fertig werden, neue bekommt er nicht"
+								>Wird beendet</Badge
+							>
+						{/if}
+					</span>
+				</Table.Cell>
 				<Table.Cell class="text-xs text-muted-foreground">
 					{#if r.online}Jetzt{:else}<TimeAgo value={r.lastSeenAt} empty="nie" />{/if}
 				</Table.Cell>

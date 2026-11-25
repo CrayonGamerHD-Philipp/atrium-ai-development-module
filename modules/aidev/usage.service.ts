@@ -40,7 +40,7 @@ export async function loadAccountViews(
 	const rows = await rowsOf(
 		tx,
 		sql`SELECT a.*, rn.name AS runner_name, rn.online AS runner_online, rn.status AS runner_status,
-				rn.max_slots AS runner_max_slots,
+				rn.max_slots AS runner_max_slots, rn.draining AS runner_draining,
 				(SELECT count(*) FROM run r WHERE r.account_id = a.id AND r.status IN ('offered', 'running')) AS running,
 				(SELECT count(*) FROM run r WHERE r.runner_id = a.runner_id AND r.status IN ('offered', 'running')) AS runner_active,
 				(SELECT COALESCE(sum(u.units), 0) FROM usage_ledger u
@@ -88,7 +88,11 @@ export async function loadAccountViews(
 			enabled: r.enabled === true,
 			loggedIn: r.logged_in === true,
 			runnerOnline: r.runner_online === true && r.runner_status === 'approved',
-			runnerFreeSlots: Math.max(0, num(r.runner_max_slots) - num(r.runner_active)),
+			// Runner wird beendet (`draining`): keine neuen Läufe
+			runnerFreeSlots:
+				r.runner_draining === true
+					? 0
+					: Math.max(0, num(r.runner_max_slots) - num(r.runner_active)),
 			running: num(r.running),
 			maxConcurrency: num(r.max_concurrency),
 			cooldownUntil: ms(r.cooldown_until),

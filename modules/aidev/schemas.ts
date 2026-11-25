@@ -458,6 +458,8 @@ export interface RunnerDto {
 	lastSeenAt: string | null;
 	maxSlots: number;
 	slotsUsed: number;
+	/** Runner wird beendet und lässt laufende Läufe fertig werden (bekommt keine neuen) */
+	draining: boolean;
 	capabilities: {
 		question?: boolean;
 		branchDelivery?: boolean;
