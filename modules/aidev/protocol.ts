@@ -95,6 +95,8 @@ export const registerInput = z.object({
 		prUpdate: z.boolean().optional(),
 		/** Meldet den Limit-Stand der Konten im Heartbeat (`accounts[].limits`) */
 		limitReport: z.boolean().optional(),
+		/** Versteht RPC `git.branch-delete` (Atrium sendet ihn nur an solche Runner) */
+		branchCleanup: z.boolean().optional(),
 		git: z.boolean(),
 		gh: z.boolean(),
 		pty: z.boolean(),
@@ -216,6 +218,11 @@ export type RunOffer = z.infer<typeof runOfferSchema>;
 /** Plan eines Orchestrierungs-Laufs: Teilaufträge mit Abhängigkeiten (über `key`) */
 export const planSchema = z.object({
 	summary: shortText(4000).default(''),
+	/**
+	 * Slug-Vorschlag für den Integrations-Branch (2–5 Wörter Kebab-Case, z. B. `branch-namen-aufraeumen`).
+	 * Tolerant: ein ungültiger Wert wird verworfen, ohne den Plan ungültig zu machen.
+	 */
+	branch: z.string().max(80).optional().catch(undefined),
 	subtasks: z
 		.array(
 			z.object({
@@ -255,7 +262,8 @@ export const RPC_OPS = [
 	'git.log',
 	'gh.pr-list',
 	'gh.pr-merge',
-	'repo.check'
+	'repo.check',
+	'git.branch-delete'
 ] as const;
 export const rpcOpSchema = z.enum(RPC_OPS);
 export type RpcOp = z.infer<typeof rpcOpSchema>;
@@ -274,7 +282,8 @@ export const rpcCommandSchema = z.object({
 	op: rpcOpSchema,
 	project: rpcProjectSchema,
 	target: workspaceTargetSchema.default('main'),
-	/** Je `op`: `fs.*` → `{ path, content? }`, `git.diff` → `{ base?, head? }`, `gh.pr-merge` → `{ number, method }` */
+	/** Je `op`: `fs.*` → `{ path, content? }`, `git.diff` → `{ base?, head? }`, `gh.pr-merge` → `{ number, method }`,
+	 *  `git.branch-delete` → `{ branches: string[] }` (höchstens `MAX_BRANCH_DELETE`, Antwort `branchDeleteResult`) */
 	args: z.record(z.string(), z.unknown()).default({})
 });
 export type RpcCommand = z.infer<typeof rpcCommandSchema>;
@@ -493,6 +502,15 @@ export const repoCheckResult = z.object({
 	canPush: z.boolean(),
 	message: z.string()
 });
+
+/** Antwort auf `git.branch-delete`: gelöschte, nicht (mehr) vorhandene und fehlgeschlagene Branches */
+export const branchDeleteResult = z.object({
+	deleted: z.array(z.string()),
+	missing: z.array(z.string()),
+	failed: z.array(z.object({ branch: z.string(), error: z.string() }))
+});
+/** Höchstzahl an Branches je `git.branch-delete`-Aufruf */
+export const MAX_BRANCH_DELETE = 50;
 
 /** Höchstgröße einer Datei, die der Editor liest/schreibt (JSON-Body der Atrium-API ≤ 1 MB, Base64 +33 %) */
 export const MAX_FILE_BYTES = 600_000;
