@@ -7,13 +7,7 @@
 	import ExternalLink from '@lucide/svelte/icons/external-link';
 	import SquareTerminal from '@lucide/svelte/icons/square-terminal';
 	import type { ModulePageProps } from '$lib/sdk/types/module-ui';
-	import {
-		EmptyState,
-		ErrorState,
-		LoadingState,
-		PageHeader,
-		PageTitle
-	} from '$lib/components/layout';
+	import { EmptyState, ErrorState, LoadingState, PageTitle } from '$lib/components/layout';
 	import * as Alert from '$lib/components/ui/alert';
 	import { Button } from '$lib/components/ui/button';
 	import * as Tabs from '$lib/components/ui/tabs';
@@ -60,6 +54,9 @@
 		void goto(url, { replaceState: true, noScroll: true, keepFocus: true });
 	}
 
+	/** Reiter mobil nicht stauchen und mit 40-px-Touch-Ziel */
+	const TRIGGER = 'flex-none max-sm:min-h-10 max-sm:px-2.5';
+
 	const canWorkspace = $derived(has(PERM.files) || has(PERM.terminal));
 	const project = $derived(store?.project ?? null);
 	const counts = $derived.by(() => {
@@ -89,15 +86,30 @@
 	<ErrorState message={store.error} onretry={() => store?.load()} />
 {:else if project}
 	<PageTitle title={project.name} />
-	<PageHeader
-		title={project.name}
-		description={`${project.repoOwner}/${project.repoName} · ${project.defaultBranch} · ${POLICY_LABELS[project.commitPolicy]}`}
-	>
-		{#snippet actions()}
-			<LiveIndicator status={store!.live.status} />
+	<!-- Eigener Kopf (Aufbau wie PageHeader): lange Repo-/Branch-Namen brechen mobil um, statt die Seite zu verbreitern -->
+	<div class="mb-6 flex flex-wrap items-start justify-between gap-3">
+		<div class="min-w-0 flex-1 basis-64">
+			<h1 class="text-title wrap-break-word">{project.name}</h1>
+			<p class="mt-1 flex flex-wrap gap-x-1.5 text-sm text-muted-foreground">
+				<span class="font-mono wrap-anywhere">{project.repoOwner}/{project.repoName}</span>
+				<span aria-hidden="true">·</span>
+				<span class="font-mono wrap-anywhere">{project.defaultBranch}</span>
+				<span aria-hidden="true">·</span>
+				<span>{POLICY_LABELS[project.commitPolicy]}</span>
+			</p>
+		</div>
+		<div class="flex max-w-full min-w-0 flex-wrap items-center gap-2">
+			<LiveIndicator status={store.live.status} />
 			{#if canWorkspace}
-				<Button href={workspacePath(project.id)} variant="outline">
-					<SquareTerminal /> Workspace öffnen
+				<!-- Mobil nur Symbol (40 px), Text bleibt für Screenreader -->
+				<Button
+					href={workspacePath(project.id)}
+					variant="outline"
+					class="max-sm:size-10"
+					title="Workspace öffnen"
+				>
+					<SquareTerminal aria-hidden="true" />
+					<span class="max-sm:sr-only">Workspace öffnen</span>
 				</Button>
 			{/if}
 			<Button
@@ -105,12 +117,15 @@
 				target="_blank"
 				rel="noopener noreferrer"
 				variant="ghost"
+				class="max-sm:size-10"
 				aria-label="Repository auf GitHub öffnen"
+				title="Repository auf GitHub öffnen"
 			>
-				<ExternalLink /> GitHub
+				<ExternalLink aria-hidden="true" />
+				<span class="max-sm:sr-only">GitHub</span>
 			</Button>
-		{/snippet}
-	</PageHeader>
+		</div>
+	</div>
 
 	{#if store.revoked}
 		<Alert.Root variant="warning" class="mb-4">
@@ -130,28 +145,33 @@
 	{/if}
 
 	<Tabs.Root value={tab} onValueChange={setTab}>
-		<Tabs.List variant="line" aria-label="Bereiche des Projekts">
-			<Tabs.Trigger value="board">
-				Board
-				{#if counts.open}<span class="text-xs text-muted-foreground tabular-nums"
-						>{counts.open}</span
-					>{/if}
-				{#if counts.needsInput}
-					<span
-						class="size-1.5 rounded-full bg-warning"
-						title={`${counts.needsInput} Rückfragen`}
-						aria-label={`${counts.needsInput} Rückfragen`}
-					></span>
-				{/if}
-			</Tabs.Trigger>
-			<Tabs.Trigger value="chat">Chat</Tabs.Trigger>
-			<Tabs.Trigger value="pulls">
-				Pull Requests
-				{#if openPulls}<span class="text-xs text-muted-foreground tabular-nums">{openPulls}</span
-					>{/if}
-			</Tabs.Trigger>
-			<Tabs.Trigger value="settings">Einstellungen</Tabs.Trigger>
-		</Tabs.List>
+		<!-- Mobil seitlich scrollbar statt Umbruch; pb-1.5 hält die Aktiv-Linie (after:-bottom) sichtbar -->
+		<div
+			class="-mx-4 overflow-x-auto px-4 pb-1.5 [scrollbar-width:none] sm:mx-0 sm:px-0 [&::-webkit-scrollbar]:hidden"
+		>
+			<Tabs.List variant="line" aria-label="Bereiche des Projekts" class="flex-nowrap">
+				<Tabs.Trigger value="board" class={TRIGGER}>
+					Board
+					{#if counts.open}<span class="text-xs text-muted-foreground tabular-nums"
+							>{counts.open}</span
+						>{/if}
+					{#if counts.needsInput}
+						<span
+							class="size-1.5 rounded-full bg-warning"
+							title={`${counts.needsInput} Rückfragen`}
+							aria-label={`${counts.needsInput} Rückfragen`}
+						></span>
+					{/if}
+				</Tabs.Trigger>
+				<Tabs.Trigger value="chat" class={TRIGGER}>Chat</Tabs.Trigger>
+				<Tabs.Trigger value="pulls" class={TRIGGER}>
+					Pull Requests
+					{#if openPulls}<span class="text-xs text-muted-foreground tabular-nums">{openPulls}</span
+						>{/if}
+				</Tabs.Trigger>
+				<Tabs.Trigger value="settings" class={TRIGGER}>Einstellungen</Tabs.Trigger>
+			</Tabs.List>
+		</div>
 		<div class="pt-4">
 			{#key store}
 				{#if tab === 'board'}
