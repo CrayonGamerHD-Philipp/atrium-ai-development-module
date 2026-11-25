@@ -49,12 +49,23 @@ export async function requireProject(tx: Tx, id: string, forUpdate = false): Pro
 	return row;
 }
 
-export async function assertNoDuplicate(tx: Tx, owner: string, name: string, exceptId?: string) {
+/** Id eines nicht archivierten Projekts mit diesem Repo (Groß-/Kleinschreibung egal), sonst `null` */
+export async function findDuplicate(
+	tx: Tx,
+	owner: string,
+	name: string,
+	exceptId?: string
+): Promise<string | null> {
 	const dup = await oneOf(
 		tx,
 		sql`SELECT id FROM project WHERE lower(repo_owner) = lower(${owner})
 			AND lower(repo_name) = lower(${name}) AND archived_at IS NULL
-			${exceptId ? sql`AND id <> ${exceptId}` : sql``}`
+			${exceptId ? sql`AND id <> ${exceptId}` : sql``}
+			ORDER BY created_at LIMIT 1`
 	);
-	if (dup) throw errors.conflict('Für dieses Repo gibt es bereits ein Projekt');
+	return dup ? String(dup.id) : null;
+}
+
+export async function assertNoDuplicate(tx: Tx, owner: string, name: string, exceptId?: string) {
+	if (await findDuplicate(tx, owner, name, exceptId)) throw errors.conflict('Für dieses Repo gibt es bereits ein Projekt');
 }

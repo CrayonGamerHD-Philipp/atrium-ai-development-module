@@ -196,6 +196,9 @@ export const projectInput = z.object({
 	preferredRunnerId: z.string().uuid().nullable().default(null)
 });
 export type ProjectInput = z.infer<typeof projectInput>;
+/** `POST /projects/probe`: Repo vor dem Anlegen prüfen (Link oder `owner/repo`) */
+export const repoProbeInput = z.object({ repo: z.string().trim().min(1).max(300) });
+export type RepoProbeInput = z.infer<typeof repoProbeInput>;
 /** Ohne `.default()` (Zod 4 füllt Defaults auch in `.partial()` ein – ein PATCH würde sonst Felder zurücksetzen) */
 export const projectPatch = z
 	.object({
@@ -350,6 +353,22 @@ export interface ProjectDto {
 	updatedAt: string;
 	archivedAt: string | null;
 	counts: { queued: number; running: number; review: number; needsInput: number; done: number };
+}
+
+/**
+ * Ergebnis von `POST /projects/probe` (Repo vor dem Anlegen über einen Runner prüfen). `name` ist der
+ * Repo-Name als Namensvorschlag; `branches` ist leer, wenn das Repo nicht erreichbar ist oder der Runner
+ * (älter) keine Liste liefert. `existingProjectId`: nicht archiviertes Projekt mit demselben Repo.
+ */
+export interface RepoProbeDto {
+	owner: string;
+	name: string;
+	ok: boolean;
+	message: string;
+	defaultBranch: string | null;
+	branches: string[];
+	canPush: boolean;
+	existingProjectId: string | null;
 }
 
 export interface TaskDto {
@@ -620,7 +639,8 @@ export type TerminalLiveEvent =
  * | GET | /projects/:id | project.view | – | ProjectDto |
  * | PATCH | /projects/:id | project.manage | projectPatch | ProjectDto |
  * | DELETE | /projects/:id | project.manage | – | { ok } (archiviert) |
- * | POST | /projects/:id/check | project.manage | – | { ok, message, defaultBranch, canPush } (über Runner) |
+ * | POST | /projects/probe | project.manage | repoProbeInput | RepoProbeDto (über Runner) |
+ * | POST | /projects/:id/check | project.manage | – | { ok, message, defaultBranch, canPush, branches } (über Runner) |
  * | GET | /projects/:id/live | project.view | liveQuery | SSE ProjectLiveEvent |
  * | GET | /projects/:id/tasks | project.view | tasksQuery | TaskDto[] |
  * | POST | /projects/:id/tasks | task.create | taskInput | TaskDto |
