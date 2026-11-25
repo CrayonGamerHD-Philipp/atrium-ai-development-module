@@ -88,6 +88,54 @@ describe('buildSystemPrompt', () => {
 		);
 		expect(p).toContain('## Project rules\nKommentare auf Deutsch.');
 	});
+	it.each(['implement', 'fix', 'resolve'] as Role[])(
+		'%s mit pr-update: bestehender PR, Merge statt Rebase, kein neuer PR',
+		(role) => {
+			const p = buildSystemPrompt(
+				ctx({
+					role,
+					delivery: { mode: 'pr-update', number: 42 },
+					project: { ...ctx().project, defaultBranch: 'develop' }
+				})
+			);
+			expect(p).toContain('existing pull request #42');
+			expect(p).toContain('merge `origin/develop` into the branch');
+			expect(p).toMatch(/never rebase or force-push/);
+			expect(p).toMatch(/Do not open a new pull request/);
+			expect(p).toMatch(/PR comment/);
+		}
+	);
+	it('implement mit pr-update: Auslieferung beschreibt Update des PR', () => {
+		const p = buildSystemPrompt(ctx({ delivery: { mode: 'pr-update', number: 7 } }));
+		expect(p).toContain(
+			'push the task branch to update the existing pull request #7 (no new pull request)'
+		);
+	});
+	it.each(['research', 'review'] as Role[])(
+		'%s mit pr-update: keine PR-Bearbeitungszeilen',
+		(role) => {
+			const p = buildSystemPrompt(
+				ctx({ role, readOnly: true, delivery: { mode: 'pr-update', number: 42 } })
+			);
+			expect(p).not.toContain('#42');
+			expect(p).not.toMatch(/force-push/);
+		}
+	);
+	it('review mit pr-update: weiterhin Diff gegen Basis', () => {
+		const p = buildSystemPrompt(
+			ctx({ role: 'review', delivery: { mode: 'pr-update', number: 3 } })
+		);
+		expect(p).toContain('git diff origin/main...HEAD');
+	});
+	it('implement ohne pr-update: keine PR-Bearbeitungszeilen', () => {
+		expect(buildSystemPrompt(ctx())).not.toMatch(/existing pull request/);
+	});
+	it('orchestrate: Leitlinie zur Modellwahl und zu bestehenden PRs', () => {
+		const p = buildSystemPrompt(ctx({ role: 'orchestrate', readOnly: true, expectPlan: true }));
+		expect(p).toMatch(/Choose a provider only when it clearly fits the subtask/);
+		expect(p).toMatch(/scheduler balances load and limits/);
+		expect(p).toMatch(/existing pull request, all subtasks work on its branch/);
+	});
 	it('ohne expectPlan kein Plan-Format bei implement', () => {
 		expect(buildSystemPrompt(ctx())).not.toContain('```json');
 	});
