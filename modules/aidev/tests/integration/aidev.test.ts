@@ -2177,6 +2177,39 @@ describe('aidev', () => {
 		expect((await upload(new Uint8Array(0), 'leer.txt', 'text/plain')).status).toBe(422);
 		const big = new Uint8Array(ATTACHMENT_MAX_BYTES + 1);
 		expect((await upload(big, 'gross.bin', 'application/octet-stream')).status).toBe(413);
+		// ohne `content-length` (gestreamt): Abbruch nach dem Limit, der Rest wird nicht mehr gelesen
+		const chunk = new Uint8Array(256 * 1024);
+		let pulled = 0;
+		const endless = new ReadableStream<Uint8Array>({
+			start(c) {
+				c.enqueue(
+					text(
+						'--grenze\r\ncontent-disposition: form-data; name="file"; filename="gross.bin"\r\n' +
+							'content-type: application/octet-stream\r\n\r\n'
+					)
+				);
+			},
+			pull(c) {
+				pulled += chunk.byteLength;
+				c.enqueue(chunk);
+			}
+		});
+		const streamUrl = new URL(`http://localhost:5173/api/v1${M}/projects/${projectId}/attachments`);
+		const streamed = await handleApiRequest({
+			request: new Request(streamUrl, {
+				method: 'POST',
+				headers: {
+					authorization: `Bearer ${keys.admin}`,
+					'content-type': 'multipart/form-data; boundary=grenze'
+				},
+				body: endless,
+				duplex: 'half'
+			} as RequestInit),
+			url: streamUrl,
+			ip: '127.0.0.1'
+		});
+		expect(streamed.status).toBe(413);
+		expect(pulled).toBeLessThan(ATTACHMENT_MAX_BYTES + 2 * 1024 * 1024 + 4 * chunk.byteLength);
 		expect(
 			(await upload(PNG, 'a.png', 'image/png', 'admin', '00000000-0000-4000-8000-000000000000'))
 				.status

@@ -17,6 +17,7 @@ import {
 	deleteOwnAttachment,
 	getAttachment,
 	insertAttachment,
+	limitedUploadRequest,
 	RASTER_IMAGE_TYPES
 } from './attachments.service';
 import { mdb } from './db';
@@ -49,7 +50,9 @@ export const attachmentEndpoints: AnyApiEndpoint[] = [
 			// Projekt vor dem Einlesen prüfen (unbekannt → 404 ohne den Body zu lesen)
 			const project = await mdb().transaction((tx) => requireProject(tx, params.id));
 			if (project.archived_at) throw errors.conflict('Das Projekt ist archiviert');
-			const file = await readUpload(request, { maxBytes: ATTACHMENT_MAX_BYTES, sniff: false });
+			// Body gestreamt begrenzen – `readUpload` prüft nur einen angegebenen `content-length`
+			const limited = await limitedUploadRequest(request);
+			const file = await readUpload(limited, { maxBytes: ATTACHMENT_MAX_BYTES, sniff: false });
 			const mime = attachmentMime(file.contentType, file.bytes);
 			const row = await mdb().transaction(async (tx) => {
 				const current = await requireProject(tx, params.id, true);
