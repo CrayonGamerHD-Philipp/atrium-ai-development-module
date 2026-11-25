@@ -1,5 +1,5 @@
 <script lang="ts">
-	// Auftragsboard: Spalten nach Status, horizontal scrollbar (mobil), Schnellerfassung oben
+	// Auftragsboard: Spalten nach Status – mobil seitlich snap-scrollend, ab lg als Raster (3, ab 110rem 6 Spalten), Schnellerfassung oben
 	import Plus from '@lucide/svelte/icons/plus';
 	import { Label } from '$lib/components/ui/label';
 	import { Switch } from '$lib/components/ui/switch';
@@ -82,7 +82,7 @@
 	{/if}
 
 	{#if hasChildren}
-		<div class="flex items-center gap-2">
+		<div class="flex min-h-10 items-center gap-2">
 			<Switch id="board-children" bind:checked={showChildren} size="sm" />
 			<Label for="board-children" class="text-sm font-normal">Teilaufträge einzeln zeigen</Label>
 		</div>
@@ -100,7 +100,7 @@
 		</div>
 	{:else}
 		<div
-			class="-mx-4 flex snap-x snap-mandatory gap-3 overflow-x-auto px-4 pb-3 sm:mx-0 sm:px-0"
+			class="-mx-4 flex scroll-px-4 snap-x snap-mandatory gap-3 overflow-x-auto px-4 pb-3 sm:mx-0 sm:scroll-px-0 sm:px-0 lg:grid lg:snap-none lg:grid-cols-3 lg:items-start lg:overflow-visible lg:pb-0 min-[110rem]:grid-cols-6"
 			role="list"
 			aria-label="Auftragsboard"
 		>
@@ -108,14 +108,14 @@
 				{@const items = columnTasks(col.statuses)}
 				{@const finished = col.key === 'done' || col.key === 'failed'}
 				<section
-					class="flex w-[17.5rem] shrink-0 snap-start flex-col rounded-lg bg-muted/50 p-2"
+					class="flex w-[min(17.5rem,calc(100vw-4rem))] min-w-0 shrink-0 snap-start flex-col rounded-lg bg-muted/50 p-2 lg:w-auto"
 					role="listitem"
 					aria-labelledby={`col-${col.key}`}
 				>
-					<header class="mb-2 flex items-center justify-between px-1" title={col.hint}>
-						<h3 id={`col-${col.key}`} class="text-sm font-medium">{col.label}</h3>
+					<header class="mb-2 flex items-center justify-between gap-2 px-1" title={col.hint}>
+						<h3 id={`col-${col.key}`} class="truncate text-sm font-medium">{col.label}</h3>
 						<span
-							class="rounded-full bg-background px-2 text-xs text-muted-foreground tabular-nums"
+							class="shrink-0 rounded-full bg-background px-2 text-xs text-muted-foreground tabular-nums"
 						>
 							{items.length}
 						</span>

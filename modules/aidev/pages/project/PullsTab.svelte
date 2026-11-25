@@ -121,11 +121,11 @@
 	emptyDescription="Sobald ein Agent einen Auftrag abschließt, öffnet er hier einen Pull Request. „Synchronisieren“ holt den Stand von GitHub."
 >
 	{#snippet toolbar()}
-		<div class="flex w-full items-center justify-between gap-2">
+		<div class="flex w-full flex-wrap items-center justify-between gap-2">
 			<span class="text-sm text-muted-foreground">
 				{sorted.filter((p) => p.state === 'open').length} offen
 			</span>
-			<Button variant="outline" size="sm" onclick={sync} disabled={syncing}>
+			<Button variant="outline" size="sm" class="max-sm:h-10" onclick={sync} disabled={syncing}>
 				<RefreshCw class={syncing ? 'animate-spin' : ''} />
 				{syncing ? 'Synchronisiert …' : 'Synchronisieren'}
 			</Button>
@@ -145,10 +145,10 @@
 	{#each sorted as pr (pr.number)}
 		<Table.Row>
 			<Table.Cell class="font-mono text-xs text-muted-foreground">#{pr.number}</Table.Cell>
-			<Table.Cell class="max-w-md">
-				<div class="truncate font-medium">{pr.title}</div>
+			<Table.Cell class="max-w-md min-w-0 2xl:max-w-2xl">
+				<div class="truncate font-medium" title={pr.title}>{pr.title}</div>
 				<div class="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-					<span class="truncate font-mono">{pr.branch}</span>
+					<span class="max-w-full min-w-0 truncate font-mono" title={pr.branch}>{pr.branch}</span>
 					{#if pr.taskId}
 						<a href={taskPath(store.id, pr.taskId)} class="text-link hover:underline">Auftrag</a>
 					{/if}
@@ -175,10 +175,11 @@
 			<Table.Cell class="text-xs text-muted-foreground"><TimeAgo value={pr.updatedAt} /></Table.Cell
 			>
 			<Table.Cell class="text-right">
-				<div class="flex justify-end gap-1">
+				<div class="flex flex-wrap justify-end gap-1">
 					<Button
 						variant="ghost"
 						size="icon-sm"
+						class="max-sm:size-10"
 						href={pr.url}
 						target="_blank"
 						rel="noopener noreferrer"
@@ -189,6 +190,7 @@
 						<Button
 							variant="ghost"
 							size="icon-sm"
+							class="max-sm:size-10"
 							onclick={() => askAgent(pr)}
 							aria-label={`#${pr.number} mit Agent bearbeiten`}
 							title="Mit Agent bearbeiten"><Bot /></Button
@@ -201,6 +203,7 @@
 									<Button
 										{...props}
 										size="sm"
+										class="max-sm:h-10"
 										variant="outline"
 										disabled={merging === pr.number || pr.isDraft}
 									>
