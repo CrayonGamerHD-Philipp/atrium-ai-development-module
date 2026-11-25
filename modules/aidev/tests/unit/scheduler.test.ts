@@ -18,6 +18,7 @@ import {
 	type ProjectState,
 	type TaskCandidate
 } from '../../scheduler';
+import { rejectedUntil } from '../../limits';
 import type { Routing } from '../../schemas';
 
 const NOW = Date.UTC(2026, 10, 25, 12, 0, 0); // Mittwoch, 25.11.2026 12:00 UTC
@@ -501,5 +502,25 @@ describe('gemeldete Limits', () => {
 		expect(accountAvailable(account({ rejectedUntil: null }), NOW)).toBe(true);
 		const t = task();
 		expect(scoreAccount(t, account({ rejectedUntil: NOW + 1000 }), ROUTING, NOW)).toBeNull();
+	});
+
+	it('veraltete Ablehnung mit künftigem Wochen-Reset sperrt das Konto nicht', () => {
+		const rejectedWeek = {
+			window: 'week' as const,
+			label: 'seven_day',
+			usedPercent: 100,
+			resetsAt: new Date(NOW + 3 * 24 * 3600_000).toISOString(),
+			status: 'rejected' as const
+		};
+		const stale = {
+			observedAt: new Date(NOW - 2 * 24 * 3600_000).toISOString(),
+			source: 'stream' as const,
+			windows: [rejectedWeek]
+		};
+		expect(accountAvailable(account({ rejectedUntil: rejectedUntil(stale, NOW) }), NOW)).toBe(true);
+		const fresh = { ...stale, observedAt: new Date(NOW - 60_000).toISOString() };
+		expect(accountAvailable(account({ rejectedUntil: rejectedUntil(fresh, NOW) }), NOW)).toBe(
+			false
+		);
 	});
 });

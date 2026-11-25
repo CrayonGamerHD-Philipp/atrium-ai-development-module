@@ -48,7 +48,12 @@ export const limitWindowSchema = z.object({
 	/** Auslastung in Prozent (0–100; über 100 bei genutztem Overage), `null` = unbekannt */
 	usedPercent: z.number().min(0).max(1000).nullable().default(null),
 	resetsAt: z.string().datetime({ offset: true }).nullable().default(null),
-	status: z.enum(['allowed', 'warning', 'rejected', 'unknown']).default('unknown')
+	status: z.enum(['allowed', 'warning', 'rejected', 'unknown']).default('unknown'),
+	/**
+	 * Beobachtungszeit dieses Fensters (Runner-Uhr), sofern es älter ist als der Schnappschuss (`observedAt`).
+	 * Optional (ältere Runner senden es nicht) → es gilt `observedAt` des Schnappschusses.
+	 */
+	observedAt: z.string().datetime({ offset: true }).optional()
 });
 export type LimitWindow = z.infer<typeof limitWindowSchema>;
 

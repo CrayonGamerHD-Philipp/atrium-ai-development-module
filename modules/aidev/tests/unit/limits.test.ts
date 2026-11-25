@@ -4,6 +4,7 @@ import {
 	analyzeLimits,
 	forecastExhaustion,
 	isStale,
+	isWindowStale,
 	median,
 	parseSnapshot,
 	rejectedUntil,
@@ -159,6 +160,21 @@ describe('forecastExhaustion', () => {
 			)
 		).toBe(NOW);
 	});
+
+	it('bereits erschöpft auch mit nur einem Punkt oder ohne Anstieg', () => {
+		expect(forecastExhaustion([{ ts: NOW, usedPercent: 100 }], reset)).toBe(NOW);
+		expect(
+			forecastExhaustion(
+				[
+					{ ts: NOW - HOUR, usedPercent: 100 },
+					{ ts: NOW, usedPercent: 100 }
+				],
+				reset
+			)
+		).toBe(NOW);
+		// erschöpft, aber Reset bereits vorbei → keine Aussage
+		expect(forecastExhaustion([{ ts: NOW, usedPercent: 100 }], NOW)).toBeNull();
+	});
 });
 
 describe('analyzeLimits', () => {
@@ -213,6 +229,29 @@ describe('analyzeLimits', () => {
 		expect(dto.windows[0]!.exhaustsAt).toBe(iso(NOW - 40 * MIN + 2 * HOUR));
 		expect(dto.windows[0]!.estimatedUtil).toBeNull();
 	});
+
+	it('Fenster mit eigener, älterer Beobachtungszeit einzeln als veraltet markiert', () => {
+		const s = snap(
+			[
+				win(),
+				win({ window: 'week', resetsAt: iso(NOW + 24 * HOUR), observedAt: iso(NOW - 3 * HOUR) })
+			],
+			NOW
+		);
+		const dto = analyzeLimits(s, state(), [], NOW);
+		expect(dto.stale).toBe(false);
+		expect(dto.windows.map((w) => w.stale)).toEqual([false, true]);
+	});
+});
+
+describe('isWindowStale', () => {
+	it('eigene Zeit, höchstens die des Schnappschusses; sonst die des Schnappschusses', () => {
+		const s = snap([], NOW - MIN);
+		expect(isWindowStale(win(), s, NOW)).toBe(false);
+		expect(isWindowStale(win({ observedAt: iso(NOW - 31 * MIN) }), s, NOW)).toBe(true);
+		// eigene Zeit nach dem Schnappschuss zählt nicht
+		expect(isWindowStale(win({ observedAt: iso(NOW) }), snap([], NOW - 31 * MIN), NOW)).toBe(true);
+	});
 });
 
 describe('reportedUtil / rejectedUntil', () => {
@@ -228,6 +267,19 @@ describe('reportedUtil / rejectedUntil', () => {
 		expect(reportedUtil(snap([win({ resetsAt: null })]), NOW)).toEqual({ u5h: null, uWeek: null });
 		expect(reportedUtil(snap([win()], NOW - 31 * MIN), NOW)).toEqual({ u5h: null, uWeek: null });
 		expect(reportedUtil(null, NOW)).toEqual({ u5h: null, uWeek: null });
+	});
+
+	it('veraltete Einzelfenster bleiben unberücksichtigt', () => {
+		const s = snap([
+			win({ window: '5h', usedPercent: 42 }),
+			win({
+				window: 'week',
+				usedPercent: 95,
+				resetsAt: iso(NOW + 24 * HOUR),
+				observedAt: iso(NOW - 2 * HOUR)
+			})
+		]);
+		expect(reportedUtil(s, NOW)).toEqual({ u5h: 0.42, uWeek: null });
 	});
 
 	it('abgelehntes Fenster mit künftigem Reset wirkt wie eine Wartezeit', () => {
@@ -247,5 +299,15 @@ describe('reportedUtil / rejectedUntil', () => {
 		).toBeNull();
 		expect(rejectedUntil(snap([win({ status: 'warning' })]), NOW)).toBeNull();
 		expect(rejectedUntil(null, NOW)).toBeNull();
+	});
+
+	it('veraltete Ablehnung sperrt nicht bis zum künftigen Reset', () => {
+		const week = win({ window: 'week', status: 'rejected', resetsAt: iso(NOW + 3 * 24 * HOUR) });
+		// gesamter Stand veraltet (vor zwei Tagen gemeldet)
+		expect(rejectedUntil(snap([week], NOW - 2 * 24 * HOUR), NOW)).toBeNull();
+		// nur das Wochenfenster veraltet, das 5h-Fenster aktuell
+		expect(
+			rejectedUntil(snap([win(), { ...week, observedAt: iso(NOW - 2 * 24 * HOUR) }]), NOW)
+		).toBeNull();
 	});
 });

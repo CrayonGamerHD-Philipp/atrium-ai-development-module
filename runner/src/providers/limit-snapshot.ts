@@ -278,7 +278,11 @@ export class LimitStore {
 		return best;
 	}
 
-	/** Aktueller Schnappschuss eines Kontos (Quelle der jüngsten Beobachtung) oder `null` */
+	/**
+	 * Aktueller Schnappschuss eines Kontos (Quelle der jüngsten Beobachtung) oder `null`. Fenster, die älter sind
+	 * als die jüngste Beobachtung, tragen ihre eigene Beobachtungszeit (`observedAt`), damit Atrium sie getrennt
+	 * auf Aktualität prüft.
+	 */
 	snapshot(accountKey: string): LimitSnapshot | null {
 		const m = this.accounts.get(accountKey);
 		if (!m || !m.size) return null;
@@ -286,7 +290,9 @@ export class LimitStore {
 		const latest = entries.reduce((a, b) => (b.observedAt > a.observedAt ? b : a));
 		const order: LimitWindowKind[] = ['5h', 'week', 'week-opus', 'week-sonnet', 'daily', 'other'];
 		const windows = entries
-			.map((e) => e.value)
+			.map((e) =>
+				e.observedAt < latest.observedAt ? { ...e.value, observedAt: new Date(e.observedAt).toISOString() } : e.value
+			)
 			.sort((a, b) => order.indexOf(a.window) - order.indexOf(b.window) || a.label.localeCompare(b.label));
 		return { observedAt: new Date(latest.observedAt).toISOString(), source: latest.source, windows };
 	}
