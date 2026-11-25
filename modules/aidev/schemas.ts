@@ -210,6 +210,8 @@ export type ProjectPatch = z.infer<typeof projectPatch>;
 
 export const taskInput = z.object({
 	delivery: taskDeliverySchema.default('project'),
+	/** Bestehenden PR bearbeiten statt neuen Branch/PR anzulegen (Nummer des Pull Requests) */
+	targetPr: z.number().int().positive().nullable().default(null),
 	title: z.string().trim().max(200).optional(),
 	prompt: z.string().trim().min(1).max(20_000),
 	role: roleSchema.default('implement'),
@@ -235,6 +237,8 @@ export const replyInput = z.object({ message: z.string().trim().min(1).max(20_00
 
 export const chatInput = z.object({
 	delivery: taskDeliverySchema.default('project'),
+	/** Bestehenden PR bearbeiten statt neuen Branch/PR anzulegen (Nummer des Pull Requests) */
+	targetPr: z.number().int().positive().nullable().default(null),
 	body: z.string().trim().min(1).max(20_000),
 	/** `task` = Nachricht wird ein Auftrag, `note` = nur Notiz im Verlauf */
 	mode: z.enum(['task', 'note', 'question']).default('task'),
@@ -332,6 +336,8 @@ export interface ProjectDto {
 
 export interface TaskDto {
 	delivery: 'project' | 'branch';
+	/** Bearbeiteter bestehender Pull Request (sonst `null`) */
+	targetPr: number | null;
 	branchPushed: boolean;
 	id: string;
 	projectId: string;
@@ -450,6 +456,7 @@ export interface RunnerDto {
 	capabilities: {
 		question?: boolean;
 		branchDelivery?: boolean;
+		prUpdate?: boolean;
 		git?: boolean;
 		gh?: boolean;
 		pty?: boolean;

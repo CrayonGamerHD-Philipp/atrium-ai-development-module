@@ -98,6 +98,7 @@ export function taskDto(r: Row, dependsOn: string[], lastRun: RunSummaryDto | nu
 	return {
 		id: String(r.id),
 		delivery: r.delivery === 'branch' ? 'branch' : 'project',
+		targetPr: r.target_pr === null || r.target_pr === undefined ? null : num(r.target_pr),
 		branchPushed: r.branch_pushed === true,
 		projectId: String(r.project_id),
 		parentId: str(r.parent_id),
