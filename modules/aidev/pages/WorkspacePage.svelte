@@ -354,7 +354,7 @@
 			value={target}
 			onchange={setTarget}
 			size="sm"
-			class="ml-1 w-44 sm:w-72"
+			class="ml-1 min-w-0 flex-1 sm:w-72 sm:flex-none"
 		/>
 		<div class="ml-auto flex items-center gap-1">
 			{#if canFiles && !phone}
@@ -367,6 +367,18 @@
 				>
 					<Save />
 					{activeTab?.saving ? BUSY_SAVE : 'Speichern'}
+				</Button>
+			{:else if canFiles && mobileView === 'editor'}
+				<!-- Handy: kein Strg+S – Speichern als Symbolknopf im Kopf -->
+				<Button
+					size="icon"
+					variant="outline"
+					onclick={save}
+					disabled={!activeTab?.dirty || activeTab.saving}
+					aria-label={activeTab?.saving ? BUSY_SAVE : 'Speichern'}
+					title="Speichern"
+				>
+					<Save />
 				</Button>
 			{/if}
 			{#if canTerminal && canFiles && !phone}
@@ -393,13 +405,17 @@
 					Ansichten.
 				</Alert.Description>
 			</Alert.Root>
-			<div class="grid grid-cols-3 gap-1 rounded-lg border p-0.5" role="group" aria-label="Ansicht">
+			<div
+				class="grid auto-cols-fr grid-flow-col gap-1 rounded-lg border p-0.5"
+				role="group"
+				aria-label="Ansicht"
+			>
 				{#each [{ v: 'files', l: 'Dateien', ok: canFiles }, { v: 'editor', l: 'Editor', ok: canFiles }, { v: 'terminal', l: 'Terminal', ok: canTerminal }] as o (o.v)}
 					{#if o.ok}
 						<button
 							type="button"
 							class={cn(
-								'rounded-md py-1.5 text-xs font-medium',
+								'min-h-10 rounded-md px-1 py-1.5 text-sm font-medium',
 								mobileView === o.v ? 'bg-primary text-primary-foreground' : 'text-muted-foreground'
 							)}
 							aria-pressed={mobileView === o.v}
@@ -430,18 +446,19 @@
 				<aside
 					class={cn(
 						'min-h-0 shrink-0 overflow-y-auto border-r bg-sidebar-surface',
-						phone ? 'w-full' : 'w-64',
+						phone ? 'w-full' : 'w-56 lg:w-64 2xl:w-72',
 						!showFiles && 'hidden'
 					)}
 					aria-label="Dateibaum"
 				>
 					<div
-						class="flex h-8 items-center justify-between px-2 text-xs font-medium text-muted-foreground"
+						class="flex h-8 items-center justify-between px-2 text-xs font-medium text-muted-foreground pointer-coarse:h-11"
 					>
 						<span>Dateien</span>
 						<Button
 							variant="ghost"
 							size="icon-xs"
+							class="pointer-coarse:size-10"
 							onclick={() => {
 								treeKey++;
 								void loadGit();
@@ -471,14 +488,14 @@
 						aria-label="Editor"
 					>
 						<div
-							class="flex h-9 shrink-0 items-end overflow-x-auto border-b bg-muted/30"
+							class="flex h-9 shrink-0 items-end overflow-x-auto border-b bg-muted/30 pointer-coarse:h-11"
 							role="tablist"
 							aria-label="Offene Dateien"
 						>
 							{#each tabs as t (t.key)}
 								<div
 									class={cn(
-										'group flex h-8 max-w-56 shrink-0 items-center gap-1 border-r pr-1 pl-3 text-xs',
+										'group flex h-8 max-w-56 shrink-0 items-center gap-1 border-r pr-1 pl-3 text-xs pointer-coarse:h-10',
 										activeKey === t.key
 											? 'bg-background text-foreground'
 											: 'text-muted-foreground hover:bg-muted/60'
@@ -498,7 +515,7 @@
 									</button>
 									<button
 										type="button"
-										class="flex size-5 items-center justify-center rounded-sm hover:bg-muted"
+										class="flex size-5 shrink-0 items-center justify-center rounded-sm hover:bg-muted pointer-coarse:size-8"
 										aria-label={t.dirty
 											? `${t.name} schließen (ungespeichert)`
 											: `${t.name} schließen`}
@@ -528,8 +545,9 @@
 								>
 									<FileCode class="size-7 text-muted-foreground" aria-hidden="true" />
 									<p class="text-sm text-muted-foreground">
-										Wähle links eine Datei. Änderungen speicherst du mit Strg+S direkt in die
-										Arbeitskopie des Runners.
+										{phone
+											? 'Wähle unter „Dateien“ eine Datei. Speichern schreibt direkt in die Arbeitskopie des Runners.'
+											: 'Wähle links eine Datei. Änderungen speicherst du mit Strg+S direkt in die Arbeitskopie des Runners.'}
 									</p>
 								</div>
 							{:else if activeTab.state === 'loading'}
@@ -590,7 +608,7 @@
 		<!-- Git-Status -->
 		{#if canFiles}
 			<footer
-				class="flex h-7 shrink-0 items-center gap-3 overflow-x-auto border-t bg-muted/40 px-3 text-xs text-muted-foreground"
+				class="flex h-7 shrink-0 items-center gap-3 overflow-x-auto border-t bg-muted/40 px-3 text-xs whitespace-nowrap text-muted-foreground pointer-coarse:h-10"
 			>
 				{#if git}
 					<span class="inline-flex items-center gap-1 font-mono">
@@ -621,7 +639,7 @@
 				<button
 					type="button"
 					class={cn(
-						'inline-flex items-center gap-1 hover:text-foreground',
+						'inline-flex shrink-0 items-center gap-1 hover:text-foreground pointer-coarse:min-h-10 pointer-coarse:min-w-10 pointer-coarse:justify-center',
 						!dirtyCount && 'ml-auto'
 					)}
 					onclick={loadGit}
