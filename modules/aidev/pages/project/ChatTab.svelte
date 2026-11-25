@@ -1,7 +1,8 @@
 <script lang="ts">
 	// Projekt-Chat: Verlauf (neueste unten, Nachrichten als Markdown, gruppiert nach Autor), Antwort-Indikator,
 	// „Nach unten“-Knopf und Eingabe (ChatComposer). Mobil (< lg) als Vollbild mit eigener Kopfzeile, ab lg als Karte,
-	// die genau bis zum Fensterrand reicht (kein doppeltes Scrollen).
+	// die genau bis zum Fensterrand reicht (kein doppeltes Scrollen). Unter Agent-Antworten: Aktionsvorschläge
+	// (ChatActions) und „Umsetzen“ (Bezug auf die Antwort für einen neuen Auftrag).
 	import { onMount, tick } from 'svelte';
 	import { page } from '$app/state';
 	import ArrowDown from '@lucide/svelte/icons/arrow-down';
@@ -10,6 +11,7 @@
 	import Bot from '@lucide/svelte/icons/bot';
 	import CircleHelp from '@lucide/svelte/icons/circle-help';
 	import Info from '@lucide/svelte/icons/info';
+	import WandSparkles from '@lucide/svelte/icons/wand-sparkles';
 	import { ErrorState, LoadingState } from '$lib/components/layout';
 	import { Button } from '$lib/components/ui/button';
 	import { cn } from '$lib/utils';
@@ -20,7 +22,10 @@
 	import Markdown from '../components/Markdown.svelte';
 	import StatusBadge from '../components/StatusBadge.svelte';
 	import ChatComposer from './ChatComposer.svelte';
+	import ChatActions from './chat/ChatActions.svelte';
+	import { canImplement, replyLabel } from './chat/proposals';
 	import { activityFor, buildTimeline, clockTime } from './chat/timeline';
+	import type { ChatMessageDto } from '../../schemas';
 	import type { ProjectStore } from './store.svelte';
 
 	let { store, onclose }: { store: ProjectStore; onclose?: () => void } = $props();
@@ -209,6 +214,11 @@
 		draft = text;
 		await tick();
 		composer?.focus();
+	}
+
+	/** „Umsetzen“: Eingabe als Auftrag mit Bezug auf diese Antwort vorbereiten */
+	function implement(m: ChatMessageDto) {
+		composer?.implement(m.id, replyLabel(m));
 	}
 
 	const FOCUS =
@@ -428,6 +438,21 @@
 											</a>
 										{/if}
 									</div>
+									{#if m.kind === 'agent' && m.actions.length > 0}
+										<ChatActions {store} message={m} {tasksById} />
+									{/if}
+									{#if canWrite && canImplement(m, task)}
+										<Button
+											variant="ghost"
+											size="sm"
+											class="mt-0.5 h-8 self-start px-2 text-xs text-muted-foreground hover:text-foreground max-lg:h-10"
+											title="Als Auftrag umsetzen lassen (mit dieser Antwort als Kontext)"
+											onclick={() => implement(m)}
+										>
+											<WandSparkles class="size-3.5" aria-hidden="true" />
+											Umsetzen
+										</Button>
+									{/if}
 								</div>
 							</article>
 						{/if}

@@ -2,12 +2,14 @@
 	// Chat-Eingabe als eine kompakte Zeile: [Modus] [Optionen] [mitwachsendes Textfeld] [Senden].
 	// Modus per Menü (mit Live-Erkennung im Auto-Modus), erweiterte Optionen im Popover (Desktop) bzw.
 	// Blatt von unten (mobil); abweichende Optionen stehen als entfernbare Chips über der Eingabe.
-	// Entwurf (pro Benutzer und Projekt) und Modus werden im Browser gemerkt.
+	// Entwurf (pro Benutzer und Projekt) und Modus werden im Browser gemerkt. „Umsetzen“ (`implement`) setzt einen
+	// Bezug auf eine Agent-Antwort (`replyTo`), sichtbar als entfernbarer Chip.
 	import { onMount } from 'svelte';
 	import { page } from '$app/state';
 	import { MediaQuery } from 'svelte/reactivity';
 	import { toast } from 'svelte-sonner';
 	import ArrowUp from '@lucide/svelte/icons/arrow-up';
+	import CornerDownRight from '@lucide/svelte/icons/corner-down-right';
 	import LoaderCircle from '@lucide/svelte/icons/loader-circle';
 	import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
 	import X from '@lucide/svelte/icons/x';
@@ -25,6 +27,7 @@
 	import { postChat } from '../api';
 	import { errMsg } from '../format';
 	import { CHAT_MODES, isChatMode, modeInfo, storage, type ChatMode } from './chat/modes';
+	import { IMPLEMENT_TEXT } from './chat/proposals';
 	import type { ProjectStore } from './store.svelte';
 
 	let {
@@ -52,6 +55,10 @@
 	let optionsOpen = $state(false);
 	/** „Optionen …“ im Modus-Menü gewählt → Blatt erst öffnen, wenn das Menü den Fokus abgegeben hat */
 	let pendingOptions = false;
+	/** „Umsetzen“: Agent-Antwort, auf die sich die nächste Nachricht bezieht (`label` z. B. „Antwort von 14:05“) */
+	let replyTo = $state<{ id: string; label: string } | null>(null);
+	/** Modus vor „Umsetzen“ – nach dem Senden bzw. Entfernen des Bezugs wiederherstellen */
+	let modeBeforeReply: ChatMode | null = null;
 	/** Browser ohne `field-sizing: content` → Höhe per JS anpassen */
 	let manualGrow = $state(false);
 
@@ -156,10 +163,31 @@
 		textarea?.focus();
 	}
 
+	/**
+	 * „Umsetzen“: Modus `task` (nur für diese Nachricht, nicht gemerkt), Bezug auf die Antwort `messageId` und
+	 * vorbelegter Text – ein schon begonnener Entwurf bleibt stehen.
+	 */
+	export function implement(messageId: string, label: string) {
+		if (!replyTo) modeBeforeReply = mode;
+		replyTo = { id: messageId, label };
+		mode = 'task';
+		if (!body.trim()) body = IMPLEMENT_TEXT;
+		textarea?.focus();
+	}
+
+	/** Bezug entfernen und den vorherigen Modus wiederherstellen */
+	function clearReply() {
+		replyTo = null;
+		if (modeBeforeReply) mode = modeBeforeReply;
+		modeBeforeReply = null;
+	}
+
 	function setMode(m: string) {
 		if (!isChatMode(m)) return;
 		mode = m;
 		storage.set(MODE_KEY, m);
+		// bewusst gewählter Modus bleibt auch nach dem Entfernen des Bezugs
+		modeBeforeReply = null;
 	}
 
 	async function send(e?: Event) {
@@ -175,11 +203,14 @@
 				role,
 				// im Auto-Modus entscheidet der Server; Aufteilen gilt dort nur, wenn es ein Auftrag wird
 				decompose: effective === 'task' && decompose,
-				providerHint: effective !== 'note' ? providerHint : null
+				providerHint: effective !== 'note' ? providerHint : null,
+				// nur im Modus `task` wirksam (der Server ignoriert den Bezug sonst)
+				replyTo: effective === 'task' ? (replyTo?.id ?? null) : null
 			});
 			store.addChat(res.message);
 			if (res.task) store.upsertTask(res.task);
 			body = '';
+			if (replyTo) clearReply();
 			if (mode === 'auto') toast.success(SENT_LABEL[res.mode] ?? 'Gesendet');
 			onsent?.();
 			// Desktop: direkt weiterschreiben; mobil Tastatur schließen, damit die Antwort sichtbar ist
@@ -284,8 +315,25 @@
 	onsubmit={send}
 	aria-label="Nachricht senden"
 >
-	{#if showAutoChip || chips.length > 0 || (enterSends && hasText)}
+	{#if replyTo || showAutoChip || chips.length > 0 || (enterSends && hasText)}
 		<div class="flex min-w-0 flex-wrap items-center gap-1.5 px-1">
+			{#if replyTo}
+				<span
+					class="inline-flex min-h-7 max-w-full items-center gap-0.5 rounded-full border border-info-border bg-info-muted pl-2.5 text-xs text-info"
+				>
+					<CornerDownRight class="mr-1 size-3.5 shrink-0" aria-hidden="true" />
+					<span class="truncate">Bezug: {replyTo.label}</span>
+					<button
+						type="button"
+						class="inline-flex size-7 shrink-0 items-center justify-center rounded-full outline-none hover:opacity-80 focus-visible:ring-3 focus-visible:ring-ring/50"
+						aria-label="Bezug auf {replyTo.label} entfernen"
+						disabled={busy}
+						onclick={clearReply}
+					>
+						<X class="size-3.5" aria-hidden="true" />
+					</button>
+				</span>
+			{/if}
 			{#if showAutoChip}
 				<button
 					type="button"
