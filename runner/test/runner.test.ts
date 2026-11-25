@@ -208,7 +208,14 @@ describe('Runner', () => {
 		expect((await rpc('gh.pr-merge', { number: 1, method: 'evil' })).ok).toBe(false);
 
 		const check = await rpc('repo.check');
-		expect(check.result).toEqual({ ok: true, defaultBranch: 'main', canPush: true, message: expect.any(String) });
+		expect(check.result).toEqual({
+			ok: true,
+			defaultBranch: 'main',
+			canPush: true,
+			message: expect.any(String),
+			branches: expect.arrayContaining(['main'])
+		});
+		expect(check.result.branches[0]).toBe('main');
 	});
 
 	it('beendet Terminals auf fehlenden Worktrees mit Fehlermeldung', async () => {
