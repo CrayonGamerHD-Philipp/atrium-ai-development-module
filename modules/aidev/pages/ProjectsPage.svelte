@@ -1,30 +1,45 @@
 <script lang="ts">
 	// Startseite des Moduls: Kennzahlen (live), Projekte, aktive Läufe aller Projekte, Auslastung je Konto
+	import { goto } from '$app/navigation';
+	import { page } from '$app/state';
 	import { onMount } from 'svelte';
 	import Activity from '@lucide/svelte/icons/activity';
 	import CircleHelp from '@lucide/svelte/icons/circle-help';
-	import FolderGit2 from '@lucide/svelte/icons/folder-git-2';
-	import GitPullRequest from '@lucide/svelte/icons/git-pull-request';
 	import ListTodo from '@lucide/svelte/icons/list-todo';
 	import Plus from '@lucide/svelte/icons/plus';
 	import Server from '@lucide/svelte/icons/server';
 	import Split from '@lucide/svelte/icons/split';
 	import { EmptyState, ErrorState, LoadingState, PageHeader } from '$lib/components/layout';
 	import * as Alert from '$lib/components/ui/alert';
-	import { Badge } from '$lib/components/ui/badge';
 	import { Button } from '$lib/components/ui/button';
 	import * as Card from '$lib/components/ui/card';
 	import type { OverviewDto, OverviewLiveEvent, ProjectDto } from '../schemas';
-	import { POLICY_LABELS } from '../schemas';
 	import { BASE, getOverview, listProjects, projectPath } from './api';
 	import AccountUsageList from './components/AccountUsageList.svelte';
 	import ActiveRunsList from './components/ActiveRunsList.svelte';
 	import LiveIndicator from './components/LiveIndicator.svelte';
 	import ProjectCreateDialog from './components/ProjectCreateDialog.svelte';
-	import TimeAgo from './components/TimeAgo.svelte';
 	import { errMsg } from './format';
 	import { LiveStream } from './live.svelte';
 	import { has, PERM } from './perms';
+	import {
+		defaultView,
+		filterProjects,
+		isProjectSort,
+		isStatusFilter,
+		loadFavorites,
+		loadView,
+		parseQuery,
+		saveFavorites,
+		saveView,
+		statusCounts,
+		type ProjectSort,
+		type ProjectStatusFilter,
+		type ProjectView
+	} from './projects/filter';
+	import ProjectCard from './projects/ProjectCard.svelte';
+	import ProjectRow from './projects/ProjectRow.svelte';
+	import ProjectToolbar from './projects/ProjectToolbar.svelte';
 
 	let overview = $state<OverviewDto | null>(null);
 	let projects = $state<ProjectDto[]>([]);
@@ -78,15 +93,106 @@
 		return () => stream.close();
 	});
 
-	const visible = $derived(
-		[...projects]
-			.filter((p) => !p.archivedAt)
-			.sort(
-				(a, b) =>
-					b.counts.running + b.counts.needsInput - (a.counts.running + a.counts.needsInput) ||
-					b.updatedAt.localeCompare(a.updatedAt)
-			)
-	);
+	// Suche, Filter und Sortierung – Zustand im URL-Query (?q=&status=&sort=), Filterung sofort
+	const initial = page.url.searchParams;
+	const initialStatus = initial.get('status');
+	const initialSort = initial.get('sort');
+	let query = $state(initial.get('q') ?? '');
+	let status = $state<ProjectStatusFilter>(isStatusFilter(initialStatus) ? initialStatus : 'all');
+	let sort = $state<ProjectSort>(isProjectSort(initialSort) ? initialSort : 'activity');
+	let favorites = $state.raw<ReadonlySet<string>>(loadFavorites());
+	let viewChoice = $state<ProjectView | null>(loadView());
+	let searchInput = $state<HTMLInputElement | null>(null);
+
+	const active = $derived(projects.filter((p) => !p.archivedAt));
+	const tokens = $derived(parseQuery(query));
+	const visible = $derived(filterProjects(projects, { query, status, sort, favorites }));
+	const counts = $derived(statusCounts(projects, favorites));
+	const view = $derived<ProjectView>(viewChoice ?? defaultView(active.length));
+	const filtered = $derived(tokens.length > 0 || status !== 'all');
+
+	let urlTimer: ReturnType<typeof setTimeout> | undefined;
+	function syncUrl() {
+		clearTimeout(urlTimer);
+		const url = new URL(page.url);
+		const q = query.trim();
+		if (q) url.searchParams.set('q', q);
+		else url.searchParams.delete('q');
+		if (status !== 'all') url.searchParams.set('status', status);
+		else url.searchParams.delete('status');
+		if (sort !== 'activity') url.searchParams.set('sort', sort);
+		else url.searchParams.delete('sort');
+		if (url.search === page.url.search) return;
+		void goto(url, { replaceState: true, noScroll: true, keepFocus: true });
+	}
+
+	// Nur das URL-Update entprellen (~150 ms), die Liste filtert sofort
+	$effect(() => {
+		void query;
+		clearTimeout(urlTimer);
+		urlTimer = setTimeout(syncUrl, 150);
+		return () => clearTimeout(urlTimer);
+	});
+
+	function setStatus(next: ProjectStatusFilter) {
+		status = next;
+		syncUrl();
+	}
+
+	function setSort(next: ProjectSort) {
+		sort = next;
+		syncUrl();
+	}
+
+	function setView(next: ProjectView) {
+		viewChoice = next;
+		saveView(next);
+	}
+
+	function resetFilters() {
+		query = '';
+		status = 'all';
+		syncUrl();
+		searchInput?.focus();
+	}
+
+	function toggleFavorite(id: string) {
+		const next = new Set(favorites);
+		if (next.has(id)) next.delete(id);
+		else next.add(id);
+		favorites = next;
+		saveFavorites(next);
+	}
+
+	function onQueryKeydown(e: KeyboardEvent) {
+		if (e.key === 'Escape' && query) {
+			e.preventDefault();
+			query = '';
+		} else if (e.key === 'Enter' && visible.length === 1) {
+			e.preventDefault();
+			void goto(projectPath(visible[0]!.id));
+		}
+	}
+
+	/** Fokus liegt in einem Eingabeelement – dann keine Tastenkürzel abfangen */
+	function isEditable(target: EventTarget | null): boolean {
+		if (!(target instanceof HTMLElement)) return false;
+		return (
+			target.isContentEditable ||
+			target.tagName === 'INPUT' ||
+			target.tagName === 'TEXTAREA' ||
+			target.tagName === 'SELECT'
+		);
+	}
+
+	// „/“ fokussiert die Suche. Strg/⌘+K bleibt der globalen Befehlspalette des Cores vorbehalten.
+	function onWindowKeydown(e: KeyboardEvent) {
+		if (e.key !== '/' || e.ctrlKey || e.metaKey || e.altKey || e.defaultPrevented) return;
+		if (!searchInput || isEditable(e.target)) return;
+		e.preventDefault();
+		searchInput.focus();
+		searchInput.select();
+	}
 
 	const stats = $derived(
 		overview
@@ -125,6 +231,8 @@
 			: []
 	);
 </script>
+
+<svelte:window onkeydown={onWindowKeydown} />
 
 <PageHeader
 	title="KI-Entwicklung"
@@ -192,12 +300,23 @@
 	</section>
 
 	<section aria-labelledby="aidev-projects" class="space-y-3">
-		<h2 id="aidev-projects" class="text-section">Projekte</h2>
+		<div class="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1">
+			<h2 id="aidev-projects" class="text-section">Projekte</h2>
+			{#if active.length}
+				<p class="text-xs text-muted-foreground tabular-nums" aria-live="polite">
+					{#if filtered}
+						{visible.length} von {active.length} Projekt{active.length === 1 ? '' : 'en'}
+					{:else}
+						{active.length} Projekt{active.length === 1 ? '' : 'e'}
+					{/if}
+				</p>
+			{/if}
+		</div>
 		{#if loading && !projects.length}
 			<LoadingState rows={3} rowClass="h-28 w-full" label="Projekte" />
 		{:else if loadError}
 			<ErrorState message={loadError} onretry={loadProjects} />
-		{:else if !visible.length}
+		{:else if !active.length}
 			<EmptyState
 				title="Noch keine Projekte"
 				description={canManage
@@ -209,66 +328,54 @@
 				{/if}
 			</EmptyState>
 		{:else}
-			<ul class="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-3 min-[110rem]:grid-cols-4">
-				{#each visible as p (p.id)}
-					<li>
-						<a
-							href={projectPath(p.id)}
-							class="group block h-full rounded-lg border bg-card p-4 transition-colors outline-none hover:border-foreground/25 focus-visible:ring-2 focus-visible:ring-ring"
-						>
-							<div class="flex min-w-0 items-start gap-3">
-								<FolderGit2
-									class="mt-0.5 size-5 shrink-0 text-muted-foreground"
-									aria-hidden="true"
-								/>
-								<div class="min-w-0 flex-1">
-									<div class="truncate font-medium group-hover:underline">{p.name}</div>
-									<div class="truncate font-mono text-xs text-muted-foreground">
-										{p.repoOwner}/{p.repoName} · {p.defaultBranch}
-									</div>
-								</div>
-								{#if p.counts.needsInput}
-									<Badge variant="warning" class="shrink-0"
-										>{p.counts.needsInput} Rückfrage{p.counts.needsInput === 1 ? '' : 'n'}</Badge
-									>
-								{/if}
-							</div>
-							<dl class="mt-4 grid grid-cols-4 gap-1 text-center sm:gap-2">
-								<div>
-									<dt class="text-xs text-muted-foreground">Wartet</dt>
-									<dd class="text-sm font-semibold tabular-nums">{p.counts.queued}</dd>
-								</div>
-								<div>
-									<dt class="text-xs text-muted-foreground">Läuft</dt>
-									<dd
-										class="text-sm font-semibold tabular-nums"
-										class:text-info={p.counts.running > 0}
-									>
-										{p.counts.running}
-									</dd>
-								</div>
-								<div>
-									<dt class="text-xs text-muted-foreground">PR offen</dt>
-									<dd class="text-sm font-semibold tabular-nums">{p.counts.review}</dd>
-								</div>
-								<div>
-									<dt class="text-xs text-muted-foreground">Fertig</dt>
-									<dd class="text-sm font-semibold tabular-nums">{p.counts.done}</dd>
-								</div>
-							</dl>
-							<div
-								class="mt-3 flex items-center justify-between gap-2 border-t pt-2 text-xs text-muted-foreground"
-							>
-								<span class="inline-flex min-w-0 items-center gap-1">
-									<GitPullRequest class="size-3.5 shrink-0" aria-hidden="true" />
-									<span class="truncate">{POLICY_LABELS[p.commitPolicy]}</span>
-								</span>
-								<TimeAgo value={p.updatedAt} />
-							</div>
-						</a>
-					</li>
-				{/each}
-			</ul>
+			<ProjectToolbar
+				bind:query
+				bind:input={searchInput}
+				{status}
+				{sort}
+				{view}
+				{counts}
+				onstatus={setStatus}
+				onsort={setSort}
+				onview={setView}
+				onquerykeydown={onQueryKeydown}
+			/>
+			{#if !visible.length}
+				<EmptyState
+					title="Keine Projekte gefunden"
+					description={tokens.length
+						? `Kein Projekt passt zu „${query.trim()}“${status !== 'all' ? ' im gewählten Filter' : ''}.`
+						: 'Kein Projekt passt zum gewählten Filter.'}
+				>
+					<Button variant="outline" onclick={resetFilters}>Suche & Filter zurücksetzen</Button>
+				</EmptyState>
+			{:else if view === 'list'}
+				<ul class="divide-y overflow-hidden rounded-lg border bg-card">
+					{#each visible as p (p.id)}
+						<li>
+							<ProjectRow
+								project={p}
+								{tokens}
+								favorite={favorites.has(p.id)}
+								ontogglefavorite={() => toggleFavorite(p.id)}
+							/>
+						</li>
+					{/each}
+				</ul>
+			{:else}
+				<ul class="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-3 min-[110rem]:grid-cols-4">
+					{#each visible as p (p.id)}
+						<li>
+							<ProjectCard
+								project={p}
+								{tokens}
+								favorite={favorites.has(p.id)}
+								ontogglefavorite={() => toggleFavorite(p.id)}
+							/>
+						</li>
+					{/each}
+				</ul>
+			{/if}
 		{/if}
 	</section>
 
