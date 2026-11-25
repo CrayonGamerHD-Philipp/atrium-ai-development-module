@@ -92,7 +92,7 @@
 			value={role}
 			onchange={(v) => v && (role = v as Role)}
 			size="sm"
-			class="w-36"
+			class="w-full sm:w-36"
 			disabled={busy || decompose}
 		/>
 		<SelectField
@@ -101,14 +101,14 @@
 			value={delivery}
 			onchange={(v) => v && (delivery = v as 'project' | 'branch')}
 			size="sm"
-			class="w-64"
+			class="w-full sm:w-64"
 			disabled={busy}
 		/>
-		<label class="inline-flex items-center gap-2 text-sm">
+		<label class="inline-flex min-h-10 items-center gap-2 text-sm sm:min-h-8">
 			<Switch bind:checked={decompose} size="sm" disabled={busy} />
 			Planen & aufteilen
 		</label>
-		<label class="inline-flex items-center gap-2 text-sm">
+		<label class="inline-flex min-h-10 items-center gap-2 text-sm sm:min-h-8">
 			<Switch bind:checked={draft} size="sm" disabled={busy} />
 			Als Entwurf
 		</label>
@@ -117,9 +117,15 @@
 			size="sm"
 			onclick={() => (more = !more)}
 			aria-expanded={more}
-			aria-controls="new-task-more">Mehr</Button
+			aria-controls="new-task-more"
+			class="max-sm:h-10">Mehr</Button
 		>
-		<Button type="submit" size="sm" class="ml-auto" disabled={busy || !prompt.trim()}>
+		<Button
+			type="submit"
+			size="sm"
+			class="w-full max-sm:h-10 sm:ml-auto sm:w-auto"
+			disabled={busy || !prompt.trim()}
+		>
 			<Send />
 			{busy ? BUSY_SAVE : draft ? 'Entwurf speichern' : 'Auftrag geben'}
 		</Button>
@@ -129,8 +135,8 @@
 		unverändert. Leseaufträge liefern keine Änderungen aus.
 	</p>
 	{#if more}
-		<div id="new-task-more" class="grid gap-3 border-t pt-3 sm:grid-cols-3">
-			<div class="space-y-1">
+		<div id="new-task-more" class="grid grid-cols-1 gap-3 border-t pt-3 sm:grid-cols-3">
+			<div class="min-w-0 space-y-1">
 				<Label for="new-task-title" class="text-xs">Titel (optional)</Label>
 				<Input
 					id="new-task-title"
@@ -140,7 +146,7 @@
 					disabled={busy}
 				/>
 			</div>
-			<div class="space-y-1">
+			<div class="min-w-0 space-y-1">
 				<Label for="new-task-priority" class="text-xs">Priorität</Label>
 				<NumberStepper
 					id="new-task-priority"
@@ -151,7 +157,7 @@
 					disabled={busy}
 				/>
 			</div>
-			<div class="space-y-1">
+			<div class="min-w-0 space-y-1">
 				<Label for="new-task-provider" class="text-xs">Anbieter erzwingen</Label>
 				<SelectField
 					id="new-task-provider"

@@ -100,7 +100,7 @@
 		<form id="new-project-form" onsubmit={submit} class="space-y-4" novalidate>
 			<ProjectFields bind:values {errors} idPrefix="new-project" disabled={busy} />
 			{#if !values.name.trim() && suggestedName}
-				<p class="text-xs text-muted-foreground">
+				<p class="text-xs wrap-break-word text-muted-foreground">
 					Ohne Namen wird „{suggestedName}“ verwendet.
 				</p>
 			{/if}
