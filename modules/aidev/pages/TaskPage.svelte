@@ -67,7 +67,7 @@
 	} from './format';
 	import { has, PERM } from './perms';
 	import { ProjectStore } from './project/store.svelte';
-	import AgentText from './task/AgentText.svelte';
+	import Markdown from './components/Markdown.svelte';
 	import DiffView from './task/DiffView.svelte';
 	import RunLog from './task/RunLog.svelte';
 	import TaskEditDialog from './task/TaskEditDialog.svelte';
@@ -497,7 +497,7 @@
 				</Label>
 				{#if task.status === 'needs-input' && (task.resultSummary || selectedRun?.summary)}
 					<div class="rounded-md bg-background p-2">
-						<AgentText text={task.resultSummary || selectedRun?.summary || ''} />
+						<Markdown text={task.resultSummary || selectedRun?.summary || ''} />
 					</div>
 				{/if}
 				<Textarea
@@ -531,7 +531,7 @@
 				</span>
 			</summary>
 			<div class="border-t px-3 py-3">
-				<AgentText text={task.prompt} />
+				<Markdown text={task.prompt} />
 				{#if detail.dependencies.length}
 					<div class="mt-3 flex flex-wrap items-center gap-2 text-xs">
 						<span class="text-muted-foreground">Wartet auf:</span>
@@ -746,7 +746,7 @@
 					{#if task.resultSummary}
 						<div class="rounded-lg border bg-card p-4">
 							<h2 class="mb-2 text-sm font-medium">Zusammenfassung des Agents</h2>
-							<AgentText text={task.resultSummary} />
+							<Markdown text={task.resultSummary} />
 						</div>
 					{:else if !task.errorMessage}
 						<EmptyState
