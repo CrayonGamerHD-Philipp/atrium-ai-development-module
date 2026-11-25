@@ -7,6 +7,8 @@ import path from 'node:path';
 import { accountEnv, publicEnv, type AccountConfig, type RunnerConfig } from './config.ts';
 import { ApiError, EventBatcher, type RunnerApi } from './client.ts';
 import {
+	assertPullUpdatable,
+	commentOnPull,
 	commitAll,
 	commitInfos,
 	countCommits,
@@ -16,8 +18,13 @@ import {
 	discardChanges,
 	enableAutoMerge,
 	ensurePullRequest,
+	fetchPullContext,
 	headSha,
-	pushBranch
+	pullCommentBody,
+	pullUrl,
+	pushBranch,
+	syncPullBranch,
+	type PullContext
 } from './git/delivery.ts';
 import { assertRefName, GitError } from './git/git.ts';
 import type { Workspace } from './git/workspace.ts';
@@ -124,7 +131,7 @@ export class Executor {
 			return reject(`Unbekanntes Konto „${offer.account.key}“`);
 		if (!acct.ok) return reject(`CLI für Konto „${offer.account.key}“ nicht verfügbar`);
 		if (!acct.loggedIn) return reject(`Konto „${offer.account.key}“ ist nicht angemeldet`);
-		if (offer.delivery.mode === 'branch' && offer.branch === offer.project.defaultBranch)
+		if ((offer.delivery.mode === 'branch' || offer.delivery.mode === 'pr-update') && offer.branch === offer.project.defaultBranch)
 			return reject('Der Ergebnis-Branch darf nicht der Haupt-Branch sein');
 		try {
 			assertRefName(offer.branch);
@@ -246,8 +253,11 @@ export class Executor {
 		};
 
 		let wtDir: string | null = null;
+		let pull: PullContext | null = null;
 		try {
 			emit('status', { text: 'Repository wird vorbereitet' });
+			// 0. Bestehender PR (pr-update): prüfen, bevor etwas geändert wird; Kontext für den Agent
+			if (offer.delivery.mode === 'pr-update') pull = await this.loadPull(offer, offer.delivery.number, emit);
 			// 1. Worktree
 			const prepared = await this.prepareWorktree(offer, emit);
 			wtDir = prepared.dir;
@@ -276,7 +286,7 @@ export class Executor {
 			const adapter = this.o.adapters[acct.provider];
 			const proc = adapter.start({
 				cwd: wtDir,
-				prompt: offer.prompt,
+				prompt: pull ? `${offer.prompt}\n\n${pull.markdown}` : offer.prompt,
 				systemPrompt: offer.systemPrompt,
 				model: offer.model ?? (acct.provider === 'openai-api' ? (acct.model ?? null) : null),
 				resumeSessionId: offer.resumeSessionId,
@@ -340,8 +350,11 @@ export class Executor {
 			const newCommits = await countCommits(ws, wtDir, prepared.startSha);
 			finish.branch = offer.branch;
 			finish.headSha = await headSha(ws, wtDir);
-			// Ein wiederaufgenommener oder zusammengeführter Branch kann bereits auszuliefernde Commits enthalten.
-			const pendingCommits = newCommits || await countCommits(ws, wtDir, `origin/${offer.baseRef}`);
+			// Ein wiederaufgenommener oder zusammengeführter Branch kann bereits auszuliefernde Commits enthalten –
+			// außer beim Head-Branch eines PR: dessen Stand liegt schon auf dem Remote.
+			const pendingCommits =
+				newCommits ||
+				(offer.delivery.mode === 'pr-update' ? 0 : await countCommits(ws, wtDir, `origin/${offer.baseRef}`));
 			if (pendingCommits === 0) {
 				emit('status', { text: NO_CHANGES });
 				finish.status = 'succeeded';
@@ -378,6 +391,28 @@ export class Executor {
 				);
 				finish.pr = pr;
 				if (d.autoMerge) await enableAutoMerge(ws, repo, pr.number, gitEmit);
+			} else if (d.mode === 'pr-update') {
+				// Kein Force-Push: parallel gepushte Commits werden per Rebase übernommen
+				commitBase = await syncPullBranch(
+					ws,
+					repo,
+					{ dir: wtDir, branch: offer.branch, number: d.number, expectedRemote: prepared.remoteSha },
+					gitEmit
+				);
+				await pushBranch(ws, repo, wtDir, offer.branch, commitBase, gitEmit, { allowForce: false });
+				finish.branchPushed = true;
+				const url =
+					pull?.url || (await pullUrl(ws, repo, d.number)) ||
+					`https://github.com/${repo.repoOwner}/${repo.repoName}/pull/${d.number}`;
+				finish.pr = { number: d.number, url };
+				emit('git', { action: 'pr', detail: `PR #${d.number} aktualisiert`, url });
+				const commits = await commitInfos(ws, wtDir, commitBase);
+				const body = pullCommentBody({
+					summary: summary ? redactor.redact(summary) : null,
+					commits,
+					taskId: offer.taskId
+				});
+				await commentOnPull(ws, repo, d.number, redactor.redact(body), gitEmit);
 			} else if (d.mode === 'direct') {
 				commitBase = await deliverDirect(ws, repo, wtDir, offer.project.defaultBranch, gitEmit);
 				finish.merged = true;
@@ -456,6 +491,9 @@ export class Executor {
 			const dir = ws.runDir(offer.runId);
 			return await ws.withRepo(repo, async () => {
 				const remoteSha = offer.question ? null : await ws.revParse(cache, `refs/remotes/origin/${offer.branch}`);
+				// Der Head-Branch eines bestehenden PR wird nie neu angelegt
+				if (!remoteSha && !offer.question && offer.delivery.mode === 'pr-update')
+					throw new RunError('git', `Branch des PR #${offer.delivery.number} existiert nicht mehr`);
 				let start: string;
 				if (remoteSha) {
 					start = remoteSha;
@@ -482,6 +520,32 @@ export class Executor {
 			if (e instanceof GitError) throw new RunError('git', e.message);
 			throw e;
 		}
+	}
+
+	/**
+	 * PR-Kontext für pr-update laden und prüfen. Ungeeignete PRs (geschlossen, Fork, anderer Branch) brechen den Lauf
+	 * ab; lässt sich der PR nicht laden, läuft der Lauf ohne Kontext weiter (Fehler als Ereignis).
+	 */
+	private async loadPull(
+		offer: RunOffer,
+		number: number,
+		emit: (k: RunEventKind, p: Record<string, unknown>) => void
+	): Promise<PullContext | null> {
+		const repo = { repoOwner: offer.project.repoOwner, repoName: offer.project.repoName };
+		let ctx: PullContext;
+		try {
+			ctx = await fetchPullContext(this.o.workspace, repo, number);
+		} catch (e) {
+			emit('error', { text: `PR-Kontext nicht verfügbar – Lauf ohne Kontext: ${errorMessage(e)}` });
+			return null;
+		}
+		try {
+			assertPullUpdatable(ctx, offer.branch);
+		} catch (e) {
+			throw new RunError('git', errorMessage(e));
+		}
+		emit('git', { action: 'pr', detail: `PR #${number} geladen: ${ctx.title.slice(0, 200)}`, url: ctx.url });
+		return ctx;
 	}
 
 	/** Projektbefehl in der Shell ausführen; Ausgabe als `system`/`stderr`-Ereignisse */

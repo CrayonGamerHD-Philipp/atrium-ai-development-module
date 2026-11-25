@@ -3,7 +3,7 @@
  * (`git init --bare`) als „GitHub“.
  */
 import { execFileSync } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { chmod, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -20,7 +20,29 @@ export interface TestEnv {
 	remoteTemplate: string;
 	cleanup(): Promise<void>;
 	ghCalls(): string[][];
-	ghPrs(): { number: number; head: string; base: string; title: string; body: string; autoMerge: boolean }[];
+	ghPrs(): GhPr[];
+	/** PR im gh-Shim anlegen (z. B. geschlossen, aus einem Fork, mit Kommentaren) */
+	addGhPr(pr: Partial<GhPr> & { repo: string; head: string }): GhPr;
+}
+
+export interface GhPr {
+	number: number;
+	repo: string;
+	head: string;
+	base: string;
+	title: string;
+	body: string;
+	url: string;
+	state: 'OPEN' | 'CLOSED' | 'MERGED';
+	autoMerge: boolean;
+	isCrossRepository?: boolean;
+	comments?: { author: { login: string }; body: string }[];
+	reviews?: { author: { login: string }; body: string; state: string }[];
+	inlineComments?: { path: string; line: number | null; body: string; user: { login: string } }[];
+	/** `gh pr view` schlägt fehl */
+	failView?: boolean;
+	/** `gh pr comment` schlägt fehl */
+	failComment?: boolean;
 }
 
 export async function setupTestEnv(): Promise<TestEnv> {
@@ -45,7 +67,7 @@ export async function setupTestEnv(): Promise<TestEnv> {
 	const remotes = path.join(tmp, 'remotes');
 	await mkdir(remotes, { recursive: true });
 	const readState = () =>
-		existsSync(ghState) ? JSON.parse(readFileSync(ghState, 'utf8')) : { prs: [], calls: [] };
+		existsSync(ghState) ? JSON.parse(readFileSync(ghState, 'utf8')) : { prs: [], merges: [], calls: [] };
 	return {
 		tmp,
 		workDir: path.join(tmp, 'work'),
@@ -56,7 +78,24 @@ export async function setupTestEnv(): Promise<TestEnv> {
 			await rm(tmp, { recursive: true, force: true, maxRetries: 5 }).catch(() => undefined);
 		},
 		ghCalls: () => readState().calls,
-		ghPrs: () => readState().prs
+		ghPrs: () => readState().prs,
+		addGhPr(pr) {
+			const state = readState();
+			const number = state.prs.length + 1;
+			const full: GhPr = {
+				number,
+				base: 'main',
+				title: `PR ${number}`,
+				body: '',
+				url: `https://github.com/${pr.repo}/pull/${number}`,
+				state: 'OPEN',
+				autoMerge: false,
+				...pr
+			};
+			state.prs.push(full);
+			writeFileSync(ghState, JSON.stringify(state, null, 2));
+			return full;
+		}
 	};
 }
 
