@@ -117,11 +117,14 @@ Worktrees bleiben nach dem Lauf erhalten (Editor/Terminal „Lauf“), aufgeräu
 `WORK_DIR/projects/<projectId>/main`. Repo-Hooks sind für die git-Befehle des Runners abgeschaltet
 (`core.hooksPath` auf ein leeres Verzeichnis).
 
-**Branches aufräumen** (RPC `git.branch-delete`, Capability `branchCleanup`, nur mit git): Atrium schickt bis zu 50
-Branches, die nach dem PR nicht mehr gebraucht werden. Der Runner akzeptiert nur `aidev/…`-Branches mit gültigem Namen,
-nie den Haupt-Branch (sonst wird die ganze Anfrage abgelehnt). Vorhandene Branches ermittelt er per `ls-remote` (fehlende
-→ `missing`) und löscht sie mit einem Push (`--delete`). Schlägt dieser fehl, versucht er jeden Branch einzeln
-(→ `failed` mit gekürzter, bereinigter Meldung). Danach löscht er im Cache die lokalen Branches und
+**Branches aufräumen** (RPC `git.branch-delete`, Capability `branchCleanup`, nur mit git und gh): Atrium schickt bis zu
+50 Branches, die nach dem PR nicht mehr gebraucht werden, optional mit erwartetem Stand je Branch (`expect`). Der Runner
+akzeptiert nur `aidev/…`-Branches mit gültigem Namen, nie den Haupt-Branch (sonst wird die ganze Anfrage abgelehnt).
+Vorhandene Branches ermittelt er per `ls-remote` (fehlende → `missing`); weicht der Stand von `expect` ab, bleibt der
+Branch stehen (`kept`, `changed`). Danach fragt er alle offenen PRs live über gh ab (paginiert bis 1000, sonst Abbruch):
+Head-Branches aus demselben Repository und Basis-Branches offener PRs bleiben stehen (`kept`, `open-pr`), Fork-Heads
+zählen nicht. Den Rest löscht er mit einem Push (`--delete` mit `--force-with-lease` auf den gelesenen Stand). Schlägt
+dieser fehl, versucht er jeden Branch einzeln (→ `failed` mit gekürzter, bereinigter Meldung). Danach löscht er im Cache die lokalen Branches und
 `refs/remotes/origin/<b>`. Worktrees laufender Läufe bleiben unangetastet, andere Worktrees mit dem Branch werden auf
 „detached“ gestellt.
 

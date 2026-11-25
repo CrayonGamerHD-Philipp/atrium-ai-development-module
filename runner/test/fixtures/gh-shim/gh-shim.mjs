@@ -1,5 +1,5 @@
 // Kleiner Ersatz für die GitHub-CLI in Tests: simuliert `pr create|view|merge|list|comment`, `api …/pulls/<n>/comments`,
-// `repo view` und `--version`.
+// `repo view` und `--version`. `failList` im Zustand lässt `pr list` fehlschlagen.
 // Zustand in der JSON-Datei aus GH_SHIM_STATE.
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 
@@ -126,13 +126,25 @@ if (args[0] === 'pr' && args[1] === 'merge') {
 
 if (args[0] === 'pr' && args[1] === 'list') {
 	const repo = opt('--repo');
+	const wanted = (opt('--state') ?? 'open').toUpperCase();
+	const limit = Number(opt('--limit') ?? 30);
 	save();
+	if (state.failList) {
+		process.stderr.write('HTTP 502: Bad Gateway\n');
+		process.exit(1);
+	}
+	// wie gh: neueste zuerst, `--state` filtert, `--limit` begrenzt (gh paginiert intern bis dahin)
 	const list = state.prs
-		.filter((p) => p.repo === repo)
+		.filter((p) => p.repo === repo && (wanted === 'ALL' || p.state === wanted))
+		.sort((a, b) => b.number - a.number)
+		.slice(0, limit)
 		.map((p) => ({
 			number: p.number,
 			title: p.title,
 			headRefName: p.head,
+			headRefOid: p.headSha ?? null,
+			baseRefName: p.base,
+			isCrossRepository: p.isCrossRepository ?? false,
 			state: p.state,
 			isDraft: false,
 			mergeable: 'MERGEABLE',

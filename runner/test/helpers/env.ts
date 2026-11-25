@@ -23,6 +23,8 @@ export interface TestEnv {
 	ghPrs(): GhPr[];
 	/** PR im gh-Shim anlegen (z. B. geschlossen, aus einem Fork, mit Kommentaren) */
 	addGhPr(pr: Partial<GhPr> & { repo: string; head: string }): GhPr;
+	/** `gh pr list` fehlschlagen lassen */
+	setGhListFailure(fail: boolean): void;
 }
 
 export interface GhPr {
@@ -36,6 +38,8 @@ export interface GhPr {
 	state: 'OPEN' | 'CLOSED' | 'MERGED';
 	autoMerge: boolean;
 	isCrossRepository?: boolean;
+	/** Head-Commit (`headRefOid` in `gh pr list`) */
+	headSha?: string;
 	comments?: { author: { login: string }; body: string }[];
 	reviews?: { author: { login: string }; body: string; state: string }[];
 	inlineComments?: { path: string; line: number | null; body: string; user: { login: string } }[];
@@ -97,6 +101,11 @@ export async function setupTestEnv(): Promise<TestEnv> {
 			state.prs.push(full);
 			writeFileSync(ghState, JSON.stringify(state, null, 2));
 			return full;
+		},
+		setGhListFailure(fail) {
+			const state = readState();
+			state.failList = fail;
+			writeFileSync(ghState, JSON.stringify(state, null, 2));
 		}
 	};
 }

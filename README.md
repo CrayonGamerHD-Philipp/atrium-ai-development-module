@@ -167,10 +167,13 @@ es stehen. Worktrees räumt der Runner selbst auf (nach 48 h bzw. ab 30 Stück).
 Neue `aidev/`-Branches räumt Atrium **automatisch** auf: Nach jedem PR-Abgleich (auch im Job) löscht es bei gemergten
 PRs den PR-Branch sowie die Branches aller Teilaufträge und Läufe über den Runner-RPC `git.branch-delete` (höchstens
 `MAX_BRANCH_DELETE` pro Aufruf). Nur Runner mit der Capability `branchCleanup` bekommen diesen Aufruf. Der Haupt-Branch,
-Branches außerhalb von `aidev/` und Branches, die ein aktiver Auftrag, ein laufender Lauf oder ein offener PR noch nutzt,
-bleiben stehen; geschlossene, nicht gemergte PRs werden nicht angefasst. Ist alles gelöscht, setzt Atrium
-`pull_request.branch_deleted_at` und schreibt das Audit `aidev.branch.deleted`; sonst versucht es der nächste Abgleich
-erneut. `branches:prune` bleibt für Altlasten, also Branches von vor dieser Funktion oder ohne passenden Runner.
+Branches außerhalb von `aidev/` und Branches, die ein aktiver Auftrag (auch als Basis oder Integrations-Branch eines
+Vorfahren), ein laufender Lauf oder ein offener PR noch nutzt, bleiben stehen; offene PRs prüft der Runner zusätzlich live
+auf GitHub. PRs aus Forks (oder unbekannter Herkunft) und geschlossene, nicht gemergte PRs werden nicht angefasst; der
+PR-Branch wird nur auf dem gemergten Stand gelöscht. Während des Löschens sind die Branches reserviert
+(`branch_cleanup_claim`), der Scheduler vergibt sie dann weder als Branch noch als Basis. Ist alles erledigt, setzt
+Atrium `pull_request.branch_deleted_at` und schreibt das Audit `aidev.branch.deleted`; sonst stellt es den PR um
+15 Minuten zurück, damit blockierte PRs spätere nicht verdrängen. `branches:prune` bleibt für Altlasten, also Branches von vor dieser Funktion oder ohne passenden Runner.
 
 ## Installation in Atrium
 
