@@ -8,6 +8,7 @@
  * unter der Sperre der Branch-Vergabe, mit Rotation); SSE (Projekt, Runner) inkl.
  * RPC über den Stream.
  */
+import { createHash } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { sql } from 'drizzle-orm';
 import {
@@ -30,11 +31,14 @@ import {
 	type ApiResult
 } from '$testing';
 import aidevModule from '$modules/aidev/module';
+import { attachmentCleanup } from '$modules/aidev/jobs';
 import { closeAllLive } from '$modules/aidev/live';
 import { dispatch, startScheduler, whenDispatchIdle } from '$modules/aidev/scheduler.service';
 import type { RunOffer, RunnerCommand } from '$modules/aidev/protocol';
 import {
+	ATTACHMENT_MAX_BYTES,
 	DEFAULT_LIMITS,
+	type AttachmentDto,
 	DEFAULT_ROUTING,
 	type AccountDto,
 	type ChatMessageDto,
@@ -1878,5 +1882,254 @@ describe('aidev', () => {
 		// derselbe Stand erneut gesendet (Heartbeat) gilt nicht als neue Beobachtung
 		ok(await beat([{ key: 'fake-a', loggedIn: true, limits: future }]), 201);
 		expect((await fakeA()).limits!.observedAt).toBe(third.observedAt);
+	});
+
+	it('Anhänge: Upload, Grenzen, Verknüpfung, Rechte, Angebot, Runner-Download und Aufräumen', async () => {
+		const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4]);
+		const raw = async (who: string, method: string, path: string, body?: FormData) => {
+			const url = new URL(`http://localhost:5173/api/v1${M}${path}`);
+			return handleApiRequest({
+				request: new Request(url, {
+					method,
+					headers: { authorization: `Bearer ${keys[who]}` },
+					body
+				}),
+				url,
+				ip: '127.0.0.1'
+			});
+		};
+		const form = (bytes: Uint8Array, name: string, type: string) => {
+			const fd = new FormData();
+			fd.append('file', new File([bytes as Uint8Array<ArrayBuffer>], name, { type }));
+			return fd;
+		};
+		const upload = async (
+			bytes: Uint8Array,
+			name: string,
+			type: string,
+			who = 'admin',
+			pid = projectId
+		) => raw(who, 'POST', `/projects/${pid}/attachments`, form(bytes, name, type));
+		const uploaded = async (res: Response) => {
+			const body = (await res.json()) as { data: AttachmentDto };
+			expect(res.status, JSON.stringify(body)).toBe(201);
+			return body.data;
+		};
+		const text = (s: string) => new TextEncoder().encode(s);
+		const sha = (b: Uint8Array) => createHash('sha256').update(b).digest('hex');
+
+		// Upload: Name bereinigt, Größe und SHA-256 vom Server
+		const png = await uploaded(await upload(PNG, 'Bildschirmfoto 1.png', 'image/png'));
+		expect(png).toMatchObject({
+			name: 'Bildschirmfoto_1.png',
+			mime: 'image/png',
+			size: PNG.length
+		});
+		const [stored] = await q<{ sha256: string; uploaded_by: string }>(
+			sql`SELECT sha256, uploaded_by FROM attachment WHERE id = ${png.id}`
+		);
+		expect(stored!.sha256).toBe(sha(PNG));
+		const notes = await uploaded(
+			await upload(text('Hallo'), '../../etc/pass\u0007wörter.txt', 'text/plain')
+		);
+		expect(notes).toMatchObject({ name: 'passwoerter.txt', mime: 'text/plain' });
+		const longName = await uploaded(await upload(text('x'), `${'a'.repeat(300)}.md`, ''));
+		expect(longName.name.length).toBeLessThanOrEqual(120);
+		expect(longName.name.endsWith('.md')).toBe(true);
+		expect(longName.mime).toBe('application/octet-stream');
+		const svg = await uploaded(
+			await upload(text('<svg xmlns="http://www.w3.org/2000/svg"/>'), 'logo.svg', 'image/svg+xml')
+		);
+		expect(svg.mime).toBe('image/svg+xml');
+
+		// Grenzen und Fehler
+		expect((await upload(text('kein Bild'), 'fake.png', 'image/png')).status).toBe(422);
+		expect((await upload(new Uint8Array(0), 'leer.txt', 'text/plain')).status).toBe(422);
+		const big = new Uint8Array(ATTACHMENT_MAX_BYTES + 1);
+		expect((await upload(big, 'gross.bin', 'application/octet-stream')).status).toBe(413);
+		expect(
+			(await upload(PNG, 'a.png', 'image/png', 'admin', '00000000-0000-4000-8000-000000000000'))
+				.status
+		).toBe(404);
+		expect((await upload(PNG, 'a.png', 'image/png', 'viewer')).status).toBe(403);
+		const noFile = new FormData();
+		noFile.append('other', 'x');
+		expect((await raw('admin', 'POST', `/projects/${projectId}/attachments`, noFile)).status).toBe(
+			422
+		);
+
+		// Download: Bilder inline, SVG nie aktiv, immer nosniff; fremde unverknüpfte Uploads unsichtbar
+		const dl = await raw('admin', 'GET', `/attachments/${png.id}`);
+		expect(dl.status).toBe(200);
+		expect(dl.headers.get('content-type')).toBe('image/png');
+		expect(dl.headers.get('content-disposition')).toMatch(/^inline/);
+		expect(dl.headers.get('x-content-type-options')).toBe('nosniff');
+		expect(new Uint8Array(await dl.arrayBuffer())).toEqual(PNG);
+		const forced = await raw('admin', 'GET', `/attachments/${png.id}?download=true`);
+		expect(forced.headers.get('content-disposition')).toMatch(/^attachment/);
+		const svgRes = await raw('admin', 'GET', `/attachments/${svg.id}`);
+		expect(svgRes.headers.get('content-type')).toBe('application/octet-stream');
+		expect(svgRes.headers.get('content-disposition')).toMatch(/^attachment/);
+		expect(svgRes.headers.get('x-content-type-options')).toBe('nosniff');
+		const txtRes = await raw('admin', 'GET', `/attachments/${notes.id}`);
+		expect(txtRes.headers.get('content-disposition')).toMatch(/^attachment/);
+		expect((await raw('creator', 'GET', `/attachments/${png.id}`)).status).toBe(404);
+		expect((await raw('viewer', 'GET', `/attachments/${png.id}`)).status).toBe(403);
+
+		// Verknüpfung: fremder Upload, fremdes Projekt und unbekannte ID werden abgelehnt
+		const other = ok<ProjectDto>(
+			await call('admin', 'POST', '/projects', { name: 'Anhang-Fremd', repo: 'acme/anhang-fremd' }),
+			201
+		);
+		const foreignProject = await uploaded(
+			await upload(PNG, 'fremd.png', 'image/png', 'admin', other.id)
+		);
+		const creatorFile = await uploaded(
+			await upload(text('vom Creator'), 'c.txt', 'text/plain', 'creator')
+		);
+		for (const ids of [
+			[foreignProject.id],
+			[creatorFile.id],
+			['00000000-0000-4000-8000-000000000001']
+		]) {
+			const res = await call('admin', 'POST', `/projects/${projectId}/tasks`, {
+				prompt: 'Mit fremdem Anhang',
+				attachmentIds: ids
+			});
+			expect(res.status, JSON.stringify(ids)).toBe(422);
+		}
+		const tooMany = await call('admin', 'POST', `/projects/${projectId}/tasks`, {
+			prompt: 'Zu viele',
+			attachmentIds: Array.from({ length: 11 }, () => crypto.randomUUID())
+		});
+		expect(tooMany.status).toBe(422);
+		// abgelehnt → nichts verknüpft, nichts angelegt
+		expect(
+			await q(sql`SELECT 1 FROM task WHERE prompt IN ('Mit fremdem Anhang', 'Zu viele')`)
+		).toHaveLength(0);
+
+		const withFiles = await createTask({
+			prompt: 'Siehe Screenshot',
+			attachmentIds: [png.id, notes.id]
+		});
+		expect(withFiles.attachments!.map((a) => a.name)).toEqual([
+			'Bildschirmfoto_1.png',
+			'passwoerter.txt'
+		]);
+		expect(withFiles.attachments![0]).not.toHaveProperty('sha256');
+		// bereits verknüpft → nicht erneut verwendbar, nicht löschbar; verknüpft für alle mit Projektzugriff sichtbar
+		expect(
+			(
+				await call('admin', 'POST', `/projects/${projectId}/tasks`, {
+					prompt: 'Nochmal',
+					attachmentIds: [png.id]
+				})
+			).status
+		).toBe(422);
+		expect((await call('admin', 'DELETE', `/attachments/${png.id}`)).status).toBe(409);
+		expect((await raw('creator', 'GET', `/attachments/${png.id}`)).status).toBe(200);
+		// Löschen nur eigener, unverknüpfter Uploads
+		expect((await call('creator', 'DELETE', `/attachments/${longName.id}`)).status).toBe(404);
+		ok(await call('admin', 'DELETE', `/attachments/${longName.id}`));
+		expect(await q(sql`SELECT 1 FROM attachment WHERE id = ${longName.id}`)).toHaveLength(0);
+
+		// Teilaufträge sehen die Anhänge des Elternauftrags (Abfrage über die Kette, keine Kopie)
+		const childId = crypto.randomUUID();
+		await q(
+			sql`INSERT INTO task (id, project_id, parent_id, title, prompt, status)
+				VALUES (${childId}, ${projectId}, ${withFiles.id}, 'Teil', 'Teil', 'draft')`
+		);
+		expect((await task(childId)).task.attachments!.map((a) => a.id)).toEqual([png.id, notes.id]);
+		expect(await q(sql`SELECT 1 FROM task_attachment WHERE task_id = ${childId}`)).toHaveLength(0);
+		await q(sql`DELETE FROM task WHERE id = ${childId}`);
+
+		// Chat: Notiz mit Anhang, Verlauf liefert ihn; „Umsetzen“ sieht die Anhänge des Ursprungsauftrags
+		const noteFile = await uploaded(await upload(text('Notiz'), 'notiz.txt', 'text/plain'));
+		const note = ok<{ message: ChatMessageDto; task: TaskDto | null }>(
+			await call('admin', 'POST', `/projects/${projectId}/chat`, {
+				body: 'Nur zur Info',
+				mode: 'note',
+				attachmentIds: [noteFile.id]
+			}),
+			201
+		);
+		expect(note.task).toBeNull();
+		expect(note.message.attachments!.map((a) => a.id)).toEqual([noteFile.id]);
+		const history = ok<ChatMessageDto[]>(await call('admin', 'GET', `/projects/${projectId}/chat`));
+		expect(history.find((m) => m.id === note.message.id)!.attachments!.map((a) => a.id)).toEqual([
+			noteFile.id
+		]);
+		const agentMsg = crypto.randomUUID();
+		await q(
+			sql`INSERT INTO chat_message (id, project_id, task_id, kind, body)
+				VALUES (${agentMsg}, ${projectId}, ${withFiles.id}, 'agent', 'Vorschlag: Bild verkleinern')`
+		);
+		const extra = await uploaded(await upload(PNG, 'Bildschirmfoto 1.png', 'image/png'));
+		const implement = ok<{ message: ChatMessageDto; task: TaskDto }>(
+			await call('admin', 'POST', `/projects/${projectId}/chat`, {
+				body: 'Setze das um',
+				mode: 'task',
+				replyTo: agentMsg,
+				attachmentIds: [extra.id]
+			}),
+			201
+		);
+		expect(implement.message.attachments!.map((a) => a.id)).toEqual([extra.id]);
+		expect(implement.task.attachments!.map((a) => a.id)).toEqual([extra.id, png.id, notes.id]);
+
+		// Angebot nur an Runner mit `capabilities.attachments`
+		ok(await call('admin', 'POST', `/tasks/${implement.task.id}/cancel`), 201);
+		const pending = await offers();
+		expect(pending.map((o) => o.taskId)).not.toContain(withFiles.id);
+		// Angebote ohne Anhänge enthalten das Feld nicht
+		for (const o of pending) expect(o).not.toHaveProperty('attachments');
+		expect((await task(withFiles.id)).task.status).toBe('queued');
+		ok(await register('runner', ['fake-a', 'fake-b'], 4, { attachments: true }), 201);
+		try {
+			const offer = await offerFor(withFiles.id);
+			expect(offer.attachments).toEqual([
+				{
+					id: png.id,
+					name: 'Bildschirmfoto_1.png',
+					mime: 'image/png',
+					size: PNG.length,
+					sha256: sha(PNG)
+				},
+				{
+					id: notes.id,
+					name: 'passwoerter.txt',
+					mime: 'text/plain',
+					size: 5,
+					sha256: sha(text('Hallo'))
+				}
+			]);
+			expect(offer.prompt).toContain('.aidev/attachments/Bildschirmfoto_1.png');
+
+			// Runner-Download: nur der Runner des Laufs, nur Anhänge des Auftrags (bzw. seiner Kette)
+			const runPath = `/runner/runs/${offer.runId}/attachments`;
+			const got = await raw('runner', 'GET', `${runPath}/${png.id}`);
+			expect(got.status).toBe(200);
+			expect(got.headers.get('content-disposition')).toMatch(/^attachment/);
+			expect(sha(new Uint8Array(await got.arrayBuffer()))).toBe(sha(PNG));
+			expect((await raw('runner2', 'GET', `${runPath}/${png.id}`)).status).toBe(404);
+			expect((await raw('runner', 'GET', `${runPath}/${svg.id}`)).status).toBe(404);
+			expect((await raw('runner', 'GET', `${runPath}/${noteFile.id}`)).status).toBe(404);
+			// Key ohne angemeldeten Runner (Verwaltung mit allen Rechten) → unbekannt
+			expect((await raw('admin', 'GET', `${runPath}/${png.id}`)).status).toBe(404);
+		} finally {
+			ok(await call('admin', 'POST', `/tasks/${withFiles.id}/cancel`), 201);
+			ok(await register('runner', ['fake-a', 'fake-b']), 201);
+		}
+
+		// Aufräumen: unverknüpfte Uploads nach 24 h, verknüpfte bleiben
+		await q(sql`UPDATE attachment SET created_at = now() - interval '25 hours'`);
+		expect(await attachmentCleanup()).toMatch(/gelöscht/);
+		const left = (await q<{ id: string }>(sql`SELECT id FROM attachment`)).map((r) => r.id);
+		expect(left).toEqual(expect.arrayContaining([png.id, notes.id, noteFile.id, extra.id]));
+		expect(left).not.toContain(svg.id);
+		expect(left).not.toContain(creatorFile.id);
+		// Projekt löschen → Anhänge per CASCADE weg
+		await q(sql`DELETE FROM project WHERE id = ${other.id}`);
+		expect(await q(sql`SELECT 1 FROM attachment WHERE id = ${foreignProject.id}`)).toHaveLength(0);
 	});
 });

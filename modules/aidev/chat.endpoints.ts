@@ -15,6 +15,7 @@ import {
 	type RequestContext
 } from '$lib/sdk/server';
 import { describeChatAction, storedActionsOf, type ChatAction } from './actions';
+import { chatAttachmentsOf, linkAttachments, shareTaskAttachments } from './attachments.service';
 import { clip, jsonb, mdb, oneOf, type Row, type Tx } from './db';
 import { mergeEffects, newEffects, type Effects } from './effects';
 import { classifyChatIntent } from './intent';
@@ -117,6 +118,9 @@ async function applyChatAction(
 			})
 		);
 		await tx.execute(sql`UPDATE task SET chat_context = ${context} WHERE id = ${id}`);
+		// wie „Umsetzen“: der neue Auftrag sieht die Anhänge des Auftrags, aus dem der Vorschlag stammt
+		const origin = str(message.task_id);
+		if (origin) await shareTaskAttachments(tx, origin, id);
 		return id;
 	}
 	const task = await getTask(tx, action.taskId, true);
@@ -147,17 +151,22 @@ export const chatEndpoints: AnyApiEndpoint[] = [
 		params: idParams,
 		query: chatQuery,
 		handler: async ({ params, query }): Promise<ChatMessageDto[]> => {
-			const rows = await mdb().transaction(async (tx) => {
+			const { rows, files } = await mdb().transaction(async (tx) => {
 				await requireProject(tx, params.id);
-				return rowsOf(
+				const rows = await rowsOf(
 					tx,
 					sql`SELECT * FROM chat_message WHERE project_id = ${params.id}
 						${query.before ? sql`AND created_at < ${query.before}::timestamptz` : sql``}
 						ORDER BY created_at DESC, id DESC LIMIT ${query.limit}`
 				);
+				const files = await chatAttachmentsOf(
+					tx,
+					rows.map((r) => String(r.id))
+				);
+				return { rows, files };
 			});
 			const names = await userNames(rows.map((r) => r.author_user_id as string | null));
-			return rows.map((r) => chatDto(r, names));
+			return rows.map((r) => chatDto(r, names, files.get(String(r.id)) ?? []));
 		}
 	}),
 	defineEndpoint({
@@ -180,10 +189,11 @@ export const chatEndpoints: AnyApiEndpoint[] = [
 			// wirksamer Modus: `auto` wird regelbasiert zu `task` oder `question`
 			const mode = body.mode === 'auto' ? classifyChatIntent(body.body).mode : body.mode;
 			const fx = newEffects();
-			const { row, task } = await mdb().transaction(async (tx) => {
+			const { row, files, task } = await mdb().transaction(async (tx) => {
 				const project = await requireProject(tx, params.id);
 				// „Umsetzen“: Antwort eines Agents in diesem Projekt, auf die sich der Auftrag bezieht
 				let reference = '';
+				let originTaskId: string | null = null;
 				if (mode === 'task' && body.replyTo) {
 					const ref = await oneOf(
 						tx,
@@ -192,6 +202,7 @@ export const chatEndpoints: AnyApiEndpoint[] = [
 					);
 					if (!ref) throw errors.notFound('Nachricht nicht gefunden');
 					reference = await referencedContext(tx, ref);
+					originTaskId = str(ref.task_id);
 				}
 				let taskId: string | null = null;
 				if (mode === 'task' || mode === 'question') {
@@ -226,14 +237,24 @@ export const chatEndpoints: AnyApiEndpoint[] = [
 					body: body.body,
 					authorUserId: ctx.userId
 				});
+				// Anhänge gehören zur Nachricht und – bei Auftrag oder Frage – zum Auftrag (gleiche Transaktion)
+				await linkAttachments(tx, body.attachmentIds, {
+					projectId: params.id,
+					userId: ctx.userId,
+					taskId,
+					chatMessageId: id
+				});
+				// „Umsetzen“: der neue Auftrag sieht auch die Anhänge des Ursprungsauftrags
+				if (taskId && originTaskId) await shareTaskAttachments(tx, originTaskId, taskId);
 				return {
 					row: (await oneOf(tx, sql`SELECT * FROM chat_message WHERE id = ${id}`))!,
+					files: (await chatAttachmentsOf(tx, [id])).get(id) ?? [],
 					task: taskId ? await loadTaskDto(tx, taskId) : null
 				};
 			});
 			await publish(ctx, fx);
 			const names = await userNames([ctx.userId]);
-			return { message: chatDto(row, names), task, mode };
+			return { message: chatDto(row, names, files), task, mode };
 		}
 	}),
 	defineEndpoint({
@@ -252,7 +273,7 @@ export const chatEndpoints: AnyApiEndpoint[] = [
 			body
 		}): Promise<{ message: ChatMessageDto; task: TaskDto | null }> => {
 			const fx = newEffects();
-			const { row, task } = await mdb().transaction(async (tx) => {
+			const { row, files, task } = await mdb().transaction(async (tx) => {
 				const message = await oneOf(
 					tx,
 					sql`SELECT * FROM chat_message WHERE id = ${params.id} FOR UPDATE`
@@ -308,12 +329,13 @@ export const chatEndpoints: AnyApiEndpoint[] = [
 				fx.chat.add(String(message.id));
 				return {
 					row: (await oneOf(tx, sql`SELECT * FROM chat_message WHERE id = ${message.id}`))!,
+					files: (await chatAttachmentsOf(tx, [String(message.id)])).get(String(message.id)) ?? [],
 					task: taskId ? await loadTaskDto(tx, taskId) : null
 				};
 			});
 			await publish(ctx, fx);
 			const names = await userNames([str(row.author_user_id)]);
-			return { message: chatDto(row, names), task };
+			return { message: chatDto(row, names, files), task };
 		}
 	})
 ];

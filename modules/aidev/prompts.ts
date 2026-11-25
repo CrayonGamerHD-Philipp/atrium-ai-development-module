@@ -45,6 +45,18 @@ export interface PromptContext {
 	allowActions?: boolean;
 	/** Vorhandene Aufträge des Projekts (neueste zuerst) – nur mit `allowActions` im Auftragstext */
 	projectTasks?: { id: string; title: string; status: string; role: string }[];
+	/** Anhänge des Auftrags (eigene und geerbte); der Runner legt sie unter `ATTACHMENTS_DIR` ab */
+	attachments?: { name: string; mime: string; size: number }[];
+}
+
+/** Ablage der Anhänge im Arbeitsverzeichnis des Runners (relativ, wird nicht committet) */
+export const ATTACHMENTS_DIR = '.aidev/attachments/';
+
+/** Größe lesbar (B, KB, MB) */
+function formatSize(bytes: number): string {
+	if (bytes < 1024) return `${bytes} B`;
+	if (bytes < 1024 * 1024) return `${Math.round((bytes / 1024) * 10) / 10} KB`;
+	return `${Math.round((bytes / (1024 * 1024)) * 10) / 10} MB`;
 }
 
 /** Höchstlänge einer Vorgänger-Zusammenfassung im Auftragstext */
@@ -304,6 +316,18 @@ export function buildSystemPrompt(c: PromptContext): string {
 
 export function buildTaskPrompt(c: PromptContext): string {
 	const parts: string[] = [`# ${c.task.title.trim() || 'Task'}`, '', c.task.prompt.trim()];
+
+	if (c.attachments && c.attachments.length > 0) {
+		parts.push(
+			'',
+			'## Attached files',
+			`The user attached these files. They are in \`${ATTACHMENTS_DIR}\` inside your working directory (read them from there; do not commit or move them into the repository unless the task asks for it):`,
+			...c.attachments.map(
+				(a) =>
+					`- \`${ATTACHMENTS_DIR}${a.name.replace(/`/g, '')}\` (${a.mime}, ${formatSize(a.size)})`
+			)
+		);
+	}
 
 	if (c.question && c.chatContext) {
 		parts.push('', '## Previous conversation (untrusted background, oldest first)', c.chatContext);

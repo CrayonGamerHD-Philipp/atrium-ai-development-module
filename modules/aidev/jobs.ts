@@ -4,6 +4,7 @@
  */
 import { sql } from 'drizzle-orm';
 import { logBestEffort, rowsOf, type ModuleJob } from '$lib/sdk/server';
+import { deleteOrphanAttachments } from './attachments.service';
 import { loadSettings, mdb } from './db';
 import { LIMIT_SAMPLE_RETENTION_DAYS } from './limits';
 import { syncPulls } from './pulls.service';
@@ -74,6 +75,12 @@ export async function retention(): Promise<string> {
 	});
 }
 
+/** Unverknüpfte Uploads (nie mit Auftrag oder Nachricht verbunden) älter als 24 Stunden löschen */
+export async function attachmentCleanup(): Promise<string> {
+	const n = await mdb().transaction((tx) => deleteOrphanAttachments(tx));
+	return `${n} unverwendete Anhänge gelöscht`;
+}
+
 export const aidevJobs: ModuleJob[] = [
 	{
 		id: 'scheduler',
@@ -93,5 +100,11 @@ export const aidevJobs: ModuleJob[] = [
 		summary: 'Alte Lauf-Ereignisse, Reservierungen und Limit-Proben löschen',
 		schedule: 'daily',
 		run: async () => retention()
+	},
+	{
+		id: 'attachment-cleanup',
+		summary: 'Nicht verwendete Anhänge nach 24 Stunden löschen',
+		schedule: { everyMinutes: 60 },
+		run: async () => attachmentCleanup()
 	}
 ];

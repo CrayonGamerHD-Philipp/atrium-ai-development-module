@@ -5,7 +5,14 @@
  */
 import { sql } from 'drizzle-orm';
 import { z } from 'zod';
-import { type AnyApiEndpoint, defineEndpoint, errors, type RequestContext } from '$lib/sdk/server';
+import {
+	type AnyApiEndpoint,
+	defineEndpoint,
+	errors,
+	secureFileResponse,
+	type RequestContext
+} from '$lib/sdk/server';
+import { attachmentBytes, getAttachment, taskHasAttachment } from './attachments.service';
 import { loadSettings, mdb, oneOf, type Row, type Tx } from './db';
 import { newEffects, type Effects } from './effects';
 import { runnerHub, terminalEvent, terminalClosed, broadcastProject } from './live';
@@ -39,6 +46,7 @@ import { idParams, PERM, sidParams } from './schemas';
 const tags = ['Modul: aidev – Runner'];
 const permission = PERM.runnerConnect;
 const reqParams = z.object({ reqId: z.string().uuid() });
+const attachmentParams = z.object({ id: z.string().uuid(), aid: z.string().uuid() });
 const streamQuery = z.object({
 	client: z
 		.string()
@@ -248,6 +256,39 @@ export const runnerApiEndpoints: AnyApiEndpoint[] = [
 		body: finishInput,
 		handler: ({ ctx, params, body }) =>
 			asRunner(ctx, (tx, fx, runner) => finishRun(tx, fx, String(runner.id), params.id, body))
+	}),
+	defineEndpoint({
+		method: 'GET',
+		path: '/runner/runs/:id/attachments/:aid',
+		summary: 'Anhang eines Laufs herunterladen',
+		description:
+			'Bytes eines Anhangs aus `offer.attachments` (binär, `content-disposition: attachment`, `nosniff`). Nur für den Runner des angebotenen bzw. laufenden Laufs und nur Anhänge des Auftrags oder seiner Elternkette; sonst 404. Die Prüfsumme steht im Angebot (`sha256`).',
+		tags,
+		permission,
+		rateLimit: { limit: 600, windowSec: 60 },
+		params: attachmentParams,
+		handler: async ({ ctx, params }) => {
+			const { row, bytes } = await mdb().transaction(async (tx) => {
+				const runner = await requireRunner(tx, ctx);
+				const run = await oneOf(
+					tx,
+					sql`SELECT task_id FROM run WHERE id = ${params.id} AND runner_id = ${runner.id}
+						AND status IN ('offered', 'running')`
+				);
+				if (!run || !(await taskHasAttachment(tx, String(run.task_id), params.aid))) {
+					throw errors.notFound('Anhang nicht gefunden');
+				}
+				const row = (await getAttachment(tx, params.aid))!;
+				return { row, bytes: await attachmentBytes(tx, params.aid) };
+			});
+			return secureFileResponse(bytes, {
+				contentType: String(row.mime),
+				size: bytes.byteLength,
+				name: String(row.name),
+				download: true,
+				cache: 'no-store'
+			});
+		}
 	}),
 	defineEndpoint({
 		method: 'POST',

@@ -2,8 +2,9 @@
 import { num, str, toIso, toIsoOrNull, type Row } from '$lib/sdk/server';
 import { storedActionsOf } from './actions';
 import { jsonOf, stringList } from './db';
-import type { CommitPolicy, Provider, Role } from './protocol';
+import type { AttachmentOffer, CommitPolicy, Provider, Role } from './protocol';
 import type {
+	AttachmentDto,
 	AccountDto,
 	AccountLimitsDto,
 	ChatMessageDto,
@@ -96,7 +97,12 @@ export function runDto(r: Row, commits: CommitDto[]): RunDto {
 	};
 }
 
-export function taskDto(r: Row, dependsOn: string[], lastRun: RunSummaryDto | null): TaskDto {
+export function taskDto(
+	r: Row,
+	dependsOn: string[],
+	lastRun: RunSummaryDto | null,
+	attachments: AttachmentDto[] = []
+): TaskDto {
 	return {
 		id: String(r.id),
 		delivery: r.delivery === 'branch' ? 'branch' : 'project',
@@ -119,6 +125,7 @@ export function taskDto(r: Row, dependsOn: string[], lastRun: RunSummaryDto | nu
 		prNumber: r.pr_number === null || r.pr_number === undefined ? null : num(r.pr_number),
 		prUrl: str(r.pr_url),
 		dependsOn,
+		attachments,
 		createdBy: str(r.created_by),
 		createdAt: toIso(r.created_at),
 		updatedAt: toIso(r.updated_at),
@@ -197,7 +204,11 @@ export function prDto(r: Row): PullRequestDto {
 	};
 }
 
-export function chatDto(r: Row, names: ReadonlyMap<string, string>): ChatMessageDto {
+export function chatDto(
+	r: Row,
+	names: ReadonlyMap<string, string>,
+	attachments: AttachmentDto[] = []
+): ChatMessageDto {
 	const authorId = str(r.author_user_id);
 	return {
 		id: String(r.id),
@@ -207,6 +218,29 @@ export function chatDto(r: Row, names: ReadonlyMap<string, string>): ChatMessage
 		body: String(r.body),
 		author: authorId ? { id: authorId, name: names.get(authorId) ?? 'Unbekannt' } : null,
 		createdAt: toIso(r.created_at),
+		attachments,
 		actions: storedActionsOf(r.actions).map((a, index) => ({ ...a, index }))
+	};
+}
+
+/** Anhang ohne Bytes (Spalten aus `attachment`) */
+export function attachmentDto(r: Row): AttachmentDto {
+	return {
+		id: String(r.id),
+		name: String(r.name),
+		mime: String(r.mime),
+		size: num(r.size),
+		createdAt: toIso(r.created_at)
+	};
+}
+
+/** Anhang als Angebotsmetadaten für den Runner */
+export function attachmentOffer(r: Row): AttachmentOffer {
+	return {
+		id: String(r.id),
+		name: String(r.name),
+		mime: String(r.mime),
+		size: num(r.size),
+		sha256: String(r.sha256)
 	};
 }

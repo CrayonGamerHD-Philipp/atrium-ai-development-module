@@ -28,7 +28,9 @@ import {
 	type AidevSettings,
 	type Tx
 } from './db';
+import { effectiveAttachmentRows, uniqueAttachmentNames } from './attachments.service';
 import { newEffects, sendCommand, type Effects } from './effects';
+import { attachmentOffer } from './mappers';
 import { buildSystemPrompt, buildTaskPrompt, slugify, type PromptContext } from './prompts';
 import {
 	READ_ONLY_ROLES,
@@ -226,6 +228,15 @@ export async function buildOffer(
 	if (!task || !project || !account) return null;
 	const role = effectiveRole(task);
 	const ctx = await promptContext(tx, task, project, role);
+	// eigene und geerbte Anhänge (Elternkette); der Runner lädt die Bytes über `/runner/runs/:id/attachments/:aid`
+	const files = uniqueAttachmentNames(
+		(await effectiveAttachmentRows(tx, [String(task.id)])).get(String(task.id)) ?? []
+	);
+	ctx.attachments = files.map((f) => ({
+		name: String(f.name),
+		mime: String(f.mime),
+		size: num(f.size)
+	}));
 	const plan = await branchPlan(tx, task, project);
 	ctx.delivery = await deliveryOf(tx, task, project);
 	const sessionAccount = str(task.session_account_id);
@@ -257,6 +268,8 @@ export async function buildOffer(
 			!ctx.question && sessionAccount && sessionAccount === str(run.account_id)
 				? str(task.session_id)
 				: null,
+		// ältere Angebote ohne Anhänge enthalten das Feld nicht
+		...(files.length ? { attachments: files.map(attachmentOffer) } : {}),
 		delivery: ctx.delivery,
 		leaseSec: LEASE_SEC,
 		timeoutSec: settings.limits.runTimeoutMin * 60
@@ -340,7 +353,8 @@ async function dispatchIn(tx: Tx, fx: Effects, settings: AidevSettings): Promise
 		tx,
 		sql`SELECT id, capabilities->>'question' = 'true' AS question,
 				capabilities->>'branchDelivery' = 'true' AS branch,
-				capabilities->>'prUpdate' = 'true' AS pr_update FROM runner`
+				capabilities->>'prUpdate' = 'true' AS pr_update,
+				capabilities->>'attachments' = 'true' AS attachments FROM runner`
 	);
 	const runnersWith = (key: string) =>
 		new Set(runnerCaps.filter((r) => r[key] === true).map((r) => String(r.id)));
@@ -348,6 +362,18 @@ async function dispatchIn(tx: Tx, fx: Effects, settings: AidevSettings): Promise
 	// Auslieferungsarten, die nicht jeder Runner kennt (gemischte Runner-Versionen beim Upgrade)
 	const branchRunners = runnersWith('branch');
 	const prRunners = runnersWith('pr_update');
+	// Aufträge mit (eigenen oder geerbten) Anhängen nur an Runner, die Anhänge bereitstellen können
+	const attachmentRunners = runnersWith('attachments');
+	const withFiles = new Set(
+		[
+			...(await effectiveAttachmentRows(
+				tx,
+				rows.map((r) => String(r.id))
+			))
+		]
+			.filter(([, list]) => list.length > 0)
+			.map(([id]) => id)
+	);
 	const capsFor = (d: Delivery): Set<string> | null => {
 		if (d.mode === 'branch') return branchRunners;
 		if (d.mode === 'pr-update') return prRunners;
@@ -394,7 +420,8 @@ async function dispatchIn(tx: Tx, fx: Effects, settings: AidevSettings): Promise
 		excludedAccountIds: [
 			...stringList(r.excluded_account_ids),
 			...(r.chat_question === true ? without(questionRunners) : []),
-			...without(restricted.get(String(r.id)) ?? null)
+			...without(restricted.get(String(r.id)) ?? null),
+			...(withFiles.has(String(r.id)) ? without(attachmentRunners) : [])
 		],
 		sessionAccountId: str(r.session_account_id),
 		estimatedUnits: settings.limits.estimatedUnitsPerRun

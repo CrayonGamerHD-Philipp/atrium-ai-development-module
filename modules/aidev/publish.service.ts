@@ -4,6 +4,7 @@
  */
 import { sql } from 'drizzle-orm';
 import { bestEffort, core, inList, rowsOf, type RequestContext } from '$lib/sdk/server';
+import { chatAttachmentsOf } from './attachments.service';
 import { mdb } from './db';
 import type { Effects } from './effects';
 import {
@@ -47,6 +48,7 @@ async function liveEvents(fx: Effects): Promise<void> {
 					sql`SELECT * FROM chat_message WHERE id IN (${inList([...fx.chat])}) ORDER BY created_at, id`
 				)
 			: [],
+		chatFiles: await chatAttachmentsOf(tx, [...fx.chat]),
 		pulls: pullKeys.length
 			? await rowsOf(
 					tx,
@@ -69,7 +71,10 @@ async function liveEvents(fx: Effects): Promise<void> {
 	if (data.chat.length) {
 		const names = await userNames(data.chat.map((m) => m.author_user_id as string | null));
 		for (const m of data.chat) {
-			broadcastProject(String(m.project_id), { type: 'chat', message: chatDto(m, names) });
+			broadcastProject(String(m.project_id), {
+				type: 'chat',
+				message: chatDto(m, names, data.chatFiles.get(String(m.id)) ?? [])
+			});
 		}
 	}
 }

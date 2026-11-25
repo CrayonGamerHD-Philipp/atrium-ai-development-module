@@ -1,8 +1,10 @@
 /** Lesende Abfragen, die DTOs zusammensetzen (Aufträge, Läufe, Projekte, Pull Requests, Chat). Nur Datenbank. */
 import { sql, type SQL } from 'drizzle-orm';
 import { inList, num, rowsOf, type Row } from '$lib/sdk/server';
+import { chatAttachmentsOf, taskAttachmentsOf } from './attachments.service';
 import { oneOf, type Tx } from './db';
 import {
+	chatDto,
 	commitDto,
 	EMPTY_COUNTS,
 	prDto,
@@ -13,6 +15,7 @@ import {
 	type ProjectCounts
 } from './mappers';
 import type {
+	ChatMessageDto,
 	ProjectDto,
 	PullRequestDto,
 	RunDto,
@@ -120,13 +123,17 @@ async function depsOf(tx: Tx, taskIds: string[]): Promise<Map<string, string[]>>
 	return map;
 }
 
-/** Aufträge zu Zeilen (Abhängigkeiten, letzter Lauf) */
+/** Aufträge zu Zeilen (Abhängigkeiten, letzter Lauf, wirksame Anhänge) */
 export async function taskDtosOf(tx: Tx, rows: Row[]): Promise<TaskDto[]> {
 	const ids = rows.map((r) => String(r.id));
-	const [deps, runs] = [await depsOf(tx, ids), await lastRunsOf(tx, ids)];
+	const [deps, runs, files] = [
+		await depsOf(tx, ids),
+		await lastRunsOf(tx, ids),
+		await taskAttachmentsOf(tx, ids)
+	];
 	return rows.map((r) => {
 		const id = String(r.id);
-		return taskDto(r, deps.get(id) ?? [], runs.get(id) ?? null);
+		return taskDto(r, deps.get(id) ?? [], runs.get(id) ?? null, files.get(id) ?? []);
 	});
 }
 
@@ -197,4 +204,19 @@ export async function loadPullDtos(tx: Tx, projectId: string): Promise<PullReque
 			ORDER BY (state = 'open') DESC, updated_at DESC, number DESC`
 	);
 	return rows.map(prDto);
+}
+
+// ---------------------------------------------------------------- Chat
+
+/** Chatnachrichten zu DTOs (Autorennamen vorher außerhalb der Transaktion laden) */
+export async function chatDtosOf(
+	tx: Tx,
+	rows: Row[],
+	names: ReadonlyMap<string, string>
+): Promise<ChatMessageDto[]> {
+	const files = await chatAttachmentsOf(
+		tx,
+		rows.map((r) => String(r.id))
+	);
+	return rows.map((r) => chatDto(r, names, files.get(String(r.id)) ?? []));
 }
