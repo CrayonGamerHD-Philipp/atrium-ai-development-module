@@ -18,6 +18,7 @@
 	import type { AccountDto, RunnerDto } from '../schemas';
 	import { BASE, clearCooldown, deleteRunner, listRunners, updateRunner } from './api';
 	import AccountDialog from './admin/AccountDialog.svelte';
+	import AccountLimits from './components/AccountLimits.svelte';
 	import ProviderBadge from './components/ProviderBadge.svelte';
 	import TimeAgo from './components/TimeAgo.svelte';
 	import UsageBar from './components/UsageBar.svelte';
@@ -335,6 +336,12 @@
 												>
 											</div>
 										{/if}
+										<div
+											class="min-w-0 rounded-md border bg-muted/30 p-2.5 sm:col-span-2 lg:col-span-4"
+										>
+											<h4 class="mb-2 text-xs font-medium">Limits laut Anbieter</h4>
+											<AccountLimits limits={a.limits} suggestion />
+										</div>
 									</li>
 								{/each}
 							</ul>
