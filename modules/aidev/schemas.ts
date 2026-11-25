@@ -677,6 +677,8 @@ export type TerminalLiveEvent =
  * | POST | /projects/:id/check | project.manage | – | { ok, message, defaultBranch, canPush, branches } (über Runner) |
  * | GET | /projects/:id/live | project.view | liveQuery | SSE ProjectLiveEvent |
  * | POST | /projects/:id/attachments | task.create | Multipart: eine Datei `file` | AttachmentDto (201) |
+ * | GET | /attachments/:id | project.view | ?download=true | Datei (binär, nosniff; inline nur Rasterbilder) |
+ * | DELETE | /attachments/:id | task.create | – | { ok } (nur eigener, unverknüpfter Upload) |
  * | GET | /projects/:id/tasks | project.view | tasksQuery | TaskDto[] |
  * | POST | /projects/:id/tasks | task.create | taskInput | TaskDto |
  * | GET | /tasks/:id | project.view | – | TaskDetailDto |

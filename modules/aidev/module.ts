@@ -1,6 +1,7 @@
 import { defineModule, manifestFromPackage } from '$lib/sdk/server';
 import pkg from './atrium-module.json';
 import { adminEndpoints } from './admin.endpoints';
+import { attachmentEndpoints } from './attachments.endpoints';
 import { chatEndpoints } from './chat.endpoints';
 import { aidevJobs } from './jobs';
 import { closeAllLive } from './live';
@@ -128,6 +129,7 @@ export default defineModule({
 		...runnerApiEndpoints,
 		...adminEndpoints,
 		...projectEndpoints,
+		...attachmentEndpoints,
 		...taskEndpoints,
 		...chatEndpoints,
 		...pullEndpoints,
