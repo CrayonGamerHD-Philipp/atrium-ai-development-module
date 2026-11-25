@@ -138,8 +138,17 @@
 	const canWorkspace = $derived(has(PERM.files) || has(PERM.terminal));
 	const isFinal = $derived(!!task && FINAL_TASK_STATUSES.includes(task.status));
 
-	/** Zustände, aus denen ein Auftrag (oder Teilauftrag) manuell neu gestartet werden kann */
-	const RESTARTABLE: readonly string[] = ['failed', 'cancelled', 'needs-input', 'done', 'review'];
+	/** Zustände, aus denen ein Auftrag (oder Teilauftrag) manuell neu gestartet werden kann; bei `queued`/`blocked`
+	 * bricht das Backend dabei einen hängenden Lauf ab. `running` und `draft` bleiben ausgenommen. */
+	const RESTARTABLE: readonly string[] = [
+		'failed',
+		'cancelled',
+		'needs-input',
+		'done',
+		'review',
+		'queued',
+		'blocked'
+	];
 	/** Orchestrierung → im Neustart-Dialog die Option für erledigte Teilaufträge anbieten */
 	const orchestrated = $derived(task?.role === 'orchestrate' || !!detail?.children.length);
 

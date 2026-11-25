@@ -37,6 +37,8 @@
 	});
 
 	const onBranch = $derived(status === 'done' || status === 'review');
+	// Wartende/blockierte Aufträge hängen evtl. an einem Lauf fest, den das Backend vorher abbricht
+	const waiting = $derived(status === 'queued' || status === 'blocked');
 
 	async function confirm() {
 		const subtasks = includeDone ? 'all' : 'failed';
@@ -53,6 +55,9 @@
 				Der Auftrag wird mit zurückgesetzten Versuchen neu eingeplant.
 				{#if onBranch}
 					Der Agent arbeitet erneut auf dem bestehenden Branch.
+				{/if}
+				{#if waiting}
+					Ein hängender Lauf dieses Auftrags wird dabei abgebrochen.
 				{/if}
 			</AlertDialogDescription>
 		</AlertDialogHeader>
