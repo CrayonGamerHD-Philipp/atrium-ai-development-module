@@ -70,6 +70,7 @@
 	import Markdown from './components/Markdown.svelte';
 	import DiffView from './task/DiffView.svelte';
 	import RunLog from './task/RunLog.svelte';
+	import RestartDialog from './task/RestartDialog.svelte';
 	import TaskEditDialog from './task/TaskEditDialog.svelte';
 
 	let { params }: ModulePageProps = $props();
@@ -101,6 +102,7 @@
 	let editOpen = $state(false);
 	let deleteOpen = $state(false);
 	let cancelOpen = $state(false);
+	let restartOpen = $state(false);
 	let now = $state(Date.now());
 	// Prompt in der Seitenleiste: ab lg (zweispaltig) anfangs aufgeklappt, mobil eingeklappt
 	let promptOpen = $state(
@@ -136,12 +138,17 @@
 	const canWorkspace = $derived(has(PERM.files) || has(PERM.terminal));
 	const isFinal = $derived(!!task && FINAL_TASK_STATUSES.includes(task.status));
 
+	/** Zustände, aus denen ein Auftrag (oder Teilauftrag) manuell neu gestartet werden kann */
+	const RESTARTABLE: readonly string[] = ['failed', 'cancelled', 'needs-input', 'done', 'review'];
+	/** Orchestrierung → im Neustart-Dialog die Option für erledigte Teilaufträge anbieten */
+	const orchestrated = $derived(task?.role === 'orchestrate' || !!detail?.children.length);
+
 	const actions = $derived.by(() => {
 		const s = task?.status;
 		return {
 			queue: canAct && s === 'draft',
 			cancel: canAct && !!s && ['queued', 'blocked', 'running', 'needs-input'].includes(s),
-			retry: canAct && !!s && ['failed', 'cancelled'].includes(s),
+			retry: canAct && !!s && RESTARTABLE.includes(s),
 			edit: canAct && !!s && ['draft', 'queued'].includes(s),
 			reply: canCreate && !!s && ['needs-input', 'failed'].includes(s),
 			remove: canManage && !!s && (isFinal || s === 'draft')
@@ -478,8 +485,11 @@
 				{/if}
 				{#if actions.retry}
 					<Button
-						onclick={() => run('retry', () => retryTask(task.id), 'Neuer Versuch eingeplant')}
-						disabled={!!busy}><RotateCcw /> Wiederholen</Button
+						variant={task.status === 'failed' || task.status === 'cancelled'
+							? 'default'
+							: 'outline'}
+						onclick={() => (restartOpen = true)}
+						disabled={!!busy}><RotateCcw /> Neu starten</Button
 					>
 				{/if}
 				{#if actions.edit}
@@ -765,6 +775,23 @@
 										<span class="text-xs text-muted-foreground">{roleLabel(c.role)}</span>
 										{#if c.lastRun}<ProviderBadge provider={c.lastRun.provider} />{/if}
 										<StatusBadge status={c.status} />
+										{#if canAct && RESTARTABLE.includes(c.status)}
+											<Button
+												size="icon-xs"
+												class="pointer-coarse:size-10"
+												variant="ghost"
+												onclick={() =>
+													// Antwort verwerfen: `run` würde sonst den Elternauftrag durch den Teilauftrag ersetzen
+													run(
+														`retry:${c.id}`,
+														async () => void (await retryTask(c.id)),
+														'Teilauftrag neu gestartet'
+													)}
+												disabled={!!busy}
+												aria-label="Teilauftrag neu starten"
+												title="Neu starten"><RotateCcw /></Button
+											>
+										{/if}
 									</li>
 								{/each}
 							</ul>
@@ -845,6 +872,13 @@
 		cancelLabel="Weiterlaufen lassen"
 		destructive
 		onconfirm={() => run('cancel', () => cancelTask(task.id), 'Auftrag abgebrochen')}
+	/>
+	<RestartDialog
+		bind:open={restartOpen}
+		status={task.status}
+		{orchestrated}
+		onconfirm={(subtasks) =>
+			run('retry', () => retryTask(task.id, { subtasks }), 'Auftrag neu gestartet')}
 	/>
 	<ConfirmDialog
 		bind:open={deleteOpen}
