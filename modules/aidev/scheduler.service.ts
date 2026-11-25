@@ -155,6 +155,21 @@ async function promptContext(tx: Tx, task: Row, project: Row, role: Role): Promi
 	);
 	const parent = task.parent_id ? await getTask(tx, String(task.parent_id)) : null;
 	const readOnly = READ_ONLY_ROLES.includes(role);
+	// Aktionsvorschläge nur für Chat-Fragen und eigenständige Arbeitsaufträge (keine Teilaufträge, keine Orchestrierung)
+	const allowActions =
+		task.chat_question === true ||
+		(!task.parent_id &&
+			(['research', 'implement', 'review', 'fix'] as Role[]).includes(role) &&
+			!planOf(task));
+	// das Schema kennt kein Löschen/Archivieren von Aufträgen; Chat-Fragen sind keine änderbaren Aufträge
+	const projectTasks = allowActions
+		? await rowsOf(
+				tx,
+				sql`SELECT id, title, status, role FROM task
+					WHERE project_id = ${task.project_id} AND id <> ${task.id} AND chat_question = false
+					ORDER BY created_at DESC, id DESC LIMIT 30`
+			)
+		: [];
 	return {
 		role,
 		question: task.chat_question === true,
@@ -186,7 +201,14 @@ async function promptContext(tx: Tx, task: Row, project: Row, role: Role): Promi
 		replies: replies.map((r) => String(r.body)),
 		parent: parent ? { title: String(parent.title), prompt: String(parent.prompt) } : null,
 		conflictFiles: resolveInfoOf(task)?.conflictFiles ?? [],
-		previousError: str(task.error_message)
+		previousError: str(task.error_message),
+		allowActions,
+		projectTasks: projectTasks.map((r) => ({
+			id: String(r.id),
+			title: String(r.title),
+			status: String(r.status),
+			role: String(r.role)
+		}))
 	};
 }
 
