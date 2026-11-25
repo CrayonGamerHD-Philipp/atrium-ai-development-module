@@ -237,7 +237,7 @@ export const chatInput = z.object({
 	delivery: taskDeliverySchema.default('project'),
 	body: z.string().trim().min(1).max(20_000),
 	/** `task` = Nachricht wird ein Auftrag, `note` = nur Notiz im Verlauf */
-	mode: z.enum(['task', 'note']).default('task'),
+	mode: z.enum(['task', 'note', 'question']).default('task'),
 	role: roleSchema.default('implement'),
 	decompose: z.boolean().default(false),
 	providerHint: providerSchema.nullable().default(null)

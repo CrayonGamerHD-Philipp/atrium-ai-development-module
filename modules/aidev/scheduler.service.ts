@@ -123,6 +123,8 @@ async function promptContext(tx: Tx, task: Row, project: Row, role: Role): Promi
 	const readOnly = READ_ONLY_ROLES.includes(role);
 	return {
 		role,
+		question: task.chat_question === true,
+		chatContext: String(task.chat_context ?? ''),
 		project: {
 			name: String(project.name),
 			repoOwner: String(project.repo_owner),
@@ -192,9 +194,12 @@ export async function buildOffer(
 		branch: str(run.branch) ?? plan.branch,
 		baseRef: plan.baseRef,
 		readOnly: ctx.readOnly,
+		question: ctx.question,
 		expectPlan: ctx.expectPlan,
 		resumeSessionId:
-			sessionAccount && sessionAccount === str(run.account_id) ? str(task.session_id) : null,
+			!ctx.question && sessionAccount && sessionAccount === str(run.account_id)
+				? str(task.session_id)
+				: null,
 		delivery: ctx.delivery,
 		leaseSec: LEASE_SEC,
 		timeoutSec: settings.limits.runTimeoutMin * 60
@@ -265,6 +270,11 @@ async function dispatchIn(tx: Tx, fx: Effects, settings: AidevSettings): Promise
 	const now = Date.now();
 	const accounts = await loadAccountViews(tx, now);
 	if (!accounts.length) return 0;
+	const questionRunners = new Set(
+		(await rowsOf(tx, sql`SELECT id FROM runner WHERE capabilities->>'question' = 'true'`)).map(
+			(r) => String(r.id)
+		)
+	);
 	const byId = new Map(rows.map((r) => [String(r.id), r]));
 	const tasks: TaskCandidate[] = rows.map((r) => ({
 		id: String(r.id),
@@ -274,7 +284,12 @@ async function dispatchIn(tx: Tx, fx: Effects, settings: AidevSettings): Promise
 		createdAt: ms(r.created_at),
 		requiredContextK: num(r.required_context_k),
 		providerHint: (str(r.provider_hint) as Provider | null) ?? null,
-		excludedAccountIds: stringList(r.excluded_account_ids),
+		excludedAccountIds: [
+			...stringList(r.excluded_account_ids),
+			...(r.chat_question === true
+				? accounts.filter((a) => !questionRunners.has(a.state.runnerId)).map((a) => a.state.id)
+				: [])
+		],
 		sessionAccountId: str(r.session_account_id),
 		estimatedUnits: settings.limits.estimatedUnitsPerRun
 	}));

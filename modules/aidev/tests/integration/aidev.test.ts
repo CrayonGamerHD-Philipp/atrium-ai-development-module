@@ -87,7 +87,7 @@ const register = (who: string, accounts: string[]) =>
 			name: `Runner ${who}`,
 			version: '0.1.0',
 			maxSlots: 4,
-			capabilities: { git: true, gh: true, pty: true, os: 'linux' },
+			capabilities: { question: true, git: true, gh: true, pty: true, os: 'linux' },
 			accounts: accounts.map((key) => ({
 				key,
 				provider: 'fake',
@@ -683,6 +683,54 @@ describe('aidev', () => {
 		expect((await call('creator', 'DELETE', `/tasks/${foreignTask.id}`)).status).toBe(403);
 		ok(await call('admin', 'DELETE', `/tasks/${foreignTask.id}`));
 		expect((await call('admin', 'GET', `/tasks/${foreignTask.id}`)).status).toBe(404);
+	});
+
+	it('Chat-Fragen liefern Antworten und übernehmen nur früheren Fragenkontext', async () => {
+		const note = ok<{ task: TaskDto | null }>(
+			await call('admin', 'POST', `/projects/${projectId}/chat`, {
+				body: 'Geheime Notiz',
+				mode: 'note'
+			}),
+			201
+		);
+		expect(note.task).toBeNull();
+		const first = ok<{ task: TaskDto }>(
+			await call('admin', 'POST', `/projects/${projectId}/chat`, {
+				body: 'Wie funktioniert das?',
+				mode: 'question',
+				role: 'implement',
+				decompose: true
+			}),
+			201
+		);
+		expect(first.task.role).toBe('research');
+		const offer = await offerFor(first.task.id);
+		expect(offer).toMatchObject({ question: true, readOnly: true, expectPlan: false });
+		ok(await call('runner', 'POST', `/runner/runs/${offer.runId}/accept`), 201);
+		const answer = 'Antwort '.repeat(900).trim();
+		ok(await finish(offer.runId, { status: 'succeeded', summary: answer }), 201);
+		ok(await finish(offer.runId, { status: 'succeeded', summary: answer }), 201);
+		const chat = ok<ChatMessageDto[]>(await call('admin', 'GET', `/projects/${projectId}/chat`));
+		expect(chat.filter((m) => m.taskId === first.task.id && m.kind === 'agent')).toHaveLength(1);
+		expect(chat.find((m) => m.taskId === first.task.id && m.kind === 'agent')?.body).toBe(answer);
+		const second = ok<{ task: TaskDto }>(
+			await call('admin', 'POST', `/projects/${projectId}/chat`, {
+				body: 'Und warum?',
+				mode: 'question'
+			}),
+			201
+		);
+		const next = await offerFor(second.task.id);
+		expect(next.prompt).toContain('Wie funktioniert das?');
+		expect(next.prompt).toContain('Antwort');
+		expect(next.prompt).not.toContain('Geheime Notiz');
+		ok(await call('runner', 'POST', `/runner/runs/${next.runId}/accept`), 201);
+		ok(await call('admin', 'PATCH', `/tasks/${second.task.id}`, { maxAttempts: 1 }));
+		ok(await finish(next.runId, { status: 'succeeded', summary: '' }), 201);
+		const after = ok<ChatMessageDto[]>(await call('admin', 'GET', `/projects/${projectId}/chat`));
+		expect(after.find((m) => m.taskId === second.task.id && m.kind === 'agent')?.body).toContain(
+			'keine Antwort'
+		);
 	});
 
 	it('Chat im Modus „task“ legt einen Auftrag an', async () => {
