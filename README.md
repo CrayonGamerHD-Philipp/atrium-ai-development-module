@@ -23,7 +23,8 @@ Browser ──REST + SSE──▶ Atrium (Modul aidev: Projekte, Warteschlange, 
 ```
 
 - **`modules/aidev/`** ist das Atrium-Modul, die Steuerzentrale. Es enthält Datenbank, Endpunkte, Scheduler (`scheduler.ts`),
-  Auftragstexte (`prompts.ts`) und die Oberfläche (`pages/`, `ui.ts`). Das Protokoll zum Runner steht in `protocol.ts`.
+  Auftragstexte (`prompts.ts`), Aktionsvorschläge der Agents (`actions.ts`) und die Oberfläche (`pages/`, `ui.ts`). Das
+  Protokoll zum Runner steht in `protocol.ts`.
 - **`runner/`** ist ein eigenständiger Dienst (Docker), auf dem die Agents mit deinen Abo-Logins laufen. Es können mehrere
   Runner sein, auf Servern oder deinem PC. Einrichtung: [`runner/README.md`](runner/README.md).
 - Atrium selbst braucht weder git noch Agent-CLIs. Der Container bleibt gehärtet.
@@ -235,3 +236,21 @@ zählen nicht. Ohne eindeutige Merkmale entsteht ein Auftrag. Der Modus lässt s
 „Auftrag“, „Frage“ oder „Notiz“ übersteuern. Über die API gilt ohne `mode` weiterhin `mode: "task"`;
 `mode: "auto"` muss ausdrücklich gesetzt werden. Die Antwort von `POST /projects/:id/chat` enthält neben
 `message` und `task` den wirksamen Modus `mode` (`task`, `question` oder `note`).
+
+#### Vom Chat zur Umsetzung
+
+Typischer Ablauf: Du stellst eine **Frage**, ein lesender Agent antwortet, und unter der Antwort steht der Knopf
+**„Umsetzen“**. Er stellt die Eingabe auf „Auftrag“, schlägt den Text „Setze den Vorschlag aus dieser Antwort um.“
+vor und zeigt den Bezug als entfernbaren Chip („Bezug: Antwort von 14:05“). Beim Senden geht die Antwort als
+`replyTo` mit; der neue Auftrag erhält Frage und Antwort als Kontext (gekürzt, zusätzlich zum bisherigen Verlauf).
+Kurze Folgebefehle wie „Mach das“, „Los geht's“ oder „Do it“ erkennt der Auto-Modus ebenfalls als Auftrag.
+
+**Vorschläge der Agents:** Agents dürfen am Ende einer Antwort Plattformaktionen vorschlagen – einen neuen Auftrag
+anlegen (`create`), einen bestehenden ändern (`update`: Titel, Text, Priorität, Anbieter) oder abbrechen (`cancel`).
+Dazu hängen sie einen Code-Block in der Sprache `aidev-actions` an (`{"actions":[…]}`, höchstens 10; Schema und
+Parser in `modules/aidev/actions.ts`). Atrium entfernt den Block aus dem sichtbaren Text, prüft jede Aktion einzeln
+und zeigt die gültigen als Karten unter der Antwort. **Nichts passiert ohne Bestätigung:** Jede Karte muss mit
+„Übernehmen“ bestätigt oder mit „Verwerfen“ abgelehnt werden; ab zwei offenen Vorschlägen gibt es „Alle übernehmen“.
+Übernehmen braucht `task.create`; fremde Aufträge ändern oder abbrechen nur mit `task.manage`, und nur Aufträge
+desselben Projekts. Scheitert eine Aktion (z. B. Auftrag läuft gerade), steht sie mit Fehlertext auf „Nicht
+übernommen“. API: `POST /chat/:id/actions/:index` mit `{ "decision": "apply" | "reject" }`.
