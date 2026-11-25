@@ -240,8 +240,11 @@ export const chatInput = z.object({
 	/** Bestehenden PR bearbeiten statt neuen Branch/PR anzulegen (Nummer des Pull Requests) */
 	targetPr: z.number().int().positive().nullable().default(null),
 	body: z.string().trim().min(1).max(20_000),
-	/** `task` = Nachricht wird ein Auftrag, `note` = nur Notiz im Verlauf */
-	mode: z.enum(['task', 'note', 'question']).default('task'),
+	/**
+	 * `task` = Nachricht wird ein Auftrag, `question` = Frage an einen lesenden Agenten, `note` = nur Notiz im Verlauf,
+	 * `auto` = Frage/Auftrag regelbasiert erkennen (`classifyChatIntent` in `intent.ts`). Ohne Angabe bleibt es `task`.
+	 */
+	mode: z.enum(['task', 'note', 'question', 'auto']).default('task'),
 	role: roleSchema.default('implement'),
 	decompose: z.boolean().default(false),
 	providerHint: providerSchema.nullable().default(null)
@@ -581,7 +584,7 @@ export type TerminalLiveEvent =
  * | GET | /tasks/:id/diff | project.view | – | DiffDto (Branch gegen Basis, über Runner) |
  * | GET | /runs/:id/events | project.view | runEventsQuery | RunEventDto[] |
  * | GET | /projects/:id/chat | project.view | chatQuery | ChatMessageDto[] (neueste zuerst) |
- * | POST | /projects/:id/chat | task.create | chatInput | { message: ChatMessageDto, task: TaskDto \| null } |
+ * | POST | /projects/:id/chat | task.create | chatInput | { message: ChatMessageDto, task: TaskDto \| null, mode: 'task' \| 'question' \| 'note' } (wirksamer Modus) |
  * | GET | /projects/:id/pulls | project.view | – | PullRequestDto[] |
  * | POST | /projects/:id/pulls/sync | project.view | – | PullRequestDto[] |
  * | POST | /projects/:id/pulls/:number/merge | project.manage | mergeInput | PullRequestDto |

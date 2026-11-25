@@ -765,6 +765,51 @@ describe('aidev', () => {
 		ok(await call('admin', 'POST', `/tasks/${res.task.id}/cancel`), 201);
 	});
 
+	it('Chat im Modus „auto“ erkennt Frage und Auftrag', async () => {
+		const question = ok<{ message: ChatMessageDto; task: TaskDto; mode: string }>(
+			await call('admin', 'POST', `/projects/${projectId}/chat`, {
+				body: 'Wie funktioniert der Scheduler?',
+				mode: 'auto',
+				role: 'implement',
+				decompose: true
+			}),
+			201
+		);
+		expect(question.mode).toBe('question');
+		expect(question.task).toMatchObject({ role: 'research' });
+		expect(question.message).toMatchObject({ kind: 'user', taskId: question.task.id });
+		const [q1] = await q<{ chat_question: boolean }>(
+			sql`SELECT chat_question FROM task WHERE id = ${question.task.id}`
+		);
+		expect(q1!.chat_question).toBe(true);
+		ok(await call('admin', 'POST', `/tasks/${question.task.id}/cancel`), 201);
+
+		const order = ok<{ message: ChatMessageDto; task: TaskDto; mode: string }>(
+			await call('admin', 'POST', `/projects/${projectId}/chat`, {
+				body: 'Kannst du den Login-Bug fixen?',
+				mode: 'auto'
+			}),
+			201
+		);
+		expect(order.mode).toBe('task');
+		expect(order.task).toMatchObject({ role: 'implement' });
+		const [t1] = await q<{ chat_question: boolean }>(
+			sql`SELECT chat_question FROM task WHERE id = ${order.task.id}`
+		);
+		expect(t1!.chat_question).toBe(false);
+		ok(await call('admin', 'POST', `/tasks/${order.task.id}/cancel`), 201);
+
+		// ohne Angabe bleibt der Modus `task`; Notizen melden `note`
+		const note = ok<{ task: TaskDto | null; mode: string }>(
+			await call('admin', 'POST', `/projects/${projectId}/chat`, {
+				body: 'Nur Notiz?',
+				mode: 'note'
+			}),
+			201
+		);
+		expect(note).toMatchObject({ task: null, mode: 'note' });
+	});
+
 	it('Chat übernimmt die Auslieferungswahl und ungültige Werte werden abgelehnt', async () => {
 		const invalid = await call('admin', 'POST', `/projects/${projectId}/tasks`, {
 			prompt: 'Test',

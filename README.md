@@ -153,3 +153,12 @@ verknüpft. Fragen benötigen wie Aufträge das Recht `task.create`. Der Runner 
 oder Auslieferung für Fragen aus; hierfür muss er auf die aktuelle Version aktualisiert werden.
 Die Lesebeschränkung hängt zusätzlich von den jeweiligen CLI-Anbietern und deren Konfiguration ab;
 sie ersetzt keine isolierte Runner-Umgebung oder restriktive Zugangsdaten.
+
+Der Modus „Automatisch“ ist im UI der Standard: Die Nachricht wird regelbasiert (Deutsch und Englisch,
+`classifyChatIntent` in `modules/aidev/intent.ts`) als Frage oder Auftrag erkannt. Aufforderungen mit
+Änderungsverb („Passe … an“, „Kannst du den Bug fixen?“, „Add dark mode“) werden Aufträge; Fragezeichen am
+Ende, Fragewörter („Wie …“, „What …“) und Erklärungswünsche werden Fragen; Code-Blöcke und Inline-Code
+zählen nicht. Ohne eindeutige Merkmale entsteht ein Auftrag. Der Modus lässt sich jederzeit manuell auf
+„Auftrag“, „Frage“ oder „Notiz“ übersteuern. Über die API gilt ohne `mode` weiterhin `mode: "task"`;
+`mode: "auto"` muss ausdrücklich gesetzt werden. Die Antwort von `POST /projects/:id/chat` enthält neben
+`message` und `task` den wirksamen Modus `mode` (`task`, `question` oder `note`).

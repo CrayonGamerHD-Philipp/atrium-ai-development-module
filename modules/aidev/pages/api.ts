@@ -121,10 +121,13 @@ export const listChat = (projectId: string, opts: { before?: string; limit?: num
 		`${API}/projects/${projectId}/chat${qs({ before: opts.before, limit: opts.limit ?? 50 })}`
 	);
 export const postChat = (projectId: string, input: Partial<ChatInput> & Pick<ChatInput, 'body'>) =>
-	apiFetch<{ message: ChatMessageDto; task: TaskDto | null }>(`${API}/projects/${projectId}/chat`, {
-		method: 'POST',
-		body: json(input)
-	});
+	apiFetch<{ message: ChatMessageDto; task: TaskDto | null; mode: 'task' | 'question' | 'note' }>(
+		`${API}/projects/${projectId}/chat`,
+		{
+			method: 'POST',
+			body: json(input)
+		}
+	);
 
 // ---------------------------------------------------------------- Pull Requests
 
