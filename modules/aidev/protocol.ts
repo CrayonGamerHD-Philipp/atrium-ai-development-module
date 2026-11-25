@@ -55,6 +55,8 @@ export const registerInput = z.object({
 	maxSlots: z.number().int().min(0).max(64),
 	capabilities: z.object({
 		question: z.boolean().optional(),
+		/** Versteht `delivery.mode = 'branch'` (ältere Runner verwerfen solche Angebote) */
+		branchDelivery: z.boolean().optional(),
 		git: z.boolean(),
 		gh: z.boolean(),
 		pty: z.boolean(),
