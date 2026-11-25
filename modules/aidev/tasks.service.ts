@@ -40,6 +40,7 @@
 import { sql } from 'drizzle-orm';
 import { errors, inList, num, rowsOf, str, type RequestContext } from '$lib/sdk/server';
 import { extractChatActions, type ChatAction, type StoredChatAction } from './actions';
+import { linkAttachments } from './attachments.service';
 import { clip, jsonb, jsonOf, oneOf, shortId, stringList, type Row, type Tx } from './db';
 import type { Effects } from './effects';
 import { sendCommand } from './effects';
@@ -419,6 +420,12 @@ export async function createTask(
 	for (const dep of deps) {
 		await tx.execute(sql`INSERT INTO task_dep (task_id, depends_on_id) VALUES (${id}, ${dep})`);
 	}
+	// eigene Uploads dieses Projekts verknüpfen (geprüft in `linkAttachments`, sonst 422)
+	await linkAttachments(tx, input.attachmentIds ?? [], {
+		projectId: String(project.id),
+		userId: ctx.userId,
+		taskId: id
+	});
 	fx.tasks.add(id);
 	fx.overview = true;
 	if (!input.draft) fx.dispatch = true;
