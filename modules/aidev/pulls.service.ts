@@ -3,7 +3,7 @@
  * (gemergt → `done`, geschlossen → `failed` mit „PR geschlossen“).
  */
 import { sql } from 'drizzle-orm';
-import type { RequestContext } from '$lib/sdk/server';
+import { rowsOf, type RequestContext } from '$lib/sdk/server';
 import { clip, mdb, oneOf } from './db';
 import { newEffects } from './effects';
 import { prListResult } from './protocol';
@@ -54,16 +54,26 @@ export async function syncPulls(
 						deletions = EXCLUDED.deletions, updated_at = EXCLUDED.updated_at, synced_at = now()`
 			);
 			fx.pulls.add(`${projectId}:${pr.number}`);
-			if (!taskId) continue;
-			const task = await getTask(tx, taskId, true);
-			if (!task) continue;
-			if (task.pr_number === null || task.pr_number === undefined) {
-				await tx.execute(
-					sql`UPDATE task SET pr_number = ${pr.number}, pr_url = ${pr.url} WHERE id = ${taskId}`
-				);
-				fx.tasks.add(taskId);
+			if (taskId) {
+				const task = await getTask(tx, taskId, true);
+				if (task && (task.pr_number === null || task.pr_number === undefined)) {
+					await tx.execute(
+						sql`UPDATE task SET pr_number = ${pr.number}, pr_url = ${pr.url} WHERE id = ${taskId}`
+					);
+					fx.tasks.add(taskId);
+				}
 			}
-			await applyPullState(tx, fx, task, pr.state);
+			// Zustand auf alle Aufträge dieses PR übertragen (mehrere Aufträge können denselben PR bearbeiten)
+			const related = await rowsOf(
+				tx,
+				sql`SELECT id FROM task WHERE project_id = ${projectId} AND status = 'review'
+					AND (pr_number = ${pr.number} OR target_pr = ${pr.number}
+						${taskId ? sql`OR id = ${taskId}` : sql``})`
+			);
+			for (const r of related) {
+				const task = await getTask(tx, String(r.id), true);
+				if (task) await applyPullState(tx, fx, task, pr.state);
+			}
 		}
 		return loadPullDtos(tx, projectId);
 	});
