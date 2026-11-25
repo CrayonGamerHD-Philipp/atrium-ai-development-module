@@ -89,6 +89,8 @@ export const relative = (iso: string | null | undefined, now = new Date()) =>
 	iso ? formatRelative(iso, now) : '–';
 export const absolute = (iso: string | null | undefined) => (iso ? formatDateTime(iso) : '');
 export const clock = (iso: string | null | undefined) => (iso ? formatTime(iso) : '');
+/** Tag + Uhrzeit („heute 14:30“, „Mo., 01.12. 09:00“) – siehe `./datetime` */
+export { atDayClock, dayClock } from './datetime';
 
 /** Dauer in Sekunden → „1 h 05 min“, „4 min 12 s“, „35 s“ */
 export function duration(seconds: number): string {
