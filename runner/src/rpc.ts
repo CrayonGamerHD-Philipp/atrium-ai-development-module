@@ -1,9 +1,10 @@
 /**
- * RPC-Anfragen von Atrium (Editor, Diff, PR-Übersicht, Repo-Prüfung). Jede Anfrage läuft parallel mit einem
+ * RPC-Anfragen von Atrium (Editor, Diff, PR-Übersicht, Repo-Prüfung, Branch-Aufräumen). Jede Anfrage läuft parallel mit einem
  * Zeitlimit von 18 s; das Ergebnis wird gegen das Result-Schema aus `protocol.ts` geprüft und per
  * `POST /runner/rpc/:reqId` zurückgemeldet.
  */
-import { lstat, mkdir, open, readdir, rename, rmdir, stat, unlink, writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { lstat, mkdir, mkdtemp, open, readdir, rename, rm, rmdir, stat, unlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { randomBytes } from 'node:crypto';
 import type { z } from 'zod';
@@ -15,11 +16,13 @@ import type { Logger } from './log.ts';
 import { silentLogger } from './log.ts';
 import { PathError, resolveInJail } from './paths.ts';
 import {
+	branchDeleteResult,
 	fsListResult,
 	fsReadResult,
 	gitDiffResult,
 	gitLogResult,
 	gitStatusResult,
+	MAX_BRANCH_DELETE,
 	MAX_DIFF_BYTES,
 	MAX_FILE_BYTES,
 	prListResult,
@@ -30,7 +33,7 @@ import {
 } from './protocol.ts';
 import type { Redactor } from './redact.ts';
 import { errorMessage } from './util/async.ts';
-import { exec } from './util/proc.ts';
+import { exec, type ExecResult } from './util/proc.ts';
 
 export const RPC_TIMEOUT_MS = 18_000;
 const MAX_LIST = 2000;
@@ -45,6 +48,10 @@ export class RpcError extends Error {
 export interface RpcContext {
 	workspace: Workspace;
 	log?: Logger;
+	/** Bereinigt Fehlertexte (z. B. von `git push`) */
+	redactor?: Redactor;
+	/** IDs laufender Läufe (deren Worktrees bleiben beim Aufräumen unangetastet) */
+	activeRuns?: () => Iterable<string>;
 }
 
 function str(v: unknown, name: string, def?: string): string {
@@ -388,6 +395,122 @@ async function repoCheck(ctx: RpcContext, cmd: RpcCommand) {
 	}
 }
 
+/** Argument `branches` von `git.branch-delete` prüfen: nur eigene `aidev/`-Branches, nie der Haupt-Branch */
+export function parseBranchList(v: unknown, defaultBranch: string): string[] {
+	if (!Array.isArray(v)) throw new RpcError('Argument „branches“ muss eine Liste sein');
+	if (v.length === 0) throw new RpcError('Argument „branches“ ist leer');
+	if (v.some((b) => typeof b !== 'string')) throw new RpcError('Argument „branches“ darf nur Zeichenketten enthalten');
+	const out = [...new Set(v as string[])];
+	if (out.length > MAX_BRANCH_DELETE) throw new RpcError(`Höchstens ${MAX_BRANCH_DELETE} Branches je Aufruf`);
+	for (const b of out) {
+		try {
+			assertRefName(b);
+		} catch {
+			throw new RpcError(`Branch „${b.slice(0, 200)}“ ist ungültig`);
+		}
+		if (!b.startsWith('aidev/')) throw new RpcError(`Branch „${b}“ gehört nicht zu aidev (Präfix „aidev/“ fehlt)`);
+		if (b === defaultBranch) throw new RpcError(`Der Haupt-Branch „${b}“ wird nicht gelöscht`);
+	}
+	return out;
+}
+
+type GitFailure = Pick<ExecResult, 'spawnError' | 'stderr' | 'stdout' | 'timedOut'>;
+
+/** Fehlertext von git kürzen (letzte aussagekräftige Zeilen, ohne „To …“/„hint:“/Sammelmeldung) und bereinigen */
+function gitErrorText(ctx: RpcContext, r: GitFailure): string {
+	const raw = r.timedOut ? 'Zeitlimit überschritten' : (r.spawnError ?? (r.stderr.trim() || r.stdout.trim() || 'unbekannter Fehler'));
+	const lines = raw
+		.split('\n')
+		.map((l) => l.trim())
+		.filter(Boolean);
+	const useful = lines.filter((l) => !/^(To\s|hint:|error: failed to push some refs)/.test(l));
+	const text = (useful.length ? useful : lines)
+		.slice(-4)
+		.join(' ')
+		.slice(0, 500);
+	return ctx.redactor ? ctx.redactor.redact(text) : text;
+}
+
+/** Remote-Branches löschen: fehlende → `missing`, nicht löschbare → `failed`; danach den Cache nachziehen */
+async function branchDelete(ctx: RpcContext, cmd: RpcCommand) {
+	const ws = ctx.workspace;
+	const branches = parseBranchList(cmd.args.branches, cmd.project.defaultBranch);
+	const url = ws.remoteUrl(cmd.project);
+	const cfg = ws.netConfig(cmd.project).flatMap((c) => ['-c', c]);
+	// Reserve fürs Aufräumen und die Antwort innerhalb des RPC-Zeitlimits
+	const deadline = Date.now() + RPC_TIMEOUT_MS - 3000;
+	const left = () => Math.max(1000, deadline - Date.now());
+
+	/** Welche der Branches gibt es auf dem Remote? */
+	const existing = async (list: string[]): Promise<Set<string>> => {
+		const ls = await exec('git', [...cfg, 'ls-remote', '--heads', url, ...list.map((b) => `refs/heads/${b}`)], {
+			env: ws.env,
+			timeoutMs: Math.min(12_000, left())
+		});
+		if (ls.code !== 0) throw new RpcError(`Repository nicht erreichbar: ${gitErrorText(ctx, ls)}`);
+		const found = new Set<string>();
+		for (const m of ls.stdout.matchAll(/^[0-9a-f]+\s+refs\/heads\/(\S+)$/gm)) if (m[1]) found.add(m[1]);
+		return found;
+	};
+
+	const present = await existing(branches);
+	const missing = branches.filter((b) => !present.has(b));
+	const toDelete = branches.filter((b) => present.has(b));
+	const deleted: string[] = [];
+	const failed: { branch: string; error: string }[] = [];
+
+	if (toDelete.length) {
+		// `git push` braucht ein Repository: der Cache, sonst ein leeres temporäres Bare-Repo
+		const cache = ws.cacheDir(cmd.project);
+		let tmp: string | null = null;
+		let cwd = cache;
+		if (!existsSync(path.join(cache, 'HEAD'))) {
+			await mkdir(ws.tmpRoot, { recursive: true });
+			tmp = await mkdtemp(path.join(ws.tmpRoot, 'branch-delete-'));
+			await ws.git(['init', '--bare', '--quiet', tmp]);
+			cwd = tmp;
+		}
+		const hooks = ['-c', `core.hooksPath=${ws.emptyHooksDir.replace(/\\/g, '/')}`];
+		const push = (list: string[]) =>
+			exec('git', [...cfg, ...hooks, 'push', '--quiet', '--no-verify', url, '--delete', ...list.map((b) => `refs/heads/${b}`)], {
+				cwd,
+				env: ws.env,
+				timeoutMs: Math.min(15_000, left())
+			});
+		try {
+			const all = await push(toDelete);
+			if (all.code === 0) deleted.push(...toDelete);
+			else {
+				// Evtl. teilweise gelöscht: Stand neu lesen, den Rest einzeln versuchen
+				const still = await existing(toDelete).catch(() => new Set(toDelete));
+				for (const b of toDelete) {
+					if (!still.has(b)) deleted.push(b);
+					else if (Date.now() >= deadline) failed.push({ branch: b, error: 'Zeitlimit überschritten' });
+					else {
+						const one = await push([b]);
+						if (one.code === 0) deleted.push(b);
+						else if (/remote ref does not exist/i.test(one.stderr)) missing.push(b);
+						else failed.push({ branch: b, error: gitErrorText(ctx, one) });
+					}
+				}
+			}
+		} finally {
+			if (tmp) await rm(tmp, { recursive: true, force: true }).catch(() => undefined);
+		}
+	}
+
+	// Cache nachziehen (Fehler sind nicht fatal)
+	const gone = [...deleted, ...missing];
+	if (gone.length) {
+		try {
+			await ws.deleteCachedBranches(cmd.project, gone, new Set(ctx.activeRuns?.() ?? []));
+		} catch (e) {
+			(ctx.log ?? silentLogger).warn('Lokale Branches konnten nicht aufgeräumt werden', errorMessage(e));
+		}
+	}
+	return { deleted, missing, failed };
+}
+
 /** Eine RPC-Anfrage ausführen und das validierte Ergebnis liefern */
 export async function executeRpc(ctx: RpcContext, cmd: RpcCommand): Promise<unknown> {
 	const check = <T>(schema: z.ZodType<T>, v: unknown): T => {
@@ -416,6 +539,8 @@ export async function executeRpc(ctx: RpcContext, cmd: RpcCommand): Promise<unkn
 			return prMerge(ctx, cmd);
 		case 'repo.check':
 			return check(repoCheckResult, await repoCheck(ctx, cmd));
+		case 'git.branch-delete':
+			return check(branchDeleteResult, await branchDelete(ctx, cmd));
 	}
 }
 
