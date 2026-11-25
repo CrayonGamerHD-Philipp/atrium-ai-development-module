@@ -95,11 +95,19 @@ export function parseResult<T>(
 
 // ---------------------------------------------------------------- Runner-Wahl
 
-/** Freigegebene Runner, die gerade verbunden sind */
-async function connectedRunners(tx: Tx): Promise<Row[]> {
+/** Optionen der Runner-Wahl: nur Runner mit Terminal (`pty`) bzw. mit `git.branch-delete` (`branchCleanup`) */
+export interface PickRunnerOptions {
+	pty?: boolean;
+	branchCleanup?: boolean;
+}
+
+/** Freigegebene Runner, die gerade verbunden sind (optional nur mit Capability `branchCleanup`) */
+async function connectedRunners(tx: Tx, branchCleanup = false): Promise<Row[]> {
 	const rows = await rowsOf(
 		tx,
-		sql`SELECT * FROM runner WHERE status = 'approved' ORDER BY last_seen_at DESC NULLS LAST, created_at`
+		sql`SELECT * FROM runner WHERE status = 'approved'
+			${branchCleanup ? sql`AND capabilities->>'branchCleanup' = 'true'` : sql``}
+			ORDER BY last_seen_at DESC NULLS LAST, created_at`
 	);
 	return rows.filter((r) => runnerConnected(String(r.id)));
 }
@@ -112,15 +120,18 @@ const hasPty = (r: Row) => {
 /**
  * Runner für eine Projekt-Operation: bevorzugter Runner des Projekts (verbunden + freigegeben), sonst der
  * Runner des letzten Laufs des Projekts, sonst irgendein verbundener Runner. Bei `target = run:<id>` der
- * Runner dieses Laufs (Lauf muss zum Projekt gehören). Kein Runner → `unavailable`.
+ * Runner dieses Laufs (Lauf muss zum Projekt gehören). `opts` schränkt auf passende Runner ein (auch beim
+ * Lauf-Ziel). Kein Runner → `unavailable`.
  */
 export async function pickRunner(
 	tx: Tx,
 	project: Row,
 	target: WorkspaceTarget,
-	opts: { pty?: boolean } = {}
+	opts: PickRunnerOptions = {}
 ): Promise<string> {
-	const runners = (await connectedRunners(tx)).filter((r) => !opts.pty || hasPty(r));
+	const runners = (await connectedRunners(tx, opts.branchCleanup)).filter(
+		(r) => !opts.pty || hasPty(r)
+	);
 	const ids = new Set(runners.map((r) => String(r.id)));
 	if (target.startsWith('run:')) {
 		const runId = target.slice(4);
@@ -144,7 +155,11 @@ export async function pickRunner(
 	const any = runners[0];
 	if (!any) {
 		throw errors.unavailable(
-			opts.pty ? 'Kein Runner mit Terminal erreichbar' : 'Kein Runner erreichbar'
+			opts.pty
+				? 'Kein Runner mit Terminal erreichbar'
+				: opts.branchCleanup
+					? 'Kein Runner mit Branch-Aufräumen erreichbar'
+					: 'Kein Runner erreichbar'
 		);
 	}
 	return String(any.id);
@@ -154,7 +169,7 @@ export async function pickRunner(
 export async function projectAndRunner(
 	projectId: string,
 	target: WorkspaceTarget,
-	opts: { pty?: boolean } = {}
+	opts: PickRunnerOptions = {}
 ): Promise<{ project: Row; runnerId: string }> {
 	return mdb().transaction(async (tx) => {
 		const project = await oneOf(tx, sql`SELECT * FROM project WHERE id = ${projectId}`);
