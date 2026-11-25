@@ -179,6 +179,32 @@ export class Executor {
 		return true;
 	}
 
+	/** Wird der Runner beendet (keine neuen Läufe)? */
+	get isStopping(): boolean {
+		return this.stopping;
+	}
+
+	/**
+	 * Keine neuen Läufe annehmen und bis zu `timeoutMs` warten, bis die laufenden fertig sind (bzw. `signal`
+	 * auslöst). Liefert die Zahl der danach noch laufenden Läufe.
+	 */
+	async drain(timeoutMs: number, signal?: AbortSignal): Promise<number> {
+		this.stopping = true;
+		const deadline = Date.now() + Math.max(0, timeoutMs);
+		const aborted = new Promise<void>((resolve) => {
+			if (signal?.aborted) resolve();
+			signal?.addEventListener('abort', () => resolve(), { once: true });
+		});
+		// Abfrage statt `run.done`: während der Annahme ist `done` noch ein erfüllter Platzhalter
+		while (this.running.size && Date.now() < deadline && !signal?.aborted) {
+			const tick = new Promise<void>((resolve) =>
+				setTimeout(resolve, Math.min(250, Math.max(1, deadline - Date.now()))).unref()
+			);
+			await Promise.race([tick, aborted]);
+		}
+		return this.running.size;
+	}
+
 	/** Keine neuen Läufe; laufende abbrechen (finish `cancelled`), Worktrees bleiben */
 	async shutdown(timeoutMs = 30_000): Promise<void> {
 		this.stopping = true;

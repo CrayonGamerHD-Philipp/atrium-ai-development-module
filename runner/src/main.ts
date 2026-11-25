@@ -32,6 +32,7 @@ Umgebungsvariablen (Vorrang vor der Konfigurationsdatei):
   RUNNER_CONFIG       Konfigurationsdatei (Standard: ./runner.config.json)
   WORK_DIR            Arbeitsverzeichnis für Repos/Worktrees (Standard: ./.work)
   MAX_SLOTS           Gleichzeitige Läufe (Standard: 2)
+  DRAIN_SEC           Beim Beenden so lange auf laufende Läufe warten (Standard: 0 = sofort abbrechen)
   RUNNER_ACCOUNTS     Konten als JSON-Liste (statt "accounts" in der Datei)
   GIT_AUTHOR_NAME     Commit-Autor (Standard: Atrium Agent)
   GIT_AUTHOR_EMAIL    Commit-E-Mail (Standard: agent@atrium.local)
@@ -132,15 +133,23 @@ async function main(): Promise<void> {
 
 	log.info(`Atrium aidev-Runner ${RUNNER_VERSION} startet (${config.name}, ${config.maxSlots} Slots, ${config.workDir})`);
 	const runner = new Runner({ config, redactor, log });
-	let stopping = false;
+	// 1. Signal: geordnet beenden (mit DRAIN_SEC: laufende Läufe dürfen fertig werden),
+	// 2. Signal: Frist abbrechen, laufende Läufe abbrechen und neu einplanen lassen, 3. Signal: sofortiges Ende
+	let signals = 0;
+	const skipDrain = new AbortController();
 	const onSignal = (sig: NodeJS.Signals) => {
-		if (stopping) {
+		signals++;
+		if (signals > 2 || (signals === 2 && !(config.drainSec ?? 0))) {
 			log.warn(`${sig} erneut – sofortiges Ende`);
 			process.exit(130);
 		}
-		stopping = true;
+		if (signals === 2) {
+			log.warn(`${sig} erneut – Wartefrist abgebrochen, laufende Läufe werden abgebrochen`);
+			skipDrain.abort();
+			return;
+		}
 		log.info(`${sig} empfangen`);
-		void runner.shutdown().then(() => {
+		void runner.shutdown({ skipDrain: skipDrain.signal }).then(() => {
 			log.info('Beendet');
 			process.exit(0);
 		});

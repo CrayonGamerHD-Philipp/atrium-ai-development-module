@@ -100,7 +100,9 @@ describe('Runner', () => {
 			name: 'test-runner',
 			maxSlots: 2,
 			capabilities: { git: true, gh: true, limitReport: true },
-			accounts: [{ key: 'fake-1', provider: 'fake', loggedIn: true, models: ['fake-large'] }]
+			accounts: [{ key: 'fake-1', provider: 'fake', loggedIn: true, models: ['fake-large'] }],
+			// frisch gestartet: keine laufenden Läufe → Atrium gibt verwaiste sofort frei
+			runIds: []
 		});
 		await atrium.waitFor((r) => r.path === '/runner/stream');
 	});
@@ -258,6 +260,32 @@ describe('Runner', () => {
 		});
 		expect((await finishOf(o.runId)).status).toBe('limited');
 		expect(runner.limits.snapshot('fake-1')?.windows[0]).toMatchObject({ window: '5h', status: 'rejected' });
+	});
+
+	it('wartet beim Beenden mit Frist auf laufende Läufe und meldet draining', async () => {
+		const o = offer({ prompt: '[fake:slow]' });
+		atrium.send({ type: 'offer', offer: o });
+		await atrium.waitFor((r) => r.path === `/runner/runs/${o.runId}/accept`);
+		const skip = new AbortController();
+		let done = false;
+		const stopping = runner.shutdown({ drainSec: 60, skipDrain: skip.signal }).then(() => {
+			done = true;
+		});
+		const hb = await atrium.waitFor((r) => r.path === '/runner/heartbeat' && (r.body as { draining?: boolean }).draining === true);
+		expect(hb.invalid).toBeUndefined();
+		expect((hb.body as { runIds: string[] }).runIds).toContain(o.runId);
+		// keine neuen Läufe während der Frist
+		const late = offer();
+		atrium.send({ type: 'offer', offer: late });
+		const rej = await atrium.waitFor((r) => r.path === `/runner/runs/${late.runId}/reject`);
+		expect((rej.body as { reason: string }).reason).toContain('beendet');
+		expect(atrium.requests.some((r) => r.path === `/runner/runs/${o.runId}/finish`)).toBe(false);
+		expect(done).toBe(false);
+		// zweites Signal: Frist abbrechen → Lauf wird abgebrochen und neu eingeplant
+		skip.abort();
+		expect(await finishOf(o.runId)).toMatchObject({ status: 'cancelled', errorMessage: 'Runner wird beendet' });
+		await stopping;
+		expect(done).toBe(true);
 	});
 
 	it('sendet keine Anfrage mit ungültigem Body', () => {

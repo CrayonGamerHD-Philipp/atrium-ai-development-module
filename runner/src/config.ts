@@ -71,6 +71,7 @@ const fileSchema = z
 		gitAuthorEmail: z.string().optional(),
 		limitProbe: z.boolean().optional(),
 		limitProbeMin: z.number().optional(),
+		drainSec: z.number().int().optional(),
 		accounts: z.array(z.unknown()).optional()
 	})
 	.strict();
@@ -93,6 +94,11 @@ export interface RunnerConfig {
 	limitProbe?: boolean;
 	/** Abstand der aktiven Limit-Abfrage in Minuten (Standard 5) */
 	limitProbeMin?: number;
+	/**
+	 * Beim Beenden (SIGTERM/SIGINT) so viele Sekunden auf laufende Läufe warten, bevor sie abgebrochen werden
+	 * (Standard 0 = sofort abbrechen und neu einplanen lassen). Während der Frist nimmt der Runner nichts Neues an.
+	 */
+	drainSec?: number;
 	/** Pfad der gelesenen Konfigurationsdatei (falls vorhanden) */
 	configFile: string | null;
 }
@@ -116,6 +122,7 @@ const finalSchema = z.object({
 	gitAuthorEmail: z.string().min(3).max(200),
 	limitProbe: z.boolean().optional(),
 	limitProbeMin: z.number().int().min(1).max(1440),
+	drainSec: z.number().int().min(0).max(86_400),
 	accounts: z.array(accountConfigSchema).max(50)
 });
 
@@ -129,7 +136,8 @@ const LABELS: Record<string, string> = {
 	gitAuthorName: 'GIT_AUTHOR_NAME',
 	gitAuthorEmail: 'GIT_AUTHOR_EMAIL',
 	limitProbe: 'LIMIT_PROBE',
-	limitProbeMin: 'LIMIT_PROBE_MIN'
+	limitProbeMin: 'LIMIT_PROBE_MIN',
+	drainSec: 'DRAIN_SEC'
 };
 
 /** Schalter aus einer Umgebungsvariable (`1`/`true`/`on` bzw. `0`/`false`/`off`); ungültig → `invalid` */
@@ -189,6 +197,8 @@ export function loadConfig(o: LoadOptions = {}): RunnerConfig {
 	const maxSlots = /^\d+$/.test(maxSlotsRaw.trim()) ? Number(maxSlotsRaw) : Number.NaN;
 	const probeMinRaw = env.LIMIT_PROBE_MIN ?? (file.limitProbeMin !== undefined ? String(file.limitProbeMin) : '5');
 	const limitProbeMin = /^\d+$/.test(probeMinRaw.trim()) ? Number(probeMinRaw) : Number.NaN;
+	const drainRaw = env.DRAIN_SEC ?? (file.drainSec !== undefined ? String(file.drainSec) : '0');
+	const drainSec = /^\d+$/.test(drainRaw.trim()) ? Number(drainRaw) : Number.NaN;
 	const probeEnv = envBool(env.LIMIT_PROBE);
 	if (probeEnv === 'invalid')
 		throw new ConfigError('Konfiguration ungültig:\n  - LIMIT_PROBE: muss true/false (bzw. 1/0) sein');
@@ -207,6 +217,7 @@ export function loadConfig(o: LoadOptions = {}): RunnerConfig {
 		gitAuthorEmail: env.GIT_AUTHOR_EMAIL ?? file.gitAuthorEmail ?? 'agent@atrium.local',
 		limitProbe: probeEnv ?? file.limitProbe,
 		limitProbeMin,
+		drainSec,
 		accounts
 	};
 	const parsed = finalSchema.safeParse(candidate);
@@ -219,6 +230,7 @@ export function loadConfig(o: LoadOptions = {}): RunnerConfig {
 			}
 			if (head === 'maxSlots') return '  - MAX_SLOTS: muss eine ganze Zahl zwischen 0 und 64 sein';
 			if (head === 'limitProbeMin') return '  - LIMIT_PROBE_MIN: muss eine ganze Zahl zwischen 1 und 1440 sein';
+			if (head === 'drainSec') return '  - DRAIN_SEC: muss eine ganze Zahl zwischen 0 und 86400 sein';
 			return `  - ${LABELS[String(head)] ?? String(head)}: ${i.message}`;
 		});
 		throw new ConfigError(`Konfiguration ungültig:\n${lines.join('\n')}`);

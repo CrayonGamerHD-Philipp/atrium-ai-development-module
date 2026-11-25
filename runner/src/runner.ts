@@ -96,6 +96,8 @@ export class Runner {
 	private timers: NodeJS.Timeout[] = [];
 	private capabilities = { question: true, branchDelivery: true, prUpdate: true, limitReport: true, branchCleanup: false, git: false, gh: false, pty: false, os: `${process.platform}-${process.arch}` };
 	private needsRegister = false;
+	/** Beenden mit Frist läuft: keine neuen Angebote (`heartbeat.draining`) */
+	private draining = false;
 
 	constructor(private readonly o: RunnerOptions) {
 		this.log = o.log ?? silentLogger;
@@ -156,7 +158,9 @@ export class Runner {
 					loggedIn: s?.loggedIn ?? false,
 					models: a.models.length ? a.models : a.model ? [a.model] : []
 				};
-			})
+			}),
+			// Nach einem Neustart leer: Atrium gibt verwaiste Läufe sofort frei
+			runIds: this.executor.runIds()
 		};
 	}
 
@@ -195,23 +199,28 @@ export class Runner {
 				this.needsRegister = false;
 				await this.register();
 			}
-			try {
-				const r = await this.api.heartbeat({
-					slotsUsed: this.executor.slotsUsed,
-					runIds: this.executor.runIds(),
-					accounts: this.heartbeatAccounts()
-				});
-				if (r.status !== this.status) this.log.info(`Status in Atrium: ${r.status}`);
-				this.status = r.status;
-				for (const id of r.cancel) {
-					if (this.executor.cancel(id, 'Von Atrium abgebrochen')) this.log.info(`Lauf ${id} wird abgebrochen (Heartbeat)`);
-				}
-			} catch (e) {
-				// Limit-Stand beim nächsten Heartbeat erneut senden
-				this.sentLimits.clear();
-				if (e instanceof ApiError && (e.status === 404 || e.status === 409)) this.needsRegister = true;
-				this.log.warn('Heartbeat fehlgeschlagen', errorMessage(e));
+			await this.sendHeartbeat();
+		}
+	}
+
+	private async sendHeartbeat(): Promise<void> {
+		try {
+			const r = await this.api.heartbeat({
+				slotsUsed: this.executor.slotsUsed,
+				runIds: this.executor.runIds(),
+				...(this.draining ? { draining: true } : {}),
+				accounts: this.heartbeatAccounts()
+			});
+			if (r.status !== this.status) this.log.info(`Status in Atrium: ${r.status}`);
+			this.status = r.status;
+			for (const id of r.cancel) {
+				if (this.executor.cancel(id, 'Von Atrium abgebrochen')) this.log.info(`Lauf ${id} wird abgebrochen (Heartbeat)`);
 			}
+		} catch (e) {
+			// Limit-Stand beim nächsten Heartbeat erneut senden
+			this.sentLimits.clear();
+			if (e instanceof ApiError && (e.status === 404 || e.status === 409)) this.needsRegister = true;
+			this.log.warn('Heartbeat fehlgeschlagen', errorMessage(e));
 		}
 	}
 
@@ -330,11 +339,28 @@ export class Runner {
 		}
 	}
 
-	/** Beenden: keine neuen Läufe, laufende mit `cancelled` abschließen, Terminals schließen */
-	async shutdown(): Promise<void> {
+	/**
+	 * Beenden: keine neuen Läufe, Terminals schließen. Mit `drainSec` (Konfiguration `DRAIN_SEC`) dürfen laufende
+	 * Läufe bis dahin fertig werden; Atrium bietet dem Runner in der Zeit nichts mehr an. `skipDrain` (z. B. zweites
+	 * Signal) bricht die Frist ab. Danach werden noch laufende Läufe mit `cancelled` abgeschlossen und neu eingeplant.
+	 */
+	async shutdown(opts: { drainSec?: number; skipDrain?: AbortSignal } = {}): Promise<void> {
+		const drainSec = opts.drainSec ?? this.o.config.drainSec ?? 0;
 		this.log.info('Runner wird beendet …');
-		for (const t of this.timers) clearInterval(t);
 		this.pty.closeAll();
+		if (drainSec > 0 && this.executor.slotsUsed > 0 && !opts.skipDrain?.aborted) {
+			this.draining = true;
+			this.log.info(
+				`Warte bis zu ${drainSec} s auf ${this.executor.slotsUsed} laufende Läufe (erneutes Signal bricht sie sofort ab)`
+			);
+			const drained = this.executor.drain(drainSec * 1000, opts.skipDrain);
+			// Atrium sofort informieren, damit keine neuen Angebote kommen
+			await this.sendHeartbeat();
+			const left = await drained;
+			if (left) this.log.warn(`${left} Läufe nicht rechtzeitig fertig – sie werden abgebrochen und neu eingeplant`);
+			else this.log.info('Alle laufenden Läufe sind fertig');
+		}
+		for (const t of this.timers) clearInterval(t);
 		await this.executor.shutdown();
 		this.stop.abort();
 	}
