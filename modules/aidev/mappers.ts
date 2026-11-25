@@ -1,5 +1,6 @@
 /** Zeilen (`tx.execute`) → DTOs aus `schemas.ts`. Reine Abbildung, keine Datenbankzugriffe. */
 import { num, str, toIso, toIsoOrNull, type Row } from '$lib/sdk/server';
+import { storedActionsOf } from './actions';
 import { jsonOf, stringList } from './db';
 import type { CommitPolicy, Provider, Role } from './protocol';
 import type {
@@ -205,6 +206,7 @@ export function chatDto(r: Row, names: ReadonlyMap<string, string>): ChatMessage
 		kind: String(r.kind) as ChatMessageDto['kind'],
 		body: String(r.body),
 		author: authorId ? { id: authorId, name: names.get(authorId) ?? 'Unbekannt' } : null,
-		createdAt: toIso(r.created_at)
+		createdAt: toIso(r.created_at),
+		actions: storedActionsOf(r.actions).map((a, index) => ({ ...a, index }))
 	};
 }
