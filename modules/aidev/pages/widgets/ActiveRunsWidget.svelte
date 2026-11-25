@@ -69,7 +69,7 @@
 		{#if overview.tasks.needsInput}
 			<a
 				href={BASE}
-				class="mb-2 flex items-center gap-2 rounded-md border border-warning-border bg-warning-muted px-3 py-2 text-sm text-warning hover:underline"
+				class="mb-2 flex min-h-10 min-w-0 items-center gap-2 rounded-md border border-warning-border bg-warning-muted px-3 py-2 text-sm break-words text-warning hover:underline"
 			>
 				<MessageCircleQuestion class="size-4 shrink-0" aria-hidden="true" />
 				{overview.tasks.needsInput}

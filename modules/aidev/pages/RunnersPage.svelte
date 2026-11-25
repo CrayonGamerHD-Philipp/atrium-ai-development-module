@@ -136,11 +136,13 @@
 
 <div class="space-y-6">
 	<details bind:open={guideOpen} class="group rounded-lg border bg-card">
-		<summary class="flex cursor-pointer list-none items-center justify-between gap-2 px-4 py-3">
+		<summary
+			class="flex min-h-10 cursor-pointer list-none items-center justify-between gap-2 px-4 py-3"
+		>
 			<span class="text-sm font-medium">Runner einrichten</span>
 			<span class="text-xs text-muted-foreground group-open:hidden">Anleitung zeigen</span>
 		</summary>
-		<ol class="list-decimal space-y-2 border-t px-4 py-3 pl-8 text-sm">
+		<ol class="min-w-0 list-decimal space-y-2 border-t px-4 py-3 pl-8 text-sm break-words">
 			<li>
 				Lege unter Administration → Benutzer einen <strong>technischen Benutzer</strong> an und gib
 				ihm eine Rolle, die <strong>nur</strong> das Recht
@@ -197,9 +199,12 @@
 		{#each runners as r (r.id)}
 			<Table.Row>
 				<Table.Cell>
-					<span class="inline-flex items-center gap-2 font-medium">
+					<span class="inline-flex min-w-0 items-center gap-2 font-medium break-all">
 						<span
-							class={cn('size-2 rounded-full', r.online ? 'bg-success' : 'bg-muted-foreground/40')}
+							class={cn(
+								'size-2 shrink-0 rounded-full',
+								r.online ? 'bg-success' : 'bg-muted-foreground/40'
+							)}
 							title={r.online ? 'Online' : 'Offline'}
 						></span>
 						<span class="sr-only">{r.online ? 'Online' : 'Offline'}</span>
@@ -216,7 +221,7 @@
 				<Table.Cell class="font-mono text-xs">{r.version || '–'}</Table.Cell>
 				<Table.Cell class="text-xs text-muted-foreground">{caps(r) || '–'}</Table.Cell>
 				<Table.Cell class="text-right">
-					<div class="flex justify-end gap-1">
+					<div class="flex flex-wrap justify-end gap-1">
 						{#if r.status !== 'approved'}
 							<Button size="sm" onclick={() => setStatus(r, 'approved')} disabled={busy === r.id}>
 								<Check /> Freigeben
@@ -258,7 +263,7 @@
 			{#each runners as r (r.id)}
 				<Card.Root>
 					<Card.Header>
-						<Card.Title level={3}>{r.name}</Card.Title>
+						<Card.Title level={3} class="break-all">{r.name}</Card.Title>
 						<Card.Description
 							>{r.accounts.length} {r.accounts.length === 1 ? 'Konto' : 'Konten'}</Card.Description
 						>
@@ -270,17 +275,17 @@
 							<ul class="divide-y">
 								{#each r.accounts as a (a.id)}
 									<li
-										class="grid gap-3 py-3 md:grid-cols-[minmax(0,1.3fr)_minmax(0,1fr)_minmax(0,1fr)_auto] md:items-center"
+										class="grid grid-cols-1 gap-3 py-3 sm:grid-cols-2 lg:grid-cols-[minmax(0,1.3fr)_minmax(0,1fr)_minmax(0,1fr)_auto] lg:items-center"
 									>
-										<div class="min-w-0 space-y-1">
-											<div class="flex flex-wrap items-center gap-2">
-												<span class="truncate font-medium">{a.label || a.key}</span>
+										<div class="min-w-0 space-y-1 sm:col-span-2 lg:col-span-1">
+											<div class="flex min-w-0 flex-wrap items-center gap-2">
+												<span class="min-w-0 truncate font-medium">{a.label || a.key}</span>
 												<ProviderBadge provider={a.provider} model={a.defaultModel} />
 												{#if !a.enabled}<Badge variant="outline">Deaktiviert</Badge>{/if}
 												{#if !a.loggedIn}<Badge variant="warning">Nicht angemeldet</Badge>{/if}
 											</div>
-											<div class="text-xs text-muted-foreground">
-												<span class="font-mono">{a.key}</span> · {a.usage
+											<div class="text-xs break-words text-muted-foreground">
+												<span class="font-mono break-all">{a.key}</span> · {a.usage
 													.running}/{a.maxConcurrency} gleichzeitig ·
 												{a.contextK}k Kontext · {a.models.length} Modelle
 											</div>
@@ -309,7 +314,7 @@
 											budget={a.effectiveWeekUnits}
 										/>
 										{#if canAccounts}
-											<div class="flex gap-1 md:justify-end">
+											<div class="flex flex-wrap gap-1 sm:col-span-2 lg:col-span-1 lg:justify-end">
 												{#if coolingDown(a)}
 													<Button
 														size="sm"
