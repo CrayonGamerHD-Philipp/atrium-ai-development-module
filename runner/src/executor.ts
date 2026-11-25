@@ -4,6 +4,7 @@
  */
 import { mkdir, rm } from 'node:fs/promises';
 import path from 'node:path';
+import { attachmentPromptHint, excludeAidevDir, storeAttachments } from './attachments.ts';
 import { accountEnv, publicEnv, type AccountConfig, type RunnerConfig } from './config.ts';
 import { ApiError, EventBatcher, type RunnerApi } from './client.ts';
 import {
@@ -325,13 +326,18 @@ export class Executor {
 				if (r !== 0) throw new RunError('setup', `setupCmd fehlgeschlagen (Exit-Code ${r ?? 'unbekannt'})`);
 			}
 
+			// 2b. Anhänge nach `.aidev/attachments/` (nie committet, siehe `excludeAidevDir`)
+			const hint = await this.prepareAttachments(offer, wtDir, signal, emit);
+			checkAbort();
+
 			// 3. Agent
 			emit('status', { text: `Agent startet (${offer.account.provider}${offer.model ? `, ${offer.model}` : ''})` });
 			await mkdir(tmpDir, { recursive: true });
 			const adapter = this.o.adapters[acct.provider];
+			const prompt = [offer.prompt, hint, pull?.markdown].filter((p): p is string => !!p).join('\n\n');
 			const proc = adapter.start({
 				cwd: wtDir,
-				prompt: pull ? `${offer.prompt}\n\n${pull.markdown}` : offer.prompt,
+				prompt,
 				systemPrompt: offer.systemPrompt,
 				model: offer.model ?? (acct.provider === 'openai-api' ? (acct.model ?? null) : null),
 				resumeSessionId: offer.resumeSessionId,
@@ -544,6 +550,35 @@ export class Executor {
 			} catch (e) {
 				log.error('Abschlussmeldung fehlgeschlagen', errorMessage(e));
 			}
+		}
+	}
+
+	/**
+	 * Schritt 2b: Anhänge des Angebots laden und unter `.aidev/attachments/` ablegen; `.aidev/` wird in
+	 * `info/exclude` eingetragen. Liefert den Prompt-Hinweis (oder `null`, z. B. wenn das Backend ihn schon setzt).
+	 */
+	private async prepareAttachments(
+		offer: RunOffer,
+		dir: string,
+		signal: AbortSignal,
+		emit: (k: RunEventKind, p: Record<string, unknown>) => void
+	): Promise<string | null> {
+		const list = offer.attachments ?? [];
+		if (!list.length) return null;
+		const ws = this.o.workspace;
+		emit('status', { text: list.length === 1 ? 'Anhang wird geladen' : `Anhänge werden geladen (${list.length})` });
+		try {
+			await ws.withRepo({ repoOwner: offer.project.repoOwner, repoName: offer.project.repoName }, () =>
+				excludeAidevDir(ws, dir)
+			);
+			const stored = await storeAttachments(dir, list, (a) => this.o.api.attachment(offer.runId, a, signal));
+			emit('system', {
+				text: `${stored.length === 1 ? 'Anhang' : 'Anhänge'} bereitgestellt: ${stored.map((s) => s.path).join(', ')}`
+			});
+			return attachmentPromptHint(offer.prompt, stored);
+		} catch (e) {
+			if (signal.aborted) throw e;
+			throw new RunError('setup', `Anhänge konnten nicht geladen werden – ${errorMessage(e)}`);
 		}
 	}
 
