@@ -27,6 +27,26 @@ describe('loadConfig', () => {
 		expect(e.CODEX_HOME).toBe(path.join(path.resolve('/accounts/claude-main'), '.codex'));
 	});
 
+	it('liest die Optionen der aktiven Limit-Abfrage', () => {
+		const d = loadConfig({ env, cwd: runnerDir });
+		expect(d.limitProbe).toBeUndefined();
+		expect(d.limitProbeMin).toBe(5);
+		const c = loadConfig({
+			env: {
+				...env,
+				LIMIT_PROBE: 'false',
+				LIMIT_PROBE_MIN: '15',
+				RUNNER_ACCOUNTS: '[{"key":"claude-main","provider":"claude","limitProbe":true}]'
+			},
+			cwd: runnerDir
+		});
+		expect(c.limitProbe).toBe(false);
+		expect(c.limitProbeMin).toBe(15);
+		expect(c.accounts[0]?.limitProbe).toBe(true);
+		expect(() => loadConfig({ env: { ...env, LIMIT_PROBE: 'vielleicht' }, cwd: runnerDir })).toThrow('LIMIT_PROBE');
+		expect(() => loadConfig({ env: { ...env, LIMIT_PROBE_MIN: '0' }, cwd: runnerDir })).toThrow('LIMIT_PROBE_MIN');
+	});
+
 	it('meldet verständliche Fehler', () => {
 		expect(() => loadConfig({ env: { MAX_SLOTS: 'viele' }, cwd: runnerDir })).toThrow(ConfigError);
 		try {

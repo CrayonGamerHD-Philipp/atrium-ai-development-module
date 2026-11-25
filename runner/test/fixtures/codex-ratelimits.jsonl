@@ -1,0 +1,5 @@
+{"type":"thread.started","thread_id":"01a20fb8-67b8-7ee3-80bd-f716063bef6e"}
+{"type":"turn.started"}
+{"type":"token_count","info":{"total_token_usage":{"input_tokens":10}},"rate_limits":{"primary":{"used_percent":12.5,"window_minutes":299,"resets_in_seconds":3600},"secondary":{"used_percent":40,"window_minutes":10080,"resets_at":1795566600}}}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"Fertig."}}
+{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":0,"output_tokens":5}}

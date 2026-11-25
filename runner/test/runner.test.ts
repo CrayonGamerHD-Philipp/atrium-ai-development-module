@@ -5,6 +5,7 @@
 import { randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { accountConfigSchema, type RunnerConfig } from '../src/config.ts';
+import type { AccountState } from '../src/executor.ts';
 import { silentLogger } from '../src/log.ts';
 import type { FinishInput, RunOffer } from '../src/protocol.ts';
 import { Redactor } from '../src/redact.ts';
@@ -98,7 +99,7 @@ describe('Runner', () => {
 			protocol: 1,
 			name: 'test-runner',
 			maxSlots: 2,
-			capabilities: { git: true, gh: true },
+			capabilities: { git: true, gh: true, limitReport: true },
 			accounts: [{ key: 'fake-1', provider: 'fake', loggedIn: true, models: ['fake-large'] }]
 		});
 		await atrium.waitFor((r) => r.path === '/runner/stream');
@@ -233,8 +234,74 @@ describe('Runner', () => {
 		expect((await finishOf(b.runId)).status).toBe('cancelled');
 	});
 
+	it('meldet den Limit-Stand im Heartbeat', async () => {
+		const hb = await atrium.waitFor(
+			(r) => r.path === '/runner/heartbeat' && Boolean((r.body as { accounts: { limits?: unknown }[] }).accounts?.[0]?.limits),
+			20_000
+		);
+		expect(hb.invalid).toBeUndefined();
+		expect((hb.body as { accounts: unknown[] }).accounts[0]).toMatchObject({
+			key: 'fake-1',
+			loggedIn: true,
+			limits: { source: 'stream', windows: [{ window: '5h', label: 'five_hour', status: expect.any(String) }] }
+		});
+	});
+
+	it('sendet bei einem Limit-Treffer die bekannten Fenster mit', async () => {
+		const o = offer({ prompt: '[fake:limit]' });
+		atrium.send({ type: 'offer', offer: o });
+		const lim = await atrium.waitFor((r) => r.path === `/runner/runs/${o.runId}/limit`);
+		expect(lim.invalid).toBeUndefined();
+		expect(lim.body).toMatchObject({
+			kind: '5h',
+			windows: [{ window: '5h', usedPercent: 100, status: 'rejected' }]
+		});
+		expect((await finishOf(o.runId)).status).toBe('limited');
+		expect(runner.limits.snapshot('fake-1')?.windows[0]).toMatchObject({ window: '5h', status: 'rejected' });
+	});
+
 	it('sendet keine Anfrage mit ungültigem Body', () => {
 		const bad = atrium.requests.filter((r) => r.invalid && r.invalid !== 'simulierter Fehler');
 		expect(bad).toEqual([]);
+	});
+});
+
+describe('Runner.heartbeatAccounts', () => {
+	it('sendet den Limit-Stand nur, wenn er sich geändert hat oder jünger als 30 min ist', () => {
+		const acct = accountConfigSchema.parse({ key: 'claude-main', provider: 'claude' });
+		const r = new Runner({
+			config: {
+				atriumUrl: 'http://127.0.0.1:9',
+				apiKey: 'test-api-key',
+				name: 'x',
+				workDir: '/tmp/aidev-hb-test',
+				maxSlots: 1,
+				gitRemoteTemplate: 'https://github.com/{owner}/{repo}.git',
+				gitAuthorName: 'A',
+				gitAuthorEmail: 'a@b.c',
+				accounts: [acct],
+				limitProbe: false,
+				configFile: null
+			},
+			redactor: new Redactor()
+		});
+		(r as unknown as { accounts: Map<string, AccountState> }).accounts = new Map([
+			[acct.key, { config: acct, ok: true, loggedIn: true, version: '1' }]
+		]);
+		const t0 = new Date('2026-11-25T10:00:00.000Z');
+		const at = (min: number) => new Date(t0.getTime() + min * 60_000);
+		const win = (usedPercent: number) => ({ window: '5h' as const, label: 'five_hour', usedPercent, resetsAt: null, status: 'allowed' as const });
+
+		expect(r.heartbeatAccounts(t0)).toEqual([{ key: 'claude-main', loggedIn: true }]);
+		r.limits.update(acct.key, [win(10)], 'probe', t0);
+		// frisch → in jedem Heartbeat
+		expect(r.heartbeatAccounts(at(1))[0]?.limits).toMatchObject({ observedAt: t0.toISOString(), windows: [win(10)] });
+		expect(r.heartbeatAccounts(at(29))[0]?.limits).toBeDefined();
+		// älter als 30 min und unverändert → nicht mehr
+		expect(r.heartbeatAccounts(at(31))[0]).toEqual({ key: 'claude-main', loggedIn: true });
+		// geändert (auch wenn alt) → einmal senden
+		r.limits.update(acct.key, [win(20)], 'probe', at(2));
+		expect(r.heartbeatAccounts(at(40))[0]?.limits?.windows).toEqual([win(20)]);
+		expect(r.heartbeatAccounts(at(41))[0]?.limits).toBeUndefined();
 	});
 });

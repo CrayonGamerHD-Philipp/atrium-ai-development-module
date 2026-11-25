@@ -11,11 +11,13 @@
  * `turn.failed`, `error`.
  */
 import { existsSync } from 'node:fs';
+import { open, readdir } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import type { AccountConfig } from '../config.ts';
 import type { Provider } from '../protocol.ts';
 import { exec } from '../util/proc.ts';
+import { codexRateLimitWindows, findCodexRateLimits, toIso } from './limit-snapshot.ts';
 import { detectLimit } from './limits.ts';
 import { probeFailed, probeVersion, runCliAgent } from './process.ts';
 import {
@@ -30,6 +32,8 @@ import {
 	type ProviderAdapter,
 	type StartOptions
 } from './types.ts';
+import { AsyncQueue } from '../util/async.ts';
+import type { LimitWindow } from '../protocol.ts';
 
 type Json = Record<string, unknown>;
 const isObj = (v: unknown): v is Json => typeof v === 'object' && v !== null && !Array.isArray(v);
@@ -141,7 +145,7 @@ export function createCodexParser(
 		return [];
 	};
 
-	return {
+	const base: LineParser = {
 		line(line) {
 			let o: unknown;
 			try {
@@ -211,6 +215,32 @@ export function createCodexParser(
 			};
 		}
 	};
+
+	return {
+		...base,
+		line(line) {
+			// Limit-Stand (`rate_limits.primary/secondary`), falls die Version ihn im Stream mitsendet;
+			// nur beim ChatGPT-Login (Abo-Fenster), nicht bei OpenAI-kompatiblen APIs
+			const limits = provider === 'codex' ? limitsOfLine(line, now()) : [];
+			return [...limits, ...base.line(line)];
+		}
+	};
+}
+
+/** `limits`-Ereignis aus einer Codex-JSON-Zeile mit `rate_limits` (sonst leer, wirft nie) */
+export function limitsOfLine(line: string, now: Date): NormalizedEvent[] {
+	if (!line.includes('rate_limits') && !line.includes('rateLimits')) return [];
+	try {
+		const o: unknown = JSON.parse(line);
+		const rl = findCodexRateLimits(o);
+		// `resets_in_seconds` bezieht sich auf den Zeitpunkt der Zeile (Sitzungsdatei: `timestamp`)
+		const ts = isObj(o) ? toIso(o.timestamp) : null;
+		const base = ts && Date.parse(ts) <= now.getTime() ? new Date(ts) : now;
+		const windows = rl !== undefined ? codexRateLimitWindows(rl, base) : null;
+		return windows ? [{ kind: 'limits', windows }] : [];
+	} catch {
+		return [];
+	}
 }
 
 /** Auftrag mit vorangestellter Systemanweisung */
@@ -241,7 +271,7 @@ export function codexArgs(o: StartOptions, extra: CodexStartExtras): string[] {
 }
 
 export function startCodex(o: StartOptions, extra: CodexStartExtras): AgentProcess {
-	return runCliAgent({
+	const proc = runCliAgent({
 		command: o.account.command ?? 'codex',
 		args: codexArgs(o, extra),
 		cwd: o.cwd,
@@ -251,6 +281,81 @@ export function startCodex(o: StartOptions, extra: CodexStartExtras): AgentProce
 		signal: o.signal,
 		parser: createCodexParser(extra.provider, extra.model ?? '')
 	});
+	// Abo-Fenster gibt es nur beim ChatGPT-Login (nicht bei OpenAI-kompatiblen APIs)
+	return extra.provider === 'codex' ? withSessionLimits(proc, codexHome(o.env)) : proc;
+}
+
+/**
+ * Liefert nach dem Lauf den Limit-Stand aus der Sitzungsdatei nach (`<CODEX_HOME>/sessions/JJJJ/MM/TT/
+ * rollout-…-<thread_id>.jsonl`, letztes `token_count` mit `rate_limits`), falls der Stream keinen enthielt.
+ */
+export function withSessionLimits(
+	proc: AgentProcess,
+	home: string,
+	now: () => Date = () => new Date()
+): AgentProcess {
+	const queue = new AsyncQueue<NormalizedEvent>();
+	let threadId: string | null = null;
+	let streamed = false;
+	const done = (async () => {
+		try {
+			for await (const ev of proc.events) {
+				if (ev.kind === 'session') threadId = ev.id;
+				else if (ev.kind === 'limits') streamed = true;
+				queue.push(ev);
+			}
+			if (threadId && !streamed) {
+				const windows = await readCodexSessionLimits(home, threadId, now());
+				if (windows) queue.push({ kind: 'limits', windows });
+			}
+		} catch {
+			// Sitzungsdatei ist optional
+		} finally {
+			queue.end();
+		}
+		return proc.done;
+	})();
+	return { events: queue, done, kill: () => proc.kill() };
+}
+
+const SESSION_TAIL_BYTES = 512 * 1024;
+
+/** Limit-Stand aus der Sitzungsdatei eines Threads (heute/gestern, lokale und UTC-Ordner); `null`, wenn unbekannt */
+export async function readCodexSessionLimits(home: string, threadId: string, now: Date): Promise<LimitWindow[] | null> {
+	if (!/^[A-Za-z0-9-]{8,80}$/.test(threadId)) return null;
+	const dirs = new Set<string>();
+	for (const offset of [0, -86_400_000]) {
+		const d = new Date(now.getTime() + offset);
+		const pad = (n: number) => String(n).padStart(2, '0');
+		dirs.add(path.join(home, 'sessions', String(d.getFullYear()), pad(d.getMonth() + 1), pad(d.getDate())));
+		dirs.add(path.join(home, 'sessions', String(d.getUTCFullYear()), pad(d.getUTCMonth() + 1), pad(d.getUTCDate())));
+	}
+	for (const dir of dirs) {
+		let names: string[];
+		try {
+			names = await readdir(dir);
+		} catch {
+			continue;
+		}
+		const name = names.find((n) => n.endsWith(`${threadId}.jsonl`));
+		if (!name) continue;
+		const fh = await open(path.join(dir, name), 'r');
+		try {
+			const { size } = await fh.stat();
+			const len = Math.min(size, SESSION_TAIL_BYTES);
+			const buf = Buffer.alloc(len);
+			await fh.read(buf, 0, len, size - len);
+			const lines = buf.toString('utf8').split(/\r?\n/);
+			for (let i = lines.length - 1; i >= 0; i--) {
+				const ev = limitsOfLine(lines[i] ?? '', now)[0];
+				if (ev?.kind === 'limits') return ev.windows;
+			}
+		} finally {
+			await fh.close();
+		}
+		return null;
+	}
+	return null;
 }
 
 function codexHome(env: NodeJS.ProcessEnv): string {

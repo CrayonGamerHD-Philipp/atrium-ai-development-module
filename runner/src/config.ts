@@ -44,7 +44,9 @@ export const accountConfigSchema = z
 		reasoningEffort: z
 			.string()
 			.regex(/^[a-z]+$/)
-			.optional()
+			.optional(),
+		/** Limit-Stand aktiv abfragen (überschreibt `limitProbe` des Runners; derzeit nur Claude mit OAuth-Login) */
+		limitProbe: z.boolean().optional()
 	})
 	.strict()
 	.superRefine((a, ctx) => {
@@ -67,6 +69,8 @@ const fileSchema = z
 		gitRemoteTemplate: z.string().optional(),
 		gitAuthorName: z.string().optional(),
 		gitAuthorEmail: z.string().optional(),
+		limitProbe: z.boolean().optional(),
+		limitProbeMin: z.number().optional(),
 		accounts: z.array(z.unknown()).optional()
 	})
 	.strict();
@@ -82,6 +86,13 @@ export interface RunnerConfig {
 	gitAuthorName: string;
 	gitAuthorEmail: string;
 	accounts: AccountConfig[];
+	/**
+	 * Aktive Limit-Abfrage ohne Lauf: `true`/`false` für alle Konten, nicht gesetzt = an für Claude-Konten mit
+	 * OAuth-Login, sonst aus. `accounts[].limitProbe` hat Vorrang.
+	 */
+	limitProbe?: boolean;
+	/** Abstand der aktiven Limit-Abfrage in Minuten (Standard 5) */
+	limitProbeMin?: number;
 	/** Pfad der gelesenen Konfigurationsdatei (falls vorhanden) */
 	configFile: string | null;
 }
@@ -103,6 +114,8 @@ const finalSchema = z.object({
 		),
 	gitAuthorName: z.string().min(1).max(200),
 	gitAuthorEmail: z.string().min(3).max(200),
+	limitProbe: z.boolean().optional(),
+	limitProbeMin: z.number().int().min(1).max(1440),
 	accounts: z.array(accountConfigSchema).max(50)
 });
 
@@ -114,8 +127,19 @@ const LABELS: Record<string, string> = {
 	maxSlots: 'MAX_SLOTS',
 	gitRemoteTemplate: 'GIT_REMOTE_TEMPLATE',
 	gitAuthorName: 'GIT_AUTHOR_NAME',
-	gitAuthorEmail: 'GIT_AUTHOR_EMAIL'
+	gitAuthorEmail: 'GIT_AUTHOR_EMAIL',
+	limitProbe: 'LIMIT_PROBE',
+	limitProbeMin: 'LIMIT_PROBE_MIN'
 };
+
+/** Schalter aus einer Umgebungsvariable (`1`/`true`/`on` bzw. `0`/`false`/`off`); ungültig → `invalid` */
+function envBool(v: string | undefined): boolean | undefined | 'invalid' {
+	if (v === undefined || v.trim() === '') return undefined;
+	const s = v.trim().toLowerCase();
+	if (['1', 'true', 'on', 'yes', 'ja'].includes(s)) return true;
+	if (['0', 'false', 'off', 'no', 'nein'].includes(s)) return false;
+	return 'invalid';
+}
 
 export interface LoadOptions {
 	env?: NodeJS.ProcessEnv;
@@ -163,6 +187,11 @@ export function loadConfig(o: LoadOptions = {}): RunnerConfig {
 	}
 	const maxSlotsRaw = env.MAX_SLOTS ?? (file.maxSlots !== undefined ? String(file.maxSlots) : '2');
 	const maxSlots = /^\d+$/.test(maxSlotsRaw.trim()) ? Number(maxSlotsRaw) : Number.NaN;
+	const probeMinRaw = env.LIMIT_PROBE_MIN ?? (file.limitProbeMin !== undefined ? String(file.limitProbeMin) : '5');
+	const limitProbeMin = /^\d+$/.test(probeMinRaw.trim()) ? Number(probeMinRaw) : Number.NaN;
+	const probeEnv = envBool(env.LIMIT_PROBE);
+	if (probeEnv === 'invalid')
+		throw new ConfigError('Konfiguration ungültig:\n  - LIMIT_PROBE: muss true/false (bzw. 1/0) sein');
 	const baseDir = configFile ? path.dirname(configFile) : cwd;
 	const url = env.ATRIUM_URL ?? file.atriumUrl;
 
@@ -176,6 +205,8 @@ export function loadConfig(o: LoadOptions = {}): RunnerConfig {
 			env.GIT_REMOTE_TEMPLATE ?? file.gitRemoteTemplate ?? 'https://github.com/{owner}/{repo}.git',
 		gitAuthorName: env.GIT_AUTHOR_NAME ?? file.gitAuthorName ?? 'Atrium Agent',
 		gitAuthorEmail: env.GIT_AUTHOR_EMAIL ?? file.gitAuthorEmail ?? 'agent@atrium.local',
+		limitProbe: probeEnv ?? file.limitProbe,
+		limitProbeMin,
 		accounts
 	};
 	const parsed = finalSchema.safeParse(candidate);
@@ -187,6 +218,7 @@ export function loadConfig(o: LoadOptions = {}): RunnerConfig {
 				return `  - accounts[${String(rest[0] ?? '')}]${sub}: ${i.message}`;
 			}
 			if (head === 'maxSlots') return '  - MAX_SLOTS: muss eine ganze Zahl zwischen 0 und 64 sein';
+			if (head === 'limitProbeMin') return '  - LIMIT_PROBE_MIN: muss eine ganze Zahl zwischen 1 und 1440 sein';
 			return `  - ${LABELS[String(head)] ?? String(head)}: ${i.message}`;
 		});
 		throw new ConfigError(`Konfiguration ungültig:\n${lines.join('\n')}`);

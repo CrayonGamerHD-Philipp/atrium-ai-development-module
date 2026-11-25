@@ -7,11 +7,19 @@ import os from 'node:os';
 import { accountEnv, publicEnv, type RunnerConfig } from './config.ts';
 import { ApiError, AtriumClient, RunnerApi, runCommandStream, type FetchFn } from './client.ts';
 import { Executor, type AccountState } from './executor.ts';
+import { LimitProber, type ProbeFetch } from './limit-probe.ts';
 import { Workspace } from './git/workspace.ts';
 import type { Logger } from './log.ts';
 import { silentLogger } from './log.ts';
 import { defaultAdapters, type AdapterRegistry } from './providers/index.ts';
-import { PROTOCOL_VERSION, type RegisterInput, type RunnerCommand } from './protocol.ts';
+import { LimitStore } from './providers/limit-snapshot.ts';
+import {
+	PROTOCOL_VERSION,
+	type HeartbeatInput,
+	type LimitSnapshot,
+	type RegisterInput,
+	type RunnerCommand
+} from './protocol.ts';
 import { PtyManager } from './pty.ts';
 import { Redactor } from './redact.ts';
 import { handleRpc } from './rpc.ts';
@@ -25,7 +33,10 @@ export interface RunnerOptions {
 	log?: Logger;
 	adapters?: AdapterRegistry;
 	fetch?: FetchFn;
+	/** fetch für die aktive Limit-Abfrage (Tests) */
+	probeFetch?: ProbeFetch;
 	/** Abstände (Tests verkürzen) */
+	limitProbeTickMs?: number;
 	reprobeMs?: number;
 	cleanupMs?: number;
 	backoffBaseMs?: number;
@@ -62,12 +73,19 @@ async function hasCommand(cmd: string, args = ['--version']): Promise<boolean> {
 	return r.code === 0 && !r.spawnError;
 }
 
+/** Limit-Stände, die jünger sind, werden in jedem Heartbeat mitgesendet */
+const LIMIT_FRESH_MS = 30 * 60_000;
+
 export class Runner {
 	readonly api: RunnerApi;
 	readonly client: AtriumClient;
 	readonly workspace: Workspace;
 	readonly executor: Executor;
 	readonly pty: PtyManager;
+	readonly limits = new LimitStore();
+	readonly limitProber: LimitProber;
+	/** Zuletzt im Heartbeat gesendeter Limit-Stand je Konto (Vergleich als JSON) */
+	private readonly sentLimits = new Map<string, string>();
 	private accounts = new Map<string, AccountState>();
 	private readonly log: Logger;
 	private readonly adapters: AdapterRegistry;
@@ -76,7 +94,7 @@ export class Runner {
 	private heartbeatSec = 15;
 	private stream: ReturnType<typeof runCommandStream> | null = null;
 	private timers: NodeJS.Timeout[] = [];
-	private capabilities = { question: true, branchDelivery: true, prUpdate: true, git: false, gh: false, pty: false, os: `${process.platform}-${process.arch}` };
+	private capabilities = { question: true, branchDelivery: true, prUpdate: true, limitReport: true, git: false, gh: false, pty: false, os: `${process.platform}-${process.arch}` };
 	private needsRegister = false;
 
 	constructor(private readonly o: RunnerOptions) {
@@ -105,7 +123,15 @@ export class Runner {
 			adapters: this.adapters,
 			redactor: o.redactor,
 			accounts: () => this.accounts,
+			limits: this.limits,
 			log: this.log.child('run')
+		});
+		this.limitProber = new LimitProber({
+			config: o.config,
+			store: this.limits,
+			accounts: () => this.accounts,
+			fetch: o.probeFetch,
+			log: this.log.child('limits')
 		});
 		this.pty = new PtyManager({ api: this.api, workspace: this.workspace, redactor: o.redactor, log: this.log.child('pty') });
 	}
@@ -173,7 +199,7 @@ export class Runner {
 				const r = await this.api.heartbeat({
 					slotsUsed: this.executor.slotsUsed,
 					runIds: this.executor.runIds(),
-					accounts: [...this.accounts.values()].map((a) => ({ key: a.config.key, loggedIn: a.loggedIn }))
+					accounts: this.heartbeatAccounts()
 				});
 				if (r.status !== this.status) this.log.info(`Status in Atrium: ${r.status}`);
 				this.status = r.status;
@@ -181,10 +207,29 @@ export class Runner {
 					if (this.executor.cancel(id, 'Von Atrium abgebrochen')) this.log.info(`Lauf ${id} wird abgebrochen (Heartbeat)`);
 				}
 			} catch (e) {
+				// Limit-Stand beim nächsten Heartbeat erneut senden
+				this.sentLimits.clear();
 				if (e instanceof ApiError && (e.status === 404 || e.status === 409)) this.needsRegister = true;
 				this.log.warn('Heartbeat fehlgeschlagen', errorMessage(e));
 			}
 		}
+	}
+
+	/**
+	 * Konten für den Heartbeat. `limits` nur, wenn sich der Stand seit dem letzten Heartbeat geändert hat oder
+	 * jünger als 30 min ist (ältere, unveränderte Stände muss Atrium nicht erneut erhalten).
+	 */
+	heartbeatAccounts(now: Date = new Date()): HeartbeatInput['accounts'] {
+		return [...this.accounts.values()].map((a) => {
+			const key = a.config.key;
+			const snap: LimitSnapshot | null = this.limits.snapshot(key);
+			if (!snap) return { key, loggedIn: a.loggedIn };
+			const sig = JSON.stringify(snap);
+			const fresh = now.getTime() - Date.parse(snap.observedAt) < LIMIT_FRESH_MS;
+			if (!fresh && this.sentLimits.get(key) === sig) return { key, loggedIn: a.loggedIn };
+			this.sentLimits.set(key, sig);
+			return { key, loggedIn: a.loggedIn, limits: snap };
+		});
 	}
 
 	/** Befehl verteilen */
@@ -231,7 +276,7 @@ export class Runner {
 	async start(): Promise<void> {
 		await mkdir(this.o.config.workDir, { recursive: true });
 		const [git, ghOk, ptyOk] = await Promise.all([hasCommand('git'), hasCommand('gh'), this.pty.available()]);
-		this.capabilities = { question: true, branchDelivery: true, prUpdate: true, git, gh: ghOk, pty: ptyOk, os: `${os.platform()}-${os.arch()}`.slice(0, 40) };
+		this.capabilities = { question: true, branchDelivery: true, prUpdate: true, limitReport: true, git, gh: ghOk, pty: ptyOk, os: `${os.platform()}-${os.arch()}`.slice(0, 40) };
 		if (!git) this.log.error('git wurde nicht gefunden – Läufe sind nicht möglich');
 		if (!ghOk) this.log.warn('gh wurde nicht gefunden – PRs und PR-Übersicht sind nicht möglich');
 		if (!ptyOk) this.log.info('node-pty nicht verfügbar – Terminals sind deaktiviert');
@@ -246,6 +291,15 @@ export class Runner {
 				});
 			}, this.o.reprobeMs ?? 300_000)
 		);
+		if (this.limitProber.enabled) {
+			const tick = () => void this.limitProber.tick(this.stop.signal);
+			const first = setTimeout(tick, 5_000);
+			first.unref();
+			const every = setInterval(tick, this.o.limitProbeTickMs ?? 60_000);
+			every.unref();
+			this.timers.push(first, every);
+			this.log.info(`Aktive Limit-Abfrage an (alle ${this.o.config.limitProbeMin ?? 5} min)`);
+		}
 
 		if (!(await this.register())) return;
 		this.stream = runCommandStream(
