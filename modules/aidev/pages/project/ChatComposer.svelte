@@ -4,7 +4,7 @@
 	// Blatt von unten (mobil); abweichende Optionen stehen als entfernbare Chips über der Eingabe.
 	// Entwurf (pro Benutzer und Projekt) und Modus werden im Browser gemerkt. „Umsetzen“ (`implement`) setzt einen
 	// Bezug auf eine Agent-Antwort (`replyTo`), sichtbar als entfernbarer Chip.
-	import { onMount } from 'svelte';
+	import { onDestroy, onMount } from 'svelte';
 	import { page } from '$app/state';
 	import { MediaQuery } from 'svelte/reactivity';
 	import { toast } from 'svelte-sonner';
@@ -28,6 +28,10 @@
 	import { errMsg } from '../format';
 	import { CHAT_MODES, isChatMode, modeInfo, storage, type ChatMode } from './chat/modes';
 	import { IMPLEMENT_TEXT } from './chat/proposals';
+	import AttachButton from './AttachButton.svelte';
+	import AttachDropZone from './AttachDropZone.svelte';
+	import AttachmentList from './AttachmentList.svelte';
+	import { AttachmentDraft } from './attachments.svelte';
 	import type { ProjectStore } from './store.svelte';
 
 	let {
@@ -61,6 +65,12 @@
 	let modeBeforeReply: ChatMode | null = null;
 	/** Browser ohne `field-sizing: content` → Höhe per JS anpassen */
 	let manualGrow = $state(false);
+	/** Anhänge der nächsten Nachricht (Strg+V, Drag & Drop, „Datei anhängen“) */
+	const attachments = new AttachmentDraft(
+		() => store.id,
+		(m) => toast.error(m)
+	);
+	onDestroy(() => attachments.clear());
 
 	/** ab sm: eigener Optionen-Knopf (darunter steckt er im Modus-Menü) */
 	const sm = new MediaQuery('(min-width: 640px)', true);
@@ -193,12 +203,13 @@
 	async function send(e?: Event) {
 		e?.preventDefault();
 		const text = body.trim();
-		if (!text || busy) return;
+		if (!text || busy || attachments.uploading) return;
 		busy = true;
 		try {
 			const res = await postChat(store.id, {
 				body: text,
 				mode,
+				attachmentIds: attachments.ids,
 				delivery,
 				role,
 				// im Auto-Modus entscheidet der Server; Aufteilen gilt dort nur, wenn es ein Auftrag wird
@@ -210,6 +221,7 @@
 			store.addChat(res.message);
 			if (res.task) store.upsertTask(res.task);
 			body = '';
+			attachments.clear();
 			if (replyTo) clearReply();
 			if (mode === 'auto') toast.success(SENT_LABEL[res.mode] ?? 'Gesendet');
 			onsent?.();
@@ -310,201 +322,218 @@
 	</div>
 {/snippet}
 
-<form
-	class="space-y-1.5 border-t bg-background p-2 pb-[max(0.5rem,env(safe-area-inset-bottom))] sm:p-3 sm:pb-[max(0.75rem,env(safe-area-inset-bottom))]"
-	onsubmit={send}
-	aria-label="Nachricht senden"
->
-	{#if replyTo || showAutoChip || chips.length > 0 || (enterSends && hasText)}
-		<div class="flex min-w-0 flex-wrap items-center gap-1.5 px-1">
-			{#if replyTo}
-				<span
-					class="inline-flex min-h-7 max-w-full items-center gap-0.5 rounded-full border border-info-border bg-info-muted pl-2.5 text-xs text-info"
-				>
-					<CornerDownRight class="mr-1 size-3.5 shrink-0" aria-hidden="true" />
-					<span class="truncate">Bezug: {replyTo.label}</span>
+<AttachDropZone draft={attachments} disabled={busy}>
+	<form
+		class="space-y-1.5 border-t bg-background p-2 pb-[max(0.5rem,env(safe-area-inset-bottom))] sm:p-3 sm:pb-[max(0.75rem,env(safe-area-inset-bottom))]"
+		onsubmit={send}
+		aria-label="Nachricht senden"
+	>
+		{#if replyTo || showAutoChip || chips.length > 0 || (enterSends && hasText)}
+			<div class="flex min-w-0 flex-wrap items-center gap-1.5 px-1">
+				{#if replyTo}
+					<span
+						class="inline-flex min-h-7 max-w-full items-center gap-0.5 rounded-full border border-info-border bg-info-muted pl-2.5 text-xs text-info"
+					>
+						<CornerDownRight class="mr-1 size-3.5 shrink-0" aria-hidden="true" />
+						<span class="truncate">Bezug: {replyTo.label}</span>
+						<button
+							type="button"
+							class="inline-flex size-7 shrink-0 items-center justify-center rounded-full outline-none hover:opacity-80 focus-visible:ring-3 focus-visible:ring-ring/50"
+							aria-label="Bezug auf {replyTo.label} entfernen"
+							disabled={busy}
+							onclick={clearReply}
+						>
+							<X class="size-3.5" aria-hidden="true" />
+						</button>
+					</span>
+				{/if}
+				{#if showAutoChip}
 					<button
 						type="button"
-						class="inline-flex size-7 shrink-0 items-center justify-center rounded-full outline-none hover:opacity-80 focus-visible:ring-3 focus-visible:ring-ring/50"
-						aria-label="Bezug auf {replyTo.label} entfernen"
-						disabled={busy}
-						onclick={clearReply}
+						class="inline-flex min-h-7 max-w-full items-center gap-1 rounded-full bg-info-muted px-2.5 text-xs text-info transition-colors outline-none hover:opacity-80 focus-visible:ring-3 focus-visible:ring-ring/50"
+						title="{detected.reason} – antippen, um den Modus festzulegen"
+						aria-label="Wird als {detected.mode === 'question'
+							? 'Frage'
+							: 'Auftrag'} erkannt{detected.confidence === 'low'
+							? ' (unsicher)'
+							: ''}. Als festen Modus übernehmen"
+						onclick={() => setMode(detected.mode)}
 					>
-						<X class="size-3.5" aria-hidden="true" />
+						<span class="truncate"
+							>wird <span class="font-medium"
+								>{detected.mode === 'question' ? 'Frage' : 'Auftrag'}</span
+							>{#if detected.confidence === 'low'}<span class="opacity-75">
+									· unsicher</span
+								>{/if}</span
+						>
 					</button>
-				</span>
-			{/if}
-			{#if showAutoChip}
-				<button
-					type="button"
-					class="inline-flex min-h-7 max-w-full items-center gap-1 rounded-full bg-info-muted px-2.5 text-xs text-info transition-colors outline-none hover:opacity-80 focus-visible:ring-3 focus-visible:ring-ring/50"
-					title="{detected.reason} – antippen, um den Modus festzulegen"
-					aria-label="Wird als {detected.mode === 'question'
-						? 'Frage'
-						: 'Auftrag'} erkannt{detected.confidence === 'low'
-						? ' (unsicher)'
-						: ''}. Als festen Modus übernehmen"
-					onclick={() => setMode(detected.mode)}
-				>
-					<span class="truncate"
-						>wird <span class="font-medium"
-							>{detected.mode === 'question' ? 'Frage' : 'Auftrag'}</span
-						>{#if detected.confidence === 'low'}<span class="opacity-75">
-								· unsicher</span
-							>{/if}</span
+				{/if}
+				{#each chips as c (c.key)}
+					<span
+						class="inline-flex min-h-7 max-w-full items-center gap-0.5 rounded-full border bg-muted/50 pl-2.5 text-xs"
 					>
-				</button>
-			{/if}
-			{#each chips as c (c.key)}
-				<span
-					class="inline-flex min-h-7 max-w-full items-center gap-0.5 rounded-full border bg-muted/50 pl-2.5 text-xs"
-				>
-					<span class="truncate">{c.label}</span>
-					<button
-						type="button"
-						class="inline-flex size-7 shrink-0 items-center justify-center rounded-full text-muted-foreground outline-none hover:text-foreground focus-visible:ring-3 focus-visible:ring-ring/50"
-						aria-label="{c.label} zurücksetzen"
-						disabled={busy}
-						onclick={c.reset}
+						<span class="truncate">{c.label}</span>
+						<button
+							type="button"
+							class="inline-flex size-7 shrink-0 items-center justify-center rounded-full text-muted-foreground outline-none hover:text-foreground focus-visible:ring-3 focus-visible:ring-ring/50"
+							aria-label="{c.label} zurücksetzen"
+							disabled={busy}
+							onclick={c.reset}
+						>
+							<X class="size-3.5" aria-hidden="true" />
+						</button>
+					</span>
+				{/each}
+				{#if enterSends && hasText}
+					<span
+						class="ml-auto hidden text-[11px] text-muted-foreground/80 sm:inline"
+						aria-hidden="true">Enter sendet · Umschalt+Enter neue Zeile</span
 					>
-						<X class="size-3.5" aria-hidden="true" />
-					</button>
-				</span>
-			{/each}
-			{#if enterSends && hasText}
-				<span
-					class="ml-auto hidden text-[11px] text-muted-foreground/80 sm:inline"
-					aria-hidden="true">Enter sendet · Umschalt+Enter neue Zeile</span
-				>
-			{/if}
-		</div>
-	{/if}
+				{/if}
+			</div>
+		{/if}
 
-	<div class="flex items-end gap-1.5 sm:gap-2">
-		<DropdownMenu.Root>
-			<DropdownMenu.Trigger>
-				{#snippet child({ props })}
+		<AttachmentList draft={attachments} disabled={busy} class="px-1" />
+
+		<div class="flex items-end gap-1.5 sm:gap-2">
+			<DropdownMenu.Root>
+				<DropdownMenu.Trigger>
+					{#snippet child({ props })}
+						<Button
+							{...props}
+							type="button"
+							variant="ghost"
+							size="icon"
+							class={iconBtn}
+							aria-label="Modus: {active.label} – ändern"
+							title="Modus: {active.label}"
+						>
+							<active.icon class="size-5" aria-hidden="true" />
+							{#if customized && !sm.current}{@render dot()}{/if}
+						</Button>
+					{/snippet}
+				</DropdownMenu.Trigger>
+				<DropdownMenu.Content
+					align="start"
+					side="top"
+					sideOffset={8}
+					class="w-72"
+					onCloseAutoFocus={onMenuCloseAutoFocus}
+				>
+					<DropdownMenu.Label class="text-xs text-muted-foreground"
+						>Wie soll die Nachricht wirken?</DropdownMenu.Label
+					>
+					<DropdownMenu.RadioGroup value={mode} onValueChange={setMode}>
+						{#each CHAT_MODES as m (m.value)}
+							<DropdownMenu.RadioItem
+								value={m.value}
+								closeOnSelect
+								class="min-h-11 items-start py-2"
+							>
+								<m.icon class="mt-0.5 size-4 shrink-0" aria-hidden="true" />
+								<span class="flex min-w-0 flex-col">
+									<span class="font-medium">{m.label}</span>
+									<span class="text-xs text-muted-foreground">{m.hint}</span>
+								</span>
+							</DropdownMenu.RadioItem>
+						{/each}
+					</DropdownMenu.RadioGroup>
+					{#if !sm.current && hasOptions}
+						<DropdownMenu.Separator />
+						<DropdownMenu.Item class="min-h-11" onSelect={() => (pendingOptions = true)}>
+							<SlidersHorizontal class="size-4" aria-hidden="true" />
+							<span class="flex-1">Optionen …</span>
+							{#if customized}
+								<span class="text-xs text-muted-foreground">{chips.length} geändert</span>
+							{/if}
+						</DropdownMenu.Item>
+					{/if}
+				</DropdownMenu.Content>
+			</DropdownMenu.Root>
+
+			{#if sm.current && hasOptions}
+				{#if lg.current}
+					<Popover.Root bind:open={optionsOpen}>
+						<Popover.Trigger>
+							{#snippet child({ props })}
+								<Button
+									{...props}
+									type="button"
+									variant="ghost"
+									size="icon"
+									class={iconBtn}
+									aria-label={customized ? 'Optionen (geändert)' : 'Optionen'}
+									title="Optionen"
+								>
+									<SlidersHorizontal class="size-5" aria-hidden="true" />
+									{#if customized}{@render dot()}{/if}
+								</Button>
+							{/snippet}
+						</Popover.Trigger>
+						<Popover.Content align="start" side="top" sideOffset={8} class="w-80 p-4">
+							<p class="mb-3 text-sm font-medium">Optionen</p>
+							{@render optionsBody()}
+						</Popover.Content>
+					</Popover.Root>
+				{:else}
 					<Button
-						{...props}
 						type="button"
 						variant="ghost"
 						size="icon"
 						class={iconBtn}
-						aria-label="Modus: {active.label} – ändern"
-						title="Modus: {active.label}"
+						aria-label={customized ? 'Optionen (geändert)' : 'Optionen'}
+						aria-haspopup="dialog"
+						aria-expanded={optionsOpen}
+						title="Optionen"
+						onclick={() => (optionsOpen = true)}
 					>
-						<active.icon class="size-5" aria-hidden="true" />
-						{#if customized && !sm.current}{@render dot()}{/if}
+						<SlidersHorizontal class="size-5" aria-hidden="true" />
+						{#if customized}{@render dot()}{/if}
 					</Button>
-				{/snippet}
-			</DropdownMenu.Trigger>
-			<DropdownMenu.Content
-				align="start"
-				side="top"
-				sideOffset={8}
-				class="w-72"
-				onCloseAutoFocus={onMenuCloseAutoFocus}
-			>
-				<DropdownMenu.Label class="text-xs text-muted-foreground"
-					>Wie soll die Nachricht wirken?</DropdownMenu.Label
-				>
-				<DropdownMenu.RadioGroup value={mode} onValueChange={setMode}>
-					{#each CHAT_MODES as m (m.value)}
-						<DropdownMenu.RadioItem value={m.value} closeOnSelect class="min-h-11 items-start py-2">
-							<m.icon class="mt-0.5 size-4 shrink-0" aria-hidden="true" />
-							<span class="flex min-w-0 flex-col">
-								<span class="font-medium">{m.label}</span>
-								<span class="text-xs text-muted-foreground">{m.hint}</span>
-							</span>
-						</DropdownMenu.RadioItem>
-					{/each}
-				</DropdownMenu.RadioGroup>
-				{#if !sm.current && hasOptions}
-					<DropdownMenu.Separator />
-					<DropdownMenu.Item class="min-h-11" onSelect={() => (pendingOptions = true)}>
-						<SlidersHorizontal class="size-4" aria-hidden="true" />
-						<span class="flex-1">Optionen …</span>
-						{#if customized}
-							<span class="text-xs text-muted-foreground">{chips.length} geändert</span>
-						{/if}
-					</DropdownMenu.Item>
 				{/if}
-			</DropdownMenu.Content>
-		</DropdownMenu.Root>
-
-		{#if sm.current && hasOptions}
-			{#if lg.current}
-				<Popover.Root bind:open={optionsOpen}>
-					<Popover.Trigger>
-						{#snippet child({ props })}
-							<Button
-								{...props}
-								type="button"
-								variant="ghost"
-								size="icon"
-								class={iconBtn}
-								aria-label={customized ? 'Optionen (geändert)' : 'Optionen'}
-								title="Optionen"
-							>
-								<SlidersHorizontal class="size-5" aria-hidden="true" />
-								{#if customized}{@render dot()}{/if}
-							</Button>
-						{/snippet}
-					</Popover.Trigger>
-					<Popover.Content align="start" side="top" sideOffset={8} class="w-80 p-4">
-						<p class="mb-3 text-sm font-medium">Optionen</p>
-						{@render optionsBody()}
-					</Popover.Content>
-				</Popover.Root>
-			{:else}
-				<Button
-					type="button"
-					variant="ghost"
-					size="icon"
-					class={iconBtn}
-					aria-label={customized ? 'Optionen (geändert)' : 'Optionen'}
-					aria-haspopup="dialog"
-					aria-expanded={optionsOpen}
-					title="Optionen"
-					onclick={() => (optionsOpen = true)}
-				>
-					<SlidersHorizontal class="size-5" aria-hidden="true" />
-					{#if customized}{@render dot()}{/if}
-				</Button>
 			{/if}
-		{/if}
 
-		<Label for="chat-input" class="sr-only">Nachricht</Label>
-		<Textarea
-			id="chat-input"
-			bind:ref={textarea}
-			bind:value={body}
-			rows={1}
-			maxlength={20000}
-			placeholder={active.placeholder}
-			enterkeyhint={enterSends ? 'send' : 'enter'}
-			aria-keyshortcuts={enterSends ? 'Enter Control+Enter Meta+Enter' : 'Control+Enter Meta+Enter'}
-			readonly={busy}
-			aria-busy={busy}
-			{onkeydown}
-			class="max-h-[40dvh] min-h-11 min-w-0 flex-1 resize-none overflow-y-auto rounded-3xl px-4 py-2.5 sm:min-h-10 sm:py-2"
-		/>
-		<Button
-			type="submit"
-			size="icon"
-			class="size-11 shrink-0 rounded-full sm:size-10 focus-visible:ring-3 focus-visible:ring-ring/50"
-			disabled={busy || !hasText}
-			aria-label={busy ? BUSY_SEND : 'Senden'}
-			title={enterSends ? 'Senden (Enter)' : 'Senden'}
-		>
-			{#if busy}
-				<LoaderCircle class="size-5 animate-spin" aria-hidden="true" />
-			{:else}
-				<ArrowUp class="size-5" aria-hidden="true" />
-			{/if}
-		</Button>
-	</div>
-</form>
+			<AttachButton draft={attachments} disabled={busy} class={iconBtn} />
+
+			<Label for="chat-input" class="sr-only">Nachricht</Label>
+			<Textarea
+				id="chat-input"
+				bind:ref={textarea}
+				bind:value={body}
+				rows={1}
+				maxlength={20000}
+				placeholder={active.placeholder}
+				enterkeyhint={enterSends ? 'send' : 'enter'}
+				aria-keyshortcuts={enterSends
+					? 'Enter Control+Enter Meta+Enter'
+					: 'Control+Enter Meta+Enter'}
+				readonly={busy}
+				aria-busy={busy}
+				{onkeydown}
+				onpaste={attachments.onpaste}
+				class="max-h-[40dvh] min-h-11 min-w-0 flex-1 resize-none overflow-y-auto rounded-3xl px-4 py-2.5 sm:min-h-10 sm:py-2"
+			/>
+			<Button
+				type="submit"
+				size="icon"
+				class="size-11 shrink-0 rounded-full sm:size-10 focus-visible:ring-3 focus-visible:ring-ring/50"
+				disabled={busy || !hasText || attachments.uploading}
+				aria-label={busy
+					? BUSY_SEND
+					: attachments.uploading
+						? 'Senden (wartet auf Uploads)'
+						: 'Senden'}
+				title={enterSends ? 'Senden (Enter)' : 'Senden'}
+			>
+				{#if busy}
+					<LoaderCircle class="size-5 animate-spin" aria-hidden="true" />
+				{:else}
+					<ArrowUp class="size-5" aria-hidden="true" />
+				{/if}
+			</Button>
+		</div>
+	</form>
+</AttachDropZone>
 
 {#if !lg.current}
 	<BottomSheet

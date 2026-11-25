@@ -22,6 +22,7 @@
 	import Markdown from '../components/Markdown.svelte';
 	import StatusBadge from '../components/StatusBadge.svelte';
 	import ChatComposer from './ChatComposer.svelte';
+	import AttachmentView from './AttachmentView.svelte';
 	import ChatActions from './chat/ChatActions.svelte';
 	import { canImplement, replyLabel } from './chat/proposals';
 	import { activityFor, buildTimeline, clockTime } from './chat/timeline';
@@ -424,6 +425,7 @@
 										title={item.first ? undefined : absolute(m.createdAt)}
 									>
 										<Markdown text={m.body} />
+										<AttachmentView attachments={m.attachments} class="mt-2" />
 										{#if m.taskId}
 											<a
 												href={taskPath(store.id, m.taskId)}
