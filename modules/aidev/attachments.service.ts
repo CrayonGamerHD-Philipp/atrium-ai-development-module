@@ -89,6 +89,48 @@ export function bytesOf(v: unknown): Uint8Array {
 
 // ---------------------------------------------------------------- Upload
 
+/** Zuschlag für Multipart-Grenzen und Kopfzeilen beim Einlesen eines Uploads */
+export const ATTACHMENT_BODY_OVERHEAD = 1024 * 1024;
+
+/**
+ * Request-Body gestreamt mit Byte-Zähler einlesen und bei mehr als `maxBytes` sofort mit 413 abbrechen – auch ohne
+ * bzw. mit falschem `content-length` (z. B. `Transfer-Encoding: chunked`). Liefert einen gleichwertigen Request mit
+ * gepuffertem Body für `readUpload`; im Speicher landet so höchstens `maxBytes` (+ ein Chunk).
+ */
+export async function limitedUploadRequest(
+	request: Request,
+	maxBytes = ATTACHMENT_MAX_BYTES + ATTACHMENT_BODY_OVERHEAD
+): Promise<Request> {
+	const tooLarge = () => errors.tooLarge('Die Datei ist zu groß (höchstens 10 MB).');
+	const declared = Number(request.headers.get('content-length') ?? '');
+	if (Number.isFinite(declared) && declared > maxBytes) throw tooLarge();
+	const chunks: Uint8Array[] = [];
+	let total = 0;
+	if (request.body) {
+		const reader = request.body.getReader();
+		for (;;) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			total += value.byteLength;
+			if (total > maxBytes) {
+				// Rest nicht mehr lesen; Fehler beim Abbrechen sind bedeutungslos
+				await reader.cancel().catch(() => undefined);
+				throw tooLarge();
+			}
+			chunks.push(value);
+		}
+	}
+	const body = new Uint8Array(total);
+	let offset = 0;
+	for (const c of chunks) {
+		body.set(c, offset);
+		offset += c.byteLength;
+	}
+	const headers = new Headers(request.headers);
+	headers.set('content-length', String(total));
+	return new Request(request.url, { method: request.method, headers, body });
+}
+
 export interface NewAttachment {
 	projectId: string;
 	userId: string | null;
