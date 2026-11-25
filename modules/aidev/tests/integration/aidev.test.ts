@@ -808,6 +808,138 @@ describe('aidev', () => {
 		expect((await task(resolve.id)).task.status).toBe('done');
 	});
 
+	it('Neu starten: ohne Body, erledigt, laufend, Rechte, ungültiger Body', async () => {
+		const t = await createTask({ prompt: 'Neustart-Test', maxAttempts: 1 });
+		const o1 = await offerFor(t.id);
+		ok(await call('runner', 'POST', `/runner/runs/${o1.runId}/accept`), 201);
+		ok(await finish(o1.runId, { status: 'failed', errorMessage: 'kaputt' }), 201);
+		expect((await task(t.id)).task).toMatchObject({ status: 'failed', attempts: 1 });
+
+		// (a) fehlgeschlagen → ohne Body neu starten → wartet, Versuche 0, Fehler gelöscht
+		const restarted = ok<TaskDto>(await call('admin', 'POST', `/tasks/${t.id}/retry`), 201);
+		expect(restarted).toMatchObject({ status: 'queued', attempts: 0, errorMessage: null });
+		const audits = await core.audit.listForModule(admin, 'aidev', { targets: [t.id] });
+		const audit = audits.rows.find((r) => r.action === 'aidev.task.restarted');
+		expect(audit?.metadata).toEqual({ projectId, subtasks: 'failed', reset: 0 });
+
+		// (c) laufend → 409
+		const o2 = await offerFor(t.id);
+		ok(await call('runner', 'POST', `/runner/runs/${o2.runId}/accept`), 201);
+		expect((await task(t.id)).task.status).toBe('running');
+		const busy = await call('admin', 'POST', `/tasks/${t.id}/retry`);
+		expect(busy.status).toBe(409);
+		ok(await finish(o2.runId, { status: 'succeeded', summary: 'fertig' }), 201);
+		expect((await task(t.id)).task.status).toBe('done');
+
+		// (f) fremder Auftrag ohne task.manage → 403
+		expect((await call('creator', 'POST', `/tasks/${t.id}/retry`)).status).toBe(403);
+		// (g) ungültiger Body → Validierungsfehler, Auftrag unverändert
+		const invalid = await call('admin', 'POST', `/tasks/${t.id}/retry`, { subtasks: 'some' });
+		expect([400, 422]).toContain(invalid.status);
+		expect((await task(t.id)).task.status).toBe('done');
+
+		// (b) erledigt → neu starten → wartet
+		const again = ok<TaskDto>(
+			await call('admin', 'POST', `/tasks/${t.id}/retry`, { subtasks: 'failed' }),
+			201
+		);
+		expect(again).toMatchObject({ status: 'queued', attempts: 0 });
+		// Entwurf ist kein Endzustand → 409
+		const draft = await createTask({ prompt: 'Neustart-Entwurf', draft: true });
+		expect((await call('admin', 'POST', `/tasks/${draft.id}/retry`)).status).toBe(409);
+		ok(await call('admin', 'DELETE', `/tasks/${draft.id}`));
+		ok(await call('admin', 'POST', `/tasks/${t.id}/cancel`), 201);
+	});
+
+	it('Neu starten: Teilauftrag öffnet gescheiterten Elternauftrag, subtasks=all setzt alles zurück', async () => {
+		const parent = await createTask({
+			prompt: 'Neustart-Orchestrierung',
+			decompose: true,
+			maxAttempts: 1
+		});
+		const plan = await offerFor(parent.id);
+		ok(await call('runner', 'POST', `/runner/runs/${plan.runId}/accept`), 201);
+		ok(
+			await finish(plan.runId, {
+				status: 'succeeded',
+				plan: {
+					subtasks: [
+						{ key: 'a', title: 'Teil A', prompt: 'A', role: 'research' },
+						{ key: 'b', title: 'Teil B', prompt: 'B', role: 'research', dependsOn: ['a'] }
+					]
+				}
+			}),
+			201
+		);
+		const [a, b] = (await task(parent.id)).children;
+		const oa = await offerFor(a!.id);
+		ok(await call('runner', 'POST', `/runner/runs/${oa.runId}/accept`), 201);
+		ok(await finish(oa.runId, { status: 'failed', errorMessage: 'A kaputt' }), 201);
+		let d = await task(parent.id);
+		expect(d.task.status).toBe('failed');
+		expect(d.children.map((c) => c.status)).toEqual(['failed', 'cancelled']);
+
+		// (d) Teilauftrag neu starten → Teilauftrag wartet, Elternauftrag wieder blockiert (Fehler gelöscht),
+		// das nur deshalb abgebrochene Geschwister läuft ebenfalls neu
+		const child = ok<TaskDto>(await call('admin', 'POST', `/tasks/${a!.id}/retry`), 201);
+		expect(child).toMatchObject({ status: 'queued', attempts: 0 });
+		d = await task(parent.id);
+		expect(d.task).toMatchObject({ status: 'blocked', errorMessage: null, finishedAt: null });
+		expect(d.children.map((c) => [c.status, c.attempts])).toEqual([
+			['queued', 0],
+			['queued', 0]
+		]);
+
+		// abarbeiten und ausliefern
+		for (const c of [a!, b!]) {
+			const o = await offerFor(c.id);
+			ok(await call('runner', 'POST', `/runner/runs/${o.runId}/accept`), 201);
+			ok(await finish(o.runId, { status: 'succeeded', summary: `Ergebnis ${c.title}` }), 201);
+		}
+		const deliver = await offerFor(parent.id);
+		ok(await call('runner', 'POST', `/runner/runs/${deliver.runId}/accept`), 201);
+		ok(await finish(deliver.runId, { status: 'succeeded', summary: 'ausgeliefert' }), 201);
+		expect((await task(parent.id)).task.status).toBe('done');
+		const delivered = async () =>
+			(
+				await q<{ delivered: boolean }>(
+					sql`SELECT (plan->>'delivered')::boolean AS delivered FROM task WHERE id = ${parent.id}`
+				)
+			)[0]!.delivered;
+		expect(await delivered()).toBe(true);
+
+		// ausgelieferter Elternauftrag: Teilauftrag allein lässt sich nicht neu starten
+		const blocked = await call<unknown>('admin', 'POST', `/tasks/${a!.id}/retry`);
+		expect(blocked.status).toBe(409);
+		expect(JSON.stringify(blocked.body)).toContain('übergeordneten Auftrag neu starten');
+
+		// (e) subtasks=all → alle Teilaufträge warten, Elternauftrag blockiert, Plan wieder nicht ausgeliefert
+		const all = ok<TaskDto>(
+			await call('admin', 'POST', `/tasks/${parent.id}/retry`, { subtasks: 'all' }),
+			201
+		);
+		expect(all).toMatchObject({ status: 'blocked', attempts: 0 });
+		d = await task(parent.id);
+		expect(d.children.map((c) => [c.status, c.attempts, c.errorMessage])).toEqual([
+			['queued', 0, null],
+			['queued', 0, null]
+		]);
+		expect(await delivered()).toBe(false);
+
+		// läuft wieder durch bis zur erneuten Auslieferung
+		for (const c of [a!, b!]) {
+			const o = await offerFor(c.id);
+			ok(await call('runner', 'POST', `/runner/runs/${o.runId}/accept`), 201);
+			ok(await finish(o.runId, { status: 'succeeded', summary: `Neu ${c.title}` }), 201);
+		}
+		const again = await offerFor(parent.id);
+		expect(again).toMatchObject({ role: 'implement', readOnly: false });
+		ok(await call('runner', 'POST', `/runner/runs/${again.runId}/accept`), 201);
+		ok(await finish(again.runId, { status: 'succeeded', summary: 'erneut ausgeliefert' }), 201);
+		expect((await task(parent.id)).task.status).toBe('done');
+		expect(await delivered()).toBe(true);
+	});
+
 	it('Rechte: Runner-Key, fremder Runner, Person ohne Projektrecht, fremde Aufträge', async () => {
 		expect((await call('runner', 'GET', '/projects')).status).toBe(403);
 		expect(
