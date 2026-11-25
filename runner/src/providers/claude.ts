@@ -253,7 +253,7 @@ export const claudeAdapter: ProviderAdapter = {
 			'--output-format',
 			'stream-json',
 			'--verbose',
-			'--dangerously-skip-permissions'
+			...(o.question ? ['--tools', 'Read,Glob,Grep'] : ['--dangerously-skip-permissions'])
 		];
 		if (o.systemPrompt) args.push('--append-system-prompt-file', sysFile);
 		if (o.model) args.push('--model', o.model);

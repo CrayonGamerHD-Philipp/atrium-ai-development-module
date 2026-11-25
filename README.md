@@ -80,3 +80,25 @@ anschließend unter **Runner & Konten** frei.
   (`aidev.workspace.terminal`, `aidev.workspace.files`). Jede Sitzung wird protokolliert.
 - Externe Empfänger sind GitHub und die KI-Anbieter (Anthropic, OpenAI, Google bzw. die eingestellte API). Sie werden
   ausschließlich vom Runner aus angesprochen.
+
+### Auslieferung pro Auftrag
+
+Bei neuen Aufträgen im Board oder Chat bestimmt „Auslieferung“ das Ergebnis: „Projektvorgabe“
+verwendet weiterhin die aktuelle Commit-Policy des Projekts. „Branch bereitstellen (ohne PR)“
+pusht getestete Änderungen auf einen eigenen Remote-Branch, erstellt keinen Pull Request und
+ändert den Hauptbranch nicht. Bei aufgeteilten Aufträgen werden die Teilaufträge zunächst auf
+dem Integrations-Branch zusammengeführt; die Wahl gilt für die abschließende Auslieferung.
+Leseaufträge liefern keine Änderungen aus. Die Auftragsansicht zeigt, ob ein Branch tatsächlich
+bereitgestellt wurde; ohne Änderungen wird kein Branch gepusht. API-Aufrufe können optional
+`delivery: "branch"` setzen; ohne Angabe gilt `delivery: "project"`, auch für bestehende Aufträge.
+Runner müssen für die neue Option aktualisiert werden: Der Scheduler vergibt Branch-Auslieferungen
+nur an Runner, die sich mit der Capability `branchDelivery` anmelden; bei gemischten Runner-Versionen
+bleiben solche Aufträge in der Warteschlange, bis ein aktueller Runner frei ist.
+
+Im Projekt-Chat beantwortet der Modus „Frage“ freie Fragen durch einen lesenden Agenten. Der
+Anbieter kann gewählt werden; frühere Fragen und Antworten werden begrenzt als Kontext übergeben,
+Notizen und Aufträge nicht. Antwort, Fehler und Abbruch erscheinen im Chat und sind mit dem Lauf
+verknüpft. Fragen benötigen wie Aufträge das Recht `task.create`. Der Runner führt kein Projekt-Setup
+oder Auslieferung für Fragen aus; hierfür muss er auf die aktuelle Version aktualisiert werden.
+Die Lesebeschränkung hängt zusätzlich von den jeweiligen CLI-Anbietern und deren Konfiguration ab;
+sie ersetzt keine isolierte Runner-Umgebung oder restriktive Zugangsdaten.

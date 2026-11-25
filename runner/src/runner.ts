@@ -76,7 +76,7 @@ export class Runner {
 	private heartbeatSec = 15;
 	private stream: ReturnType<typeof runCommandStream> | null = null;
 	private timers: NodeJS.Timeout[] = [];
-	private capabilities = { git: false, gh: false, pty: false, os: `${process.platform}-${process.arch}` };
+	private capabilities = { question: true, branchDelivery: true, git: false, gh: false, pty: false, os: `${process.platform}-${process.arch}` };
 	private needsRegister = false;
 
 	constructor(private readonly o: RunnerOptions) {
@@ -231,7 +231,7 @@ export class Runner {
 	async start(): Promise<void> {
 		await mkdir(this.o.config.workDir, { recursive: true });
 		const [git, ghOk, ptyOk] = await Promise.all([hasCommand('git'), hasCommand('gh'), this.pty.available()]);
-		this.capabilities = { git, gh: ghOk, pty: ptyOk, os: `${os.platform()}-${os.arch()}`.slice(0, 40) };
+		this.capabilities = { question: true, branchDelivery: true, git, gh: ghOk, pty: ptyOk, os: `${os.platform()}-${os.arch()}`.slice(0, 40) };
 		if (!git) this.log.error('git wurde nicht gefunden – Läufe sind nicht möglich');
 		if (!ghOk) this.log.warn('gh wurde nicht gefunden – PRs und PR-Übersicht sind nicht möglich');
 		if (!ptyOk) this.log.info('node-pty nicht verfügbar – Terminals sind deaktiviert');

@@ -123,6 +123,9 @@ describe('Codex-Parser', () => {
 			'/work/wt/1',
 			'-'
 		]);
+		const question = codexArgs({ ...base, question: true, readOnly: true, resumeSessionId: null }, { provider: 'codex', configArgs: [], model: null });
+		expect(question).toContain('read-only');
+		expect(question).not.toContain('--dangerously-bypass-approvals-and-sandbox');
 		const resume = codexArgs({ ...base, resumeSessionId: 'abc' }, { provider: 'codex', configArgs: [], model: null });
 		expect(resume.slice(0, 2)).toEqual(['exec', 'resume']);
 		expect(resume.slice(-2)).toEqual(['abc', '-']);
