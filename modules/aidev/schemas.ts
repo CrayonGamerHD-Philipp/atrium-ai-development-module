@@ -11,6 +11,8 @@ import {
 	workspaceTargetSchema,
 	type CommitPolicy,
 	type FsEntry,
+	type LimitSnapshot,
+	type LimitWindow,
 	type Provider,
 	type Role,
 	type RunEvent
@@ -491,6 +493,32 @@ export interface AccountDto {
 	cooldownUntil: string | null;
 	cooldownReason: string | null;
 	usage: { used5h: number; usedWeek: number; util5h: number; utilWeek: number; running: number };
+	/** Zuletzt gemeldeter Limit-Stand mit Atrium-Analyse (`null` = nie gemeldet) */
+	limits: AccountLimitsDto | null;
+}
+
+export interface AccountLimitWindowDto {
+	window: LimitWindow['window'];
+	label: string;
+	/** vom Anbieter gemeldete Auslastung in Prozent (0–100, über 100 bei Overage) */
+	usedPercent: number | null;
+	resetsAt: string | null;
+	status: LimitWindow['status'];
+	/** eigene Schätzung Atriums aus dem Verbrauch (0..1), nur für `5h` und `week` */
+	estimatedUtil: number | null;
+	/** Prognose, wann 100 % erreicht werden (`null` = nicht vor dem Reset bzw. unbekannt) */
+	exhaustsAt: string | null;
+}
+
+export interface AccountLimitsDto {
+	observedAt: string;
+	source: LimitSnapshot['source'];
+	/** Daten älter als 30 Minuten */
+	stale: boolean;
+	windows: AccountLimitWindowDto[];
+	/** aus Auslastung und Verbrauch abgeleitete Budgetvorschläge (Einheiten), `null` = zu wenig Daten */
+	suggestedBudget5hUnits: number | null;
+	suggestedBudgetWeekUnits: number | null;
 }
 
 export interface OverviewDto {
