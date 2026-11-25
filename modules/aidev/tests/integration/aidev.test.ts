@@ -750,6 +750,16 @@ describe('aidev', () => {
 		);
 		expect(res.task).toMatchObject({ role: 'implement', status: 'queued' });
 		expect(res.message).toMatchObject({ kind: 'user', taskId: res.task.id });
+		// der Auftrag erhält den bisherigen Frage-/Antwort-Verlauf, ist aber selbst keine Chat-Frage
+		const [row] = await q<{ chat_question: boolean; chat_context: string }>(
+			sql`SELECT chat_question, chat_context FROM task WHERE id = ${res.task.id}`
+		);
+		expect(row!.chat_question).toBe(false);
+		expect(row!.chat_context).toContain('Question: Wie funktioniert das?');
+		expect(row!.chat_context).toContain('Answer: Antwort');
+		expect(row!.chat_context).not.toContain('Bitte die Tests reparieren');
+		expect(row!.chat_context).not.toContain('Geheime Notiz');
+		expect(row!.chat_context.length).toBeLessThanOrEqual(12000);
 		ok(await call('admin', 'POST', `/tasks/${res.task.id}/cancel`), 201);
 	});
 
