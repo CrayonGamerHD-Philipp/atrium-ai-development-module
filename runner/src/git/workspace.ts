@@ -166,6 +166,46 @@ export class Workspace {
 		return out;
 	}
 
+	/** Lauf-ID eines Worktrees unter `WORK_DIR/wt` oder `null` (z. B. Arbeitskopie des Haupt-Branchs) */
+	private runIdOf(dir: string): string | null {
+		const rel = path.relative(path.resolve(this.wtRoot), path.resolve(dir));
+		if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) return null;
+		return rel.split(/[\\/]/)[0]?.slice(0, 36) ?? null;
+	}
+
+	/**
+	 * Gelöschte Remote-Branches im Cache nachziehen: lokale Branches und `refs/remotes/origin/<b>` entfernen (unter dem
+	 * Repo-Mutex). Worktrees aktiver Läufe (`active`) werden nie angefasst – deren Branch bleibt lokal erhalten; andere
+	 * Worktrees mit dem Branch werden auf „detached“ gestellt. Danach `git worktree prune`. Fehlt der Cache, passiert
+	 * nichts. Liefert die Branches, die wegen eines aktiven Laufs lokal erhalten blieben.
+	 */
+	async deleteCachedBranches(r: RepoRef, branches: string[], active: Set<string> = new Set()): Promise<string[]> {
+		for (const b of branches) assertRefName(b);
+		const cache = this.cacheDir(r);
+		return this.withRepo(r, async () => {
+			if (!existsSync(path.join(cache, 'HEAD'))) return [];
+			await this.git(['worktree', 'prune'], { cwd: cache, allowFail: true });
+			const kept: string[] = [];
+			for (const branch of branches) {
+				await this.git(['update-ref', '-d', `refs/remotes/origin/${branch}`], { cwd: cache, allowFail: true });
+				if (!(await this.revParse(cache, `refs/heads/${branch}`))) continue;
+				const holders = await this.worktreesOf(cache, branch);
+				if (holders.some((h) => active.has(this.runIdOf(h) ?? ''))) {
+					kept.push(branch);
+					continue;
+				}
+				for (const other of holders) {
+					this.log.info(`Worktree ${other} hält gelöschten Branch ${branch} – wird auf detached umgestellt`);
+					await this.git(['checkout', '--quiet', '--detach'], { cwd: other, allowFail: true });
+				}
+				const del = await this.git(['branch', '-D', '--quiet', branch], { cwd: cache, allowFail: true });
+				if (del.code !== 0) this.log.warn(`Lokaler Branch ${branch} konnte nicht gelöscht werden`, del.stderr.trim());
+			}
+			await this.git(['worktree', 'prune'], { cwd: cache, allowFail: true });
+			return kept;
+		});
+	}
+
 	/** Worktree hinzufügen; ein anderer Worktree mit demselben Branch wird dafür auf „detached“ gestellt */
 	async addWorktree(
 		cache: string,
