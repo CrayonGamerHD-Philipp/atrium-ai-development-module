@@ -49,6 +49,52 @@ stehen unter **Administration → Runner & Konten**.
 
 Teilaufträge werden in einen Integrations-Branch gemergt und zum Schluss gemeinsam ausgeliefert.
 
+### Bestehende Pull Requests bearbeiten
+
+Ein Auftrag kann einen offenen Pull Request weiterbearbeiten, statt einen neuen Branch und PR anzulegen. Im Tab
+**Pull Requests** des Projekts entsteht dazu ein Auftrag mit `targetPr` (API: `targetPr: <PR-Nummer>`, auch im Chat).
+
+Ablauf:
+
+1. Atrium prüft den PR anhand der synchronisierten PR-Liste. Der Auftrag übernimmt den Head-Branch des PR als
+   Arbeits-Branch, Basis ist der Haupt-Branch. Die Auslieferung ist `pr-update`.
+2. Der Runner checkt den Head-Branch aus und prüft vor dem Agent-Start, dass der PR offen ist, aus demselben Repo
+   stammt und zu diesem Branch gehört.
+3. Der Agent bekommt PR-Beschreibung, Reviews, Kommentare und Inline-Kommentare angehängt, als **nicht
+   vertrauenswürdigen Kontext** (Zitat, gekürzt). Er behandelt ihn als Daten, nicht als Anweisungen.
+4. Nach dem Agent laufen Commit und **testCmd**. Schlägt der Test fehl, wird nichts gepusht.
+5. Der Runner pusht **ohne Force** auf denselben Branch. Hat jemand parallel gepusht, werden nur die eigenen Commits
+   darauf übernommen. Es entsteht kein neuer PR.
+6. Die Zusammenfassung landet als Kommentar im PR (mit den neuen Commits und `Aidev-Task: <id>`). Der Auftrag geht auf
+   **Prüfung**.
+
+Voraussetzungen:
+
+- Der PR ist offen, nicht von einem Fork und hat einen eigenen Branch (nicht den Haupt-Branch).
+- Die Pull Requests des Projekts sind synchronisiert, sonst lehnt Atrium den Auftrag ab (422).
+- Ein Runner mit der Fähigkeit `prUpdate`. Ältere Runner bekommen solche Aufträge nicht; sie warten in der Schlange.
+- Das GitHub-Token des Runners hat Schreibrechte auf den PR-Branch und darf kommentieren
+  (siehe [`runner/README.md`](runner/README.md#sicherheit)).
+
+Grenzen:
+
+- **Fork-PRs** werden nicht bearbeitet. Geschlossene oder gemergte PRs ebenso wenig.
+- **Kein Force-Push**, auch nicht auf `aidev/`-Branches. Lassen sich die eigenen Commits nicht konfliktfrei auf parallel
+  gepushte übernehmen, endet der Lauf als Konflikt; lehnt GitHub den Push ab, schlägt der Lauf fehl.
+- **Konflikte** mit dem Haupt-Branch werden gelöst, indem `origin/<Haupt-Branch>` in den PR-Branch gemergt wird. Der
+  Branch wird nie rebased.
+- Fehlt der Branch auf dem Remote, bricht der Lauf ab. Er wird nicht neu angelegt.
+
+Mit **Planen & Aufteilen** wird der PR-Branch zum Integrations-Branch: Die Teilaufträge zweigen von ihm ab und werden
+hineingemergt, keiner öffnet einen neuen PR. Die abschließende Auslieferung pusht in den PR.
+
+### Parallelisierung und Modellwahl
+
+**Planen & Aufteilen** zerlegt große Aufträge in Teilaufträge mit Abhängigkeiten. Unabhängige Teilaufträge verteilt
+der Scheduler parallel auf freie Konten und Runner. Welcher Anbieter welche Rolle übernimmt, stellst du unter
+**Administration → KI-Verteilung** ein. Der Orchestrator setzt `provider` für einen Teilauftrag nur, wenn ein Anbieter
+dafür klar geeignet ist; sonst gilt die Verteilung.
+
 ## Entwicklung
 
 ```bash
