@@ -54,6 +54,9 @@ export const registerInput = z.object({
 	version: shortText(40),
 	maxSlots: z.number().int().min(0).max(64),
 	capabilities: z.object({
+		question: z.boolean().optional(),
+		/** Versteht `delivery.mode = 'branch'` (ältere Runner verwerfen solche Angebote) */
+		branchDelivery: z.boolean().optional(),
 		git: z.boolean(),
 		gh: z.boolean(),
 		pty: z.boolean(),
@@ -135,6 +138,7 @@ export const runOfferSchema = z.object({
 	/** Ausgangspunkt (`origin/<branch>`), z. B. Haupt-Branch oder Integrations-Branch */
 	baseRef: shortText(200),
 	readOnly: z.boolean(),
+	question: z.boolean().optional(),
 	/** Orchestrierung: Agent muss einen Plan als JSON (`planSchema`) ausgeben */
 	expectPlan: z.boolean(),
 	resumeSessionId: shortText(200).nullable(),

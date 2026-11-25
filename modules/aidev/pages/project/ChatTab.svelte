@@ -29,7 +29,7 @@
 	const canWrite = $derived(has(PERM.taskCreate));
 
 	let body = $state('');
-	let mode = $state<'task' | 'note'>('task');
+	let mode = $state<'task' | 'note' | 'question'>('task');
 	let role = $state<Role>('implement');
 	let decompose = $state(false);
 	let delivery = $state<'project' | 'branch'>('project');
@@ -90,7 +90,7 @@
 				delivery,
 				role,
 				decompose: mode === 'task' && decompose,
-				providerHint: mode === 'task' ? providerHint : null
+				providerHint: mode !== 'note' ? providerHint : null
 			});
 			store.addChat(res.message);
 			if (res.task) store.upsertTask(res.task);
@@ -230,14 +230,16 @@
 				maxlength={20000}
 				placeholder={mode === 'task'
 					? 'Was soll gebaut werden? Markdown möglich (Strg+Enter sendet)'
-					: 'Notiz für den Verlauf, Markdown möglich (Strg+Enter sendet)'}
+					: mode === 'question'
+						? 'Was möchtest du wissen? Markdown möglich (Strg+Enter sendet)'
+						: 'Notiz für den Verlauf, Markdown möglich (Strg+Enter sendet)'}
 				{onkeydown}
 				disabled={busy}
 				class="max-h-48 min-h-14 resize-y"
 			/>
 			<div class="flex flex-wrap items-center gap-x-3 gap-y-2">
 				<div class="inline-flex rounded-lg border p-0.5" role="group" aria-label="Modus">
-					{#each [{ v: 'task', l: 'Auftrag' }, { v: 'note', l: 'Notiz' }] as o (o.v)}
+					{#each [{ v: 'task', l: 'Auftrag' }, { v: 'question', l: 'Frage' }, { v: 'note', l: 'Notiz' }] as o (o.v)}
 						<button
 							type="button"
 							class={cn(
@@ -247,7 +249,7 @@
 									: 'text-muted-foreground hover:text-foreground'
 							)}
 							aria-pressed={mode === o.v}
-							onclick={() => (mode = o.v as 'task' | 'note')}>{o.l}</button
+							onclick={() => (mode = o.v as 'task' | 'note' | 'question')}>{o.l}</button
 						>
 					{/each}
 				</div>
@@ -274,6 +276,8 @@
 						<Switch bind:checked={decompose} size="sm" disabled={busy} />
 						Planen & aufteilen
 					</label>
+				{/if}
+				{#if mode !== 'note'}
 					<SelectField
 						label="Anbieter"
 						options={providerOptions}
@@ -290,6 +294,9 @@
 					{busy ? BUSY_SEND : 'Senden'}
 				</Button>
 			</div>
+			{#if mode === 'question'}<p class="text-xs text-muted-foreground">
+					Fragen werden lesend beantwortet. Frühere Fragen und Antworten dienen als Kontext.
+				</p>{/if}
 			{#if mode === 'task'}<p class="text-xs text-muted-foreground">
 					Branch bereitstellen pusht einen eigenen Branch ohne PR; der Hauptbranch bleibt
 					unverändert. Leseaufträge liefern keine Änderungen aus.
