@@ -1,6 +1,6 @@
 /** Gemeinsame Schnittstelle der Provider-Adapter (Claude Code, Codex, Gemini, OpenAI-kompatibel, Fake). */
 import type { AccountConfig } from '../config.ts';
-import type { RunEventKind } from '../protocol.ts';
+import type { LimitWindow, RunEventKind } from '../protocol.ts';
 import type { LimitKind } from './limits.ts';
 
 export interface AgentUsage {
@@ -22,7 +22,9 @@ export type NormalizedEvent =
 	| { kind: RunEventKind; payload: Record<string, unknown> }
 	| { kind: 'usage'; usage: AgentUsage }
 	| { kind: 'session'; id: string }
-	| ({ kind: 'limit' } & AgentLimit);
+	| ({ kind: 'limit' } & AgentLimit)
+	/** Beobachteter Limit-Stand (jedes Claude-`rate_limit_event` bzw. Codex-`rate_limits`, auch ohne Treffer) */
+	| { kind: 'limits'; windows: LimitWindow[] };
 
 export interface AgentResult {
 	exitCode: number | null;

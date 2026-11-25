@@ -2,6 +2,7 @@
  * Deterministischer Agent für Tests und Vorführungen (kein externer Prozess). Szenarien über Marker im Auftrag:
  * `[fake:fail]` (Fehler), `[fake:limit]` (5-Stunden-Limit), `[fake:plan]` (gültiger Plan als ```json-Block),
  * `[fake:slow]` (läuft bis zum Abbruch bzw. höchstens 60 s), `[fake:commit]` (Agent committet selbst).
+ * Meldet außerdem einen Limit-Stand (`limits`, 5-Stunden-Fenster).
  * Schreibt `AIDEV_FAKE.md` mit einem Auszug des Auftrags (nicht bei `readOnly`).
  */
 import { writeFile } from 'node:fs/promises';
@@ -53,6 +54,10 @@ export const fakeAdapter: ProviderAdapter = {
 				if (p.includes('[fake:limit]')) {
 					const resetsAt = new Date(Date.now() + 3_600_000).toISOString();
 					const raw = '5-hour limit reached · resets in 1 hour';
+					queue.push({
+						kind: 'limits',
+						windows: [{ window: '5h', label: 'five_hour', usedPercent: 100, resetsAt, status: 'rejected' }]
+					});
 					queue.push({ kind: 'limit', limitKind: '5h', resetsAt, raw });
 					return { ...base, exitCode: 1, limit: { limitKind: '5h', resetsAt, raw }, error: raw };
 				}
@@ -75,6 +80,18 @@ export const fakeAdapter: ProviderAdapter = {
 				if (p.includes('[fake:plan]'))
 					text = `Hier ist der Plan:\n\n\`\`\`json\n${JSON.stringify(FAKE_PLAN, null, 2)}\n\`\`\`\n`;
 				queue.push({ kind: 'text', payload: { text } });
+				queue.push({
+					kind: 'limits',
+					windows: [
+						{
+							window: '5h',
+							label: 'five_hour',
+							usedPercent: 42,
+							resetsAt: new Date(Date.now() + 2 * 3_600_000).toISOString(),
+							status: 'allowed'
+						}
+					]
+				});
 				const usage = {
 					model: o.model ?? 'fake',
 					inputTokens: 100,

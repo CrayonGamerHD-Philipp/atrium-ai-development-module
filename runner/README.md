@@ -37,6 +37,8 @@ Vorlage: [`runner.config.example.json`](runner.config.example.json)):
 | `GH_TOKEN` | GitHub-Token für `gh` und `git push` | – (alternativ `gh auth login`) |
 | `GIT_REMOTE_TEMPLATE` | Remote-URL-Vorlage | `https://github.com/{owner}/{repo}.git` |
 | `LOG_LEVEL` | `debug`, `info`, `warn`, `error` | `info` |
+| `LIMIT_PROBE` | aktive Limit-Abfrage ohne Lauf (`true`/`false`, Datei: `limitProbe`) | an für Claude-Konten mit OAuth-Login |
+| `LIMIT_PROBE_MIN` | Abstand der aktiven Limit-Abfrage in Minuten (1–1440, Datei: `limitProbeMin`) | `5` |
 
 Ein Konto (`accounts[]`):
 
@@ -51,6 +53,7 @@ Ein Konto (`accounts[]`):
 | `command` | Pfad zur CLI, falls nicht im `PATH` |
 | `baseUrl`, `apiKeyEnv`, `model`, `wireApi` | nur `openai-api` (siehe unten) |
 | `reasoningEffort` | nur Codex/`openai-api`: `model_reasoning_effort` |
+| `limitProbe` | aktive Limit-Abfrage für dieses Konto an/aus (Vorrang vor `LIMIT_PROBE`; derzeit nur Claude) |
 
 Konfiguration prüfen: `node dist/main.js probe` (bzw. `docker compose run --rm runner probe`).
 
@@ -140,6 +143,26 @@ Beim Beenden (`SIGTERM`/`SIGINT`) nimmt der Runner keine neuen Läufe an, bricht
 - Limit-Erkennung: versionierte Muster-Tabelle in `src/providers/limits.ts` (u. a. Claude `rate_limit_event` mit
   `status: rejected`, „usage limit reached“, „5-hour limit“, „weekly limit“, Codex „You've hit your usage limit“,
   Gemini `RESOURCE_EXHAUSTED`, 429). Rücksetzzeit aus Unix-Zeit, ISO, „in 2 hours“, „resets 3pm (Zeitzone)“.
+
+## Limit-Stand
+
+Der Runner meldet je Konto den zuletzt beobachteten Limit-Stand im Heartbeat (`accounts[].limits`, Fähigkeit
+`limitReport`), sofern er sich geändert hat oder jünger als 30 Minuten ist. Bei einem Limit-Treffer gehen die bekannten
+Fenster zusätzlich mit `/limit` an Atrium. Quellen (Abbildung in `src/providers/limit-snapshot.ts`):
+
+- **Claude, Run-Stream**: jedes `rate_limit_event` (auch `allowed`): `five_hour` → `5h`, `seven_day` → `week`,
+  `seven_day_opus` → `week-opus`, `seven_day_sonnet` → `week-sonnet`, sonst `other`; `utilization` (0–1) → Prozent,
+  `resetsAt` (Sekunden/Millisekunden) → ISO, ergänzend `unifiedWindows`.
+- **Claude, aktive Abfrage** (nur ohne frischen Stand aus einem Lauf): `GET https://api.anthropic.com/api/oauth/usage`
+  mit dem OAuth-Token des Kontos (`CLAUDE_CODE_OAUTH_TOKEN` bzw. `<CLAUDE_CONFIG_DIR>/.credentials.json`). Der Endpunkt
+  ist **undokumentiert** und kann sich ändern. Das Token wird nur lokal gelesen, nie erneuert, nie protokolliert und nie
+  an Atrium gesendet; abgelaufene Tokens werden übersprungen. Zeitlimit 10 s, Konten nacheinander, nach Fehlern
+  wachsender Abstand (bei 401/403/429 60 min). Abschalten mit `LIMIT_PROBE=false` bzw. `limitProbe: false`.
+- **Codex**: `rate_limits.primary/secondary` (`used_percent`, `window_minutes` ≈300 → `5h`, ≈10080 → `week`,
+  `resets_in_seconds`/`resets_at`) aus dem `--json`-Stream, falls vorhanden, sonst nach dem Lauf aus der Sitzungsdatei
+  `<CODEX_HOME>/sessions/JJJJ/MM/TT/rollout-…-<thread_id>.jsonl` (letztes `token_count`).
+- **Fehlermeldungen**: Ohne Stand aus dem Stream wird ein erkannter 5-Stunden- bzw. Wochen-Treffer als gesperrtes
+  Fenster (`source: error`) übernommen.
 
 ## Sicherheit
 
