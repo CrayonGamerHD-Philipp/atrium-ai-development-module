@@ -25,6 +25,7 @@ import {
 	MAX_BRANCH_DELETE,
 	MAX_DIFF_BYTES,
 	MAX_FILE_BYTES,
+	MAX_REPO_BRANCHES,
 	prListResult,
 	repoCheckResult,
 	type FsEntry,
@@ -357,6 +358,23 @@ async function prMerge(ctx: RpcContext, cmd: RpcCommand) {
 	return { ok: true, number: n, method, message: (r.stdout.trim() || r.stderr.trim()).slice(0, 2000) };
 }
 
+/**
+ * Branch-Namen aus der Ausgabe von `git ls-remote --heads` (`<sha>\trefs/heads/<name>`) lesen: duplikatfrei,
+ * `defaultBranch` (falls bekannt und vorhanden) zuerst, Rest alphabetisch, höchstens `MAX_REPO_BRANCHES`.
+ * Namen über 255 Zeichen werden verworfen (Schema-Grenze).
+ */
+export function parseLsRemoteHeads(stdout: string, defaultBranch?: string | null): string[] {
+	const names = new Set<string>();
+	for (const line of stdout.split(/\r?\n/)) {
+		const m = /^[0-9a-f]+\s+refs\/heads\/(\S+)\s*$/i.exec(line.trim());
+		const name = m?.[1];
+		if (name && name.length <= 255) names.add(name);
+	}
+	const rest = [...names].filter((b) => b !== defaultBranch).sort((a, b) => a.localeCompare(b));
+	const out = defaultBranch && names.has(defaultBranch) ? [defaultBranch, ...rest] : rest;
+	return out.slice(0, MAX_REPO_BRANCHES);
+}
+
 async function repoCheck(ctx: RpcContext, cmd: RpcCommand) {
 	const ws = ctx.workspace;
 	const url = ws.remoteUrl(cmd.project);
@@ -375,25 +393,35 @@ async function repoCheck(ctx: RpcContext, cmd: RpcCommand) {
 	});
 	if (view.code !== 0) {
 		const m = /^\S+\s+refs\/heads\/(\S+)$/m.exec(ls.stdout);
+		const defaultBranch = cmd.project.defaultBranch || (m?.[1] ?? null);
 		return {
 			ok: true,
-			defaultBranch: cmd.project.defaultBranch || (m?.[1] ?? null),
+			defaultBranch,
 			canPush: false,
-			message: `Repository erreichbar, gh-Abfrage fehlgeschlagen: ${(view.spawnError ?? view.stderr.trim()).slice(-500)}`
+			message: `Repository erreichbar, gh-Abfrage fehlgeschlagen: ${(view.spawnError ?? view.stderr.trim()).slice(-500)}`,
+			branches: parseLsRemoteHeads(ls.stdout, defaultBranch)
 		};
 	}
 	try {
 		const j = JSON.parse(view.stdout) as { defaultBranchRef?: { name?: string } | null; viewerPermission?: string };
 		const perm = (j.viewerPermission ?? '').toUpperCase();
 		const canPush = ['ADMIN', 'MAINTAIN', 'WRITE'].includes(perm);
+		const defaultBranch = j.defaultBranchRef?.name ?? null;
 		return {
 			ok: true,
-			defaultBranch: j.defaultBranchRef?.name ?? null,
+			defaultBranch,
 			canPush,
-			message: canPush ? `Zugriff ok (${perm})` : `Kein Schreibrecht (${perm || 'unbekannt'})`
+			message: canPush ? `Zugriff ok (${perm})` : `Kein Schreibrecht (${perm || 'unbekannt'})`,
+			branches: parseLsRemoteHeads(ls.stdout, defaultBranch ?? (cmd.project.defaultBranch || null))
 		};
 	} catch {
-		return { ok: true, defaultBranch: null, canPush: false, message: 'gh repo view lieferte kein JSON' };
+		return {
+			ok: true,
+			defaultBranch: null,
+			canPush: false,
+			message: 'gh repo view lieferte kein JSON',
+			branches: parseLsRemoteHeads(ls.stdout, cmd.project.defaultBranch || null)
+		};
 	}
 }
 
