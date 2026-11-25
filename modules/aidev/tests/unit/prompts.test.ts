@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
 	buildSystemPrompt,
+	ATTACHMENTS_DIR,
 	buildTaskPrompt,
 	extractPlan,
 	slugify,
@@ -149,6 +150,28 @@ describe('buildSystemPrompt', () => {
 });
 
 describe('buildTaskPrompt', () => {
+	it('nennt Anhänge mit Pfad unter .aidev/attachments/ und lässt den Abschnitt ohne Anhänge weg', () => {
+		const p = buildTaskPrompt(
+			ctx({
+				attachments: [
+					{ name: 'screenshot.png', mime: 'image/png', size: 2048 },
+					{ name: 'daten.csv', mime: 'text/csv', size: 3 * 1024 * 1024 }
+				]
+			})
+		);
+		expect(ATTACHMENTS_DIR).toBe('.aidev/attachments/');
+		expect(p).toContain('## Attached files');
+		expect(p).toContain('`.aidev/attachments/screenshot.png` (image/png, 2 KB)');
+		expect(p).toContain('`.aidev/attachments/daten.csv` (text/csv, 3 MB)');
+		expect(p).toMatch(/do not commit/);
+		// direkt hinter dem Auftragstext
+		expect(p.indexOf('## Attached files')).toBeGreaterThan(
+			p.indexOf('Baue eine Rückerstattung ein.')
+		);
+		expect(buildTaskPrompt(ctx())).not.toContain('Attached files');
+		expect(buildTaskPrompt(ctx({ attachments: [] }))).not.toContain('Attached files');
+	});
+
 	it('nur Titel und Auftrag, wenn kein Kontext vorhanden ist', () => {
 		const p = buildTaskPrompt(ctx());
 		expect(p).toBe('# Rückerstattung\n\nBaue eine Rückerstattung ein.');
