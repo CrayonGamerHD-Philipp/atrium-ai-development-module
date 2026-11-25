@@ -32,6 +32,35 @@ export type TaskDelivery = z.infer<typeof taskDeliverySchema>;
 const id = z.string().uuid();
 const shortText = (max: number) => z.string().max(max);
 
+// ---------------------------------------------------------------- Limit-Stand
+
+/**
+ * Limit-Fenster der Anbieter. Claude: `five_hour` → `5h`, `seven_day` → `week`, `seven_day_opus` → `week-opus`,
+ * `seven_day_sonnet` → `week-sonnet`; Codex: primäres/sekundäres Fenster nach Dauer (`5h`/`week`); Tageskontingente
+ * (z. B. Gemini) → `daily`; Overage und unbekannte Fenster → `other`.
+ */
+export const LIMIT_WINDOWS = ['5h', 'week', 'week-opus', 'week-sonnet', 'daily', 'other'] as const;
+
+export const limitWindowSchema = z.object({
+	window: z.enum(LIMIT_WINDOWS),
+	/** Anzeigename bzw. Originalbezeichnung des Anbieters (z. B. `seven_day_sonnet`) */
+	label: shortText(80).default(''),
+	/** Auslastung in Prozent (0–100; über 100 bei genutztem Overage), `null` = unbekannt */
+	usedPercent: z.number().min(0).max(1000).nullable().default(null),
+	resetsAt: z.string().datetime({ offset: true }).nullable().default(null),
+	status: z.enum(['allowed', 'warning', 'rejected', 'unknown']).default('unknown')
+});
+export type LimitWindow = z.infer<typeof limitWindowSchema>;
+
+export const limitSnapshotSchema = z.object({
+	/** Zeitpunkt der Beobachtung durch den Runner */
+	observedAt: z.string().datetime({ offset: true }),
+	/** `stream`: aus Ereignissen eines Laufs, `probe`: aktive Abfrage, `error`: aus einer Fehlermeldung abgeleitet */
+	source: z.enum(['stream', 'probe', 'error']),
+	windows: z.array(limitWindowSchema).max(10)
+});
+export type LimitSnapshot = z.infer<typeof limitSnapshotSchema>;
+
 // ---------------------------------------------------------------- Registrierung / Heartbeat
 
 export const runnerAccountSchema = z.object({
@@ -59,6 +88,8 @@ export const registerInput = z.object({
 		branchDelivery: z.boolean().optional(),
 		/** Versteht `delivery.mode = 'pr-update'` (ältere Runner verwerfen solche Angebote) */
 		prUpdate: z.boolean().optional(),
+		/** Meldet den Limit-Stand der Konten im Heartbeat (`accounts[].limits`) */
+		limitReport: z.boolean().optional(),
 		git: z.boolean(),
 		gh: z.boolean(),
 		pty: z.boolean(),
@@ -80,7 +111,14 @@ export const heartbeatInput = z.object({
 	/** Läufe, die der Runner gerade ausführt (verlängert deren Lease) */
 	runIds: z.array(id).max(64),
 	accounts: z
-		.array(z.object({ key: runnerAccountSchema.shape.key, loggedIn: z.boolean() }))
+		.array(
+			z.object({
+				key: runnerAccountSchema.shape.key,
+				loggedIn: z.boolean(),
+				/** Zuletzt beobachteter Limit-Stand (nur Runner mit `capabilities.limitReport`) */
+				limits: limitSnapshotSchema.optional()
+			})
+		)
 		.max(50)
 		.default([])
 });
@@ -310,7 +348,9 @@ export const LIMIT_KINDS = ['rate', '5h', 'week', 'auth', 'other'] as const;
 export const limitInput = z.object({
 	kind: z.enum(LIMIT_KINDS),
 	resetsAt: z.string().datetime({ offset: true }).nullable().default(null),
-	raw: shortText(2000).default('')
+	raw: shortText(2000).default(''),
+	/** Limit-Fenster zum Zeitpunkt des Treffers (sofern bekannt) */
+	windows: z.array(limitWindowSchema).max(10).optional()
 });
 export type LimitInput = z.infer<typeof limitInput>;
 

@@ -151,7 +151,9 @@ export function accountDto(
 		defaultModel: String(r.default_model ?? ''),
 		cooldownUntil: toIsoOrNull(r.cooldown_until),
 		cooldownReason: str(r.cooldown_reason),
-		usage
+		usage,
+		// Limit-Stand: wird vom Backend (Limit-Analyse) befüllt
+		limits: null
 	};
 }
 
