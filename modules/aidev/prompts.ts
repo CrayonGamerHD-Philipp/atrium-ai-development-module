@@ -46,10 +46,13 @@ export const MAX_DEPENDENCY_SUMMARY = 6000;
 export const MAX_TITLE = 80;
 /** Höchstlänge eines Branch-Slugs */
 export const MAX_SLUG = 40;
+/** Höchstzahl der Wörter eines Branch-Slugs */
+export const MAX_SLUG_WORDS = 5;
 
 /** Beispiel eines gültigen Plans (wird im Orchestrierungs-Prompt gezeigt) */
 const PLAN_EXAMPLE = `{
   "summary": "Short overview of the approach",
+  "branch": "payment-refunds",
   "subtasks": [
     {
       "key": "research-api",
@@ -138,6 +141,7 @@ function roleSection(c: PromptContext): string[] {
 				'- Put research first when knowledge is missing; let implementation depend on it via `dependsOn`.',
 				'- Maximise parallelism: subtasks without mutual dependencies must not touch the same files.',
 				'- Each subtask `prompt` must be self-contained (the executing agent sees only it plus results of its dependencies).',
+				'- `branch` is optional: a short branch name for the overall change (2–5 meaningful words, kebab-case, no filler words, e.g. `payment-refunds`); the system adds the `aidev/` prefix.',
 				'- `key`: unique, `[A-Za-z0-9_-]`, max 40 characters. `dependsOn` lists keys of other subtasks (no cycles).',
 				'- `provider` is optional (`claude`, `codex`, `gemini`, `openai-api`). Choose a provider only when it clearly fits the subtask (e.g. strong reasoning models for architecture/complex fixes, fast ones for simple research); otherwise leave it empty so the scheduler balances load and limits.',
 				'- If the task concerns an existing pull request, all subtasks work on its branch: do not plan subtasks that open a new pull request.'
@@ -380,21 +384,71 @@ export function titleFromPrompt(prompt: string): string {
 	return 'Auftrag';
 }
 
-/** Branch-Slug aus einem Titel (`[a-z0-9-]`, ≤ 40 Zeichen, nie leer). */
+/** Füllwörter (deutsch/englisch, nach Umlaut-Ersetzung), die in Branch-Namen nichts aussagen */
+const SLUG_STOP_WORDS = new Set(
+	[
+		// deutsch
+		'ok okay bitte mal noch auch dann so wie dass nun jetzt gerne',
+		'der die das den dem des ein eine einen einem einer eines und oder aber sowie',
+		'soll sollen sollte sollten muss muessen kann koennen wird werden ist sind sein hat haben',
+		'wir ich du ihr es er sie man uns mir',
+		'vom von zu zum zur mit nach fuer auf aus bei im in an am als um',
+		// englisch
+		'please the a and or but to of for on at by from with into',
+		'should shall must can could would will we i you it its is are be been this that these those let lets'
+	]
+		.join(' ')
+		.split(' ')
+);
+
+/** Wörter eines Textes in Slug-Schreibweise (Umlaute → ae/oe/ue/ss, Akzente entfernt, nur `[a-z0-9]`) */
+function slugWords(text: string): string[] {
+	return (
+		text
+			.normalize('NFC')
+			.toLowerCase()
+			.replace(/ä/g, 'ae')
+			.replace(/ö/g, 'oe')
+			.replace(/ü/g, 'ue')
+			.replace(/ß/g, 'ss')
+			// übrige Akzente (é → e) entfernen
+			.normalize('NFKD')
+			.replace(/[̀-ͯ]/g, '')
+			.split(/[^a-z0-9]+/)
+			.filter(Boolean)
+	);
+}
+
+/** Wörter ohne Duplikate verbinden: ≤ `MAX_SLUG_WORDS` Wörter, an Wortgrenzen auf ≤ `MAX_SLUG` Zeichen gekürzt */
+function joinSlug(words: string[]): string {
+	let slug = '';
+	let count = 0;
+	for (const w of new Set(words)) {
+		const next = slug ? `${slug}-${w}` : w;
+		if (next.length > MAX_SLUG || count >= MAX_SLUG_WORDS) {
+			// ein einzelnes überlanges Wort hart kürzen, sonst an der Wortgrenze aufhören
+			if (!slug) slug = w.slice(0, MAX_SLUG);
+			break;
+		}
+		slug = next;
+		count++;
+	}
+	return slug;
+}
+
+/**
+ * Branch-Slug aus einem Text oder `null`, wenn er keine verwertbaren Zeichen enthält. Füllwörter werden entfernt;
+ * besteht der Text nur aus Füllwörtern, wird ungefiltert gekürzt.
+ */
+export function slugOrNull(text: string | null | undefined): string | null {
+	const words = slugWords(text ?? '');
+	return joinSlug(words.filter((w) => !SLUG_STOP_WORDS.has(w))) || joinSlug(words) || null;
+}
+
+/**
+ * Branch-Slug aus einem Titel (`[a-z0-9-]`, ≤ `MAX_SLUG` Zeichen, ≤ `MAX_SLUG_WORDS` Wörter, ohne Füllwörter
+ * und Duplikate, an Wortgrenzen gekürzt, nie leer).
+ */
 export function slugify(title: string): string {
-	const slug = title
-		.normalize('NFC')
-		.toLowerCase()
-		.replace(/ä/g, 'ae')
-		.replace(/ö/g, 'oe')
-		.replace(/ü/g, 'ue')
-		.replace(/ß/g, 'ss')
-		// übrige Akzente (é → e) entfernen
-		.normalize('NFKD')
-		.replace(/[̀-ͯ]/g, '')
-		.replace(/[^a-z0-9]+/g, '-')
-		.replace(/^-+|-+$/g, '')
-		.slice(0, MAX_SLUG)
-		.replace(/-+$/g, '');
-	return slug || 'task';
+	return slugOrNull(title) ?? 'task';
 }

@@ -4,6 +4,7 @@ import {
 	buildTaskPrompt,
 	extractPlan,
 	slugify,
+	slugOrNull,
 	titleFromPrompt,
 	type PromptContext
 } from '../../prompts';
@@ -71,6 +72,11 @@ describe('buildSystemPrompt', () => {
 		expect(p).toMatch(/Read-only/);
 		// Beispiel im Prompt ist selbst ein gültiger Plan
 		expect(extractPlan(p)).not.toBeNull();
+	});
+	it('orchestrate: Branch-Vorschlag im Prompt und im Beispiel', () => {
+		const p = buildSystemPrompt(ctx({ role: 'orchestrate', readOnly: true, expectPlan: true }));
+		expect(p).toMatch(/`branch` is optional/);
+		expect(extractPlan(p)?.branch).toBe('payment-refunds');
 	});
 	it('review: Diff gegen Basis', () => {
 		const p = buildSystemPrompt(
@@ -318,23 +324,57 @@ describe('titleFromPrompt', () => {
 
 describe('slugify', () => {
 	it('ersetzt Umlaute und ß', () => {
-		expect(slugify('Größe ändern für Übersicht')).toBe('groesse-aendern-fuer-uebersicht');
+		expect(slugify('Größe ändern Übersicht')).toBe('groesse-aendern-uebersicht');
 		expect(slugify('ÄÖÜ straße')).toBe('aeoeue-strasse');
 	});
 	it('entfernt andere Akzente und Sonderzeichen', () => {
 		expect(slugify('Café: Menü  & Preise!!')).toBe('cafe-menue-preise');
 		expect(slugify('--Hallo--Welt--')).toBe('hallo-welt');
 	});
-	it('höchstens 40 Zeichen, kein Bindestrich am Ende', () => {
-		const s = slugify('abcdefghij abcdefghij abcdefghij abcdefg xyz');
+	it('entfernt deutsche und englische Füllwörter', () => {
+		expect(
+			slugify(
+				'Ok die branches sollen automatisch bessere Namen vom System bekommen und nach der PR'
+			)
+		).toBe('branches-automatisch-bessere-namen');
+		expect(slugify('Bitte die Größe für die Übersicht ändern')).toBe('groesse-uebersicht-aendern');
+		expect(slugify('We should add a button to the settings page')).toBe('add-button-settings-page');
+	});
+	it('entfernt doppelte Wörter', () => {
+		expect(slugify('Fix login, fix logout and Fix LOGIN')).toBe('fix-login-logout');
+	});
+	it('höchstens 5 Wörter', () => {
+		expect(slugify('eins zwei drei vier fuenf sechs sieben')).toBe('eins-zwei-drei-vier-fuenf');
+	});
+	it('höchstens 40 Zeichen, an Wortgrenzen gekürzt, kein Bindestrich am Ende', () => {
+		const s = slugify('abcdefghij klmnopqrst uvwxyzabcd efghijkl xyz');
 		expect(s.length).toBeLessThanOrEqual(40);
 		expect(s.endsWith('-')).toBe(false);
-		expect(s).toBe('abcdefghij-abcdefghij-abcdefghij-abcdefg');
+		expect(s).toBe('abcdefghij-klmnopqrst-uvwxyzabcd');
 		expect(slugify('a'.repeat(39) + ' b')).toBe('a'.repeat(39));
+		// einzelnes überlanges Wort wird hart gekürzt
+		expect(slugify('x'.repeat(60))).toBe('x'.repeat(40));
+	});
+	it('nur Füllwörter → ungefiltert', () => {
+		expect(slugify('Ok, bitte!')).toBe('ok-bitte');
+		expect(slugify('the and the')).toBe('the-and');
 	});
 	it('leer → task', () => {
 		expect(slugify('')).toBe('task');
 		expect(slugify('!!!')).toBe('task');
 		expect(slugify('日本語')).toBe('task');
+	});
+});
+
+describe('slugOrNull', () => {
+	it('Slug aus einem Namensvorschlag', () => {
+		expect(slugOrNull('branch-cleanup-after-merge')).toBe('branch-cleanup-after-merge');
+		expect(slugOrNull('Bessere Branch-Namen')).toBe('bessere-branch-namen');
+	});
+	it('ohne verwertbare Zeichen → null', () => {
+		expect(slugOrNull(undefined)).toBeNull();
+		expect(slugOrNull(null)).toBeNull();
+		expect(slugOrNull('  ')).toBeNull();
+		expect(slugOrNull('日本語')).toBeNull();
 	});
 });

@@ -40,7 +40,7 @@ import { errors, inList, num, rowsOf, str, type RequestContext } from '$lib/sdk/
 import { clip, jsonb, jsonOf, oneOf, shortId, stringList, type Row, type Tx } from './db';
 import type { Effects } from './effects';
 import { sendCommand } from './effects';
-import { slugify, titleFromPrompt } from './prompts';
+import { slugify, slugOrNull, titleFromPrompt } from './prompts';
 import { planSchema, READ_ONLY_ROLES, type Plan, type Role } from './protocol';
 import { findCycle } from './scheduler';
 import { FINAL_TASK_STATUSES, PERM, type TaskInput, type TaskStatus } from './schemas';
@@ -94,6 +94,18 @@ export const isReadOnlyRun = (task: Row) => READ_ONLY_ROLES.includes(effectiveRo
 /** Integrations-Branch bzw. Arbeits-Branch eines Auftrags ohne Elternteil */
 export const topBranchOf = (task: Row) =>
 	`aidev/${shortId(String(task.id))}-${slugify(String(task.title))}`;
+
+/**
+ * Integrations-Branch einer Orchestrierung bei Plan-Übernahme: ein gespeicherter Branch (z. B. Head-Branch des
+ * bestehenden PRs) hat Vorrang, sonst der Namensvorschlag des Plans (`plan.branch`), sonst `topBranchOf`.
+ */
+export function integrationBranchOf(parent: Row, plan: Pick<Plan, 'branch'>): string {
+	const stored = str(parent.branch);
+	if (stored) return stored;
+	const hasTargetPr = parent.target_pr !== null && parent.target_pr !== undefined;
+	const suggested = hasTargetPr ? null : slugOrNull(plan.branch);
+	return suggested ? `aidev/${shortId(String(parent.id))}-${suggested}` : topBranchOf(parent);
+}
 
 // ---------------------------------------------------------------- Zugriff
 
@@ -432,10 +444,7 @@ export async function applyPlan(
 	}
 	const stored: StoredPlan = { ...plan, delivered: false };
 	// Bestehender PR: dessen Head-Branch bleibt der Integrations-Branch (Ausliefern pusht in den PR)
-	const integrationBranch =
-		parent.target_pr !== null && parent.target_pr !== undefined && str(parent.branch)
-			? String(parent.branch)
-			: topBranchOf(parent);
+	const integrationBranch = integrationBranchOf(parent, plan);
 	await tx.execute(
 		sql`UPDATE task SET plan = ${jsonb(stored)}, branch = ${integrationBranch},
 				base_ref = ${null}, updated_at = now()
