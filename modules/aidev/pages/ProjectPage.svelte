@@ -177,7 +177,8 @@
 				{#if tab === 'board'}
 					<BoardTab {store} />
 				{:else if tab === 'chat'}
-					<ChatTab {store} />
+					<!-- Mobil Vollbild: „Zurück“ führt zum Board -->
+					<ChatTab {store} onclose={() => setTab('board')} />
 				{:else if tab === 'pulls'}
 					<PullsTab {store} />
 				{:else}
