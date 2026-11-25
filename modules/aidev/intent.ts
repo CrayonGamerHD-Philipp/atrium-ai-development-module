@@ -193,6 +193,11 @@ const HAS_DE_CHANGE = anywhere(DE_CHANGE);
 const HAS_EN_CHANGE = anywhere(EN_CHANGE);
 const IMPERATIVE_START = atStart(`${DE_CHANGE}|${EN_CHANGE}`);
 
+/** Kurze Startsignale für Folgeaufträge („Leg los“, „Do it“, „Go ahead“) – zählen nur ohne Fragezeichen */
+const GO_START = atStart('leg(?:e|t)?\\s+los|go\\s+ahead|go\\s+for\\s+it|do\\s+it|proceed');
+/** Alleinstehendes „Los“/„Los geht's“ (danach höchstens „bitte“/„jetzt“ und Satzzeichen – nicht „Los Angeles“) */
+const GO_BARE = /^los(?:\s+geht[’']?s)?(?:[\s,]+(?:bitte|jetzt|please|now))*[\s.!…]*$/iu;
+
 /** Bitte- und Modalformen, die mit Änderungsverb einen Auftrag ausdrücken */
 const ASK_DE = anywhere(
 	'bitte|(?:kannst|k[öo]nntest|k[öo]nnt|k[öo]nnen|k[öo]nnten|w[üu]rdest|w[üu]rdet|w[üu]rden)\\s+(?:du|ihr|sie|wir)|lass\\s+uns|(?:ich|wir)\\s+(?:m[öo]chte|m[öo]chten|will|wollen|h[äa]tte|h[äa]tten|w[üu]rde|w[üu]rden)'
@@ -243,6 +248,9 @@ function endsWithQuestionMark(text: string): boolean {
 function requestIn(sentence: string): string | null {
 	const start = core(sentence);
 	if (IMPERATIVE_START.test(start)) return 'Beginnt mit Aufforderung';
+	if ((GO_START.test(start) || GO_BARE.test(start)) && !endsWithQuestionMark(sentence)) {
+		return 'Beginnt mit Aufforderung';
+	}
 	const explain = EXPLAIN.test(sentence);
 	if (!explain && ASK_DE.test(sentence) && HAS_DE_CHANGE.test(sentence)) {
 		return 'Bitte mit Änderungsverb';

@@ -112,3 +112,40 @@ describe('classifyChatIntent – Code, Begründung und Fallback', () => {
 		expect(classifyChatIntent('   ')).toMatchObject({ mode: 'task', confidence: 'low' });
 	});
 });
+
+describe('classifyChatIntent – kurze Folgeaufträge', () => {
+	it.each([
+		'Setze das um',
+		'Ja, mach das',
+		'Umsetzen',
+		'Passt, umsetzen bitte',
+		'Leg los',
+		"Los geht's",
+		'Los geht’s!',
+		'Ja, los',
+		'Do it',
+		'Go ahead',
+		'Implement it',
+		'Ok, setz das so um',
+		'Go for it',
+		'Proceed with the plan'
+	])('„%s“ → task/high', (text) => {
+		expect(classifyChatIntent(text)).toMatchObject({ mode: 'task', confidence: 'high' });
+	});
+
+	it.each([
+		'Was soll ich als nächstes tun?',
+		'Los?',
+		'Go ahead?',
+		'Do it yourself?',
+		'Wie legt man los?',
+		'Passt das so?',
+		'Do you have tests for this'
+	])('„%s“ bleibt eine Frage', (text) => {
+		expect(mode(text)).toBe('question');
+	});
+
+	it('„Los“ als Wortbestandteil ist kein Startsignal', () => {
+		expect(classifyChatIntent('Los Angeles ist schön')).toMatchObject({ confidence: 'low' });
+	});
+});
