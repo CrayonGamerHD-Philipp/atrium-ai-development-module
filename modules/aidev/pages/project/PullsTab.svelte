@@ -2,6 +2,7 @@
 	// Pull Requests des Projekts: Status, Checks, Synchronisieren, Mergen (project.manage), Link zu GitHub
 	import { onMount } from 'svelte';
 	import { toast } from 'svelte-sonner';
+	import Bot from '@lucide/svelte/icons/bot';
 	import ChevronDown from '@lucide/svelte/icons/chevron-down';
 	import ExternalLink from '@lucide/svelte/icons/external-link';
 	import GitMerge from '@lucide/svelte/icons/git-merge';
@@ -16,15 +17,19 @@
 	import { errMsg, PR_STATE_LABELS, type BadgeTone } from '../format';
 	import { has, PERM } from '../perms';
 	import TimeAgo from '../components/TimeAgo.svelte';
+	import PrTaskDialog from './PrTaskDialog.svelte';
 	import type { ProjectStore } from './store.svelte';
 
 	let { store }: { store: ProjectStore } = $props();
 
 	const canMerge = $derived(has(PERM.projectManage));
+	const canCreate = $derived(has(PERM.taskCreate));
 	let syncing = $state(false);
 	let merging = $state<number | null>(null);
 	let confirmOpen = $state(false);
 	let pending = $state<{ pr: PullRequestDto; method: MergeMethod } | null>(null);
+	let agentOpen = $state(false);
+	let agentPr = $state<PullRequestDto | null>(null);
 
 	const METHODS: { value: MergeMethod; label: string; hint: string }[] = [
 		{ value: 'squash', label: 'Squash & Merge', hint: 'alle Commits zu einem zusammenfassen' },
@@ -58,6 +63,11 @@
 		} finally {
 			syncing = false;
 		}
+	}
+
+	function askAgent(pr: PullRequestDto) {
+		agentPr = pr;
+		agentOpen = true;
 	}
 
 	function askMerge(pr: PullRequestDto, method: MergeMethod) {
@@ -175,6 +185,15 @@
 						aria-label={`#${pr.number} auf GitHub öffnen`}
 						title="Auf GitHub öffnen"><ExternalLink /></Button
 					>
+					{#if canCreate && pr.state === 'open'}
+						<Button
+							variant="ghost"
+							size="icon-sm"
+							onclick={() => askAgent(pr)}
+							aria-label={`#${pr.number} mit Agent bearbeiten`}
+							title="Mit Agent bearbeiten"><Bot /></Button
+						>
+					{/if}
 					{#if canMerge && pr.state === 'open'}
 						<DropdownMenu.Root>
 							<DropdownMenu.Trigger>
@@ -219,3 +238,5 @@
 	confirmLabel="Mergen"
 	onconfirm={merge}
 />
+
+<PrTaskDialog bind:open={agentOpen} projectId={store.id} pr={agentPr} />

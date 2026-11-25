@@ -72,7 +72,14 @@
 				<span class="tabular-nums" title="Versuche">Versuch {task.attempts}/{task.maxAttempts}</span
 				>
 			{/if}
-			{#if task.prNumber}
+			{#if task.targetPr}
+				<!-- Karte ist selbst ein Link – daher hier kein Link zur PR-URL -->
+				<span
+					class="inline-flex items-center gap-0.5 text-info"
+					title="Bearbeitet einen bestehenden PR"
+					><GitPullRequest class="size-3" aria-hidden="true" />PR #{task.targetPr} bearbeiten</span
+				>
+			{:else if task.prNumber}
 				<span class="inline-flex items-center gap-0.5"
 					><GitPullRequest class="size-3" aria-hidden="true" />#{task.prNumber}</span
 				>

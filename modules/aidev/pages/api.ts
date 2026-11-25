@@ -91,10 +91,13 @@ export const listTasks = (
 	apiFetch<TaskDto[]>(
 		`${API}/projects/${projectId}/tasks${qs({ status: opts.status ?? 'all', limit: opts.limit ?? 500 })}`
 	);
-export const createTask = (
-	projectId: string,
-	input: Partial<TaskInput> & Pick<TaskInput, 'prompt'>
-) => apiFetch<TaskDto>(`${API}/projects/${projectId}/tasks`, { method: 'POST', body: json(input) });
+/**
+ * Eingabe für einen neuen Auftrag; nur `prompt` ist Pflicht. Mit `targetPr` (Nummer eines offenen, synchronisierten
+ * Pull Requests) arbeitet der Auftrag auf dessen Head-Branch und aktualisiert den PR, statt einen neuen zu öffnen.
+ */
+export type NewTaskInput = Partial<TaskInput> & Pick<TaskInput, 'prompt'>;
+export const createTask = (projectId: string, input: NewTaskInput) =>
+	apiFetch<TaskDto>(`${API}/projects/${projectId}/tasks`, { method: 'POST', body: json(input) });
 export const getTask = (id: string) => apiFetch<TaskDetailDto>(`${API}/tasks/${id}`);
 export const updateTask = (id: string, patch: TaskPatch) =>
 	apiFetch<TaskDto>(`${API}/tasks/${id}`, { method: 'PATCH', body: json(patch) });
