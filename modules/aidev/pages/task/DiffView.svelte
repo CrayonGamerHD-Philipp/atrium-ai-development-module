@@ -51,14 +51,14 @@
 	};
 </script>
 
-<div class="space-y-4">
+<div class="min-w-0 space-y-4">
 	<div class="flex flex-wrap items-center gap-x-4 gap-y-1 text-sm">
 		<span class="font-medium">{files.length} {files.length === 1 ? 'Datei' : 'Dateien'}</span>
 		<span class="font-mono text-xs tabular-nums">
 			<span class="text-success">+{totals.add}</span>
 			<span class="text-destructive">−{totals.del}</span>
 		</span>
-		<span class="font-mono text-xs text-muted-foreground">
+		<span class="font-mono text-xs break-all text-muted-foreground">
 			{shortSha(diff.base) || diff.base} … {shortSha(diff.head) || diff.head}
 		</span>
 		{#if diff.truncated}
@@ -77,7 +77,7 @@
 					<li>
 						<button
 							type="button"
-							class="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs hover:bg-muted"
+							class="flex min-h-10 w-full items-center gap-2 px-3 py-1.5 text-left text-xs hover:bg-muted sm:min-h-0"
 							onclick={() => jump(i)}
 						>
 							<FileDiff class="size-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
@@ -98,10 +98,13 @@
 		{#each files as f, i (`${i}:${f.path}`)}
 			{@const expanded = isOpen(f, i)}
 			{@const limit = limitOf(f, i)}
-			<section id={`diff-file-${i}`} class="scroll-mt-20 overflow-hidden rounded-lg border bg-card">
+			<section
+				id={`diff-file-${i}`}
+				class="min-w-0 scroll-mt-20 overflow-hidden rounded-lg border bg-card"
+			>
 				<button
 					type="button"
-					class="sticky top-0 z-10 flex w-full items-center gap-2 border-b bg-muted/60 px-3 py-2 text-left text-xs backdrop-blur"
+					class="sticky top-0 z-10 flex min-h-10 w-full items-center gap-2 border-b bg-muted/60 px-3 py-2 text-left text-xs backdrop-blur"
 					aria-expanded={expanded}
 					onclick={() => toggle(f, i)}
 				>
@@ -126,13 +129,17 @@
 							Keine Textänderungen (z. B. nur Rechte).
 						</p>
 					{:else}
-						<div class="overflow-x-auto">
-							<table class="w-full border-collapse font-mono text-xs leading-5">
+						<div class="max-w-full min-w-0 overflow-x-auto overscroll-x-contain">
+							<table
+								class="w-full border-collapse font-mono text-[11px] leading-4 sm:text-xs sm:leading-5"
+							>
 								<tbody>
 									{#each f.lines.slice(0, limit) as l, j (j)}
 										{#if l.kind === 'hunk'}
 											<tr class="bg-info-muted text-info">
-												<td colspan="3" class="px-3 py-0.5 select-none">{l.text}</td>
+												<td colspan="3" class="px-2 py-0.5 whitespace-pre select-none sm:px-3"
+													>{l.text}</td
+												>
 											</tr>
 										{:else}
 											<tr
@@ -142,14 +149,14 @@
 												)}
 											>
 												<td
-													class="w-10 border-r px-2 text-right text-muted-foreground tabular-nums select-none"
+													class="w-8 border-r px-1 text-right text-muted-foreground tabular-nums select-none sm:w-10 sm:px-2"
 													>{l.oldNo ?? ''}</td
 												>
 												<td
-													class="w-10 border-r px-2 text-right text-muted-foreground tabular-nums select-none"
+													class="w-8 border-r px-1 text-right text-muted-foreground tabular-nums select-none sm:w-10 sm:px-2"
 													>{l.newNo ?? ''}</td
 												>
-												<td class="px-2 whitespace-pre"
+												<td class="px-1.5 whitespace-pre sm:px-2"
 													><span
 														class={cn(
 															'inline-block w-3 select-none',

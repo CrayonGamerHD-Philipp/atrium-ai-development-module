@@ -218,7 +218,7 @@
 				Nur Ansicht – Ändern braucht das Recht „Verteilung einstellen“.
 			</p>
 		{/if}
-		<div class="grid gap-4 lg:grid-cols-2">
+		<div class="grid grid-cols-1 gap-4 lg:grid-cols-2 2xl:grid-cols-3">
 			{#each ROLES as role (role)}
 				{@const entries = routing[role]}
 				{@const total = entries.reduce((s, e) => s + e.weight, 0)}
@@ -237,19 +237,20 @@
 						{/if}
 						<ol class="space-y-2">
 							{#each entries as entry, i (entry.provider)}
-								<li class="space-y-2 rounded-md border p-2">
-									<div class="flex items-center gap-2">
+								<li class="min-w-0 space-y-2 rounded-md border p-2">
+									<div class="flex min-w-0 items-center gap-1 sm:gap-2">
 										<span class="w-4 text-xs text-muted-foreground tabular-nums">{i + 1}.</span>
 										<ProviderBadge provider={entry.provider} />
-										<span class="truncate text-xs text-muted-foreground"
+										<span class="hidden min-w-0 truncate text-xs text-muted-foreground sm:inline"
 											>{PROVIDER_LABELS[entry.provider]}</span
 										>
-										<span class="ml-auto text-xs text-muted-foreground tabular-nums">
+										<span class="ml-auto shrink-0 text-xs text-muted-foreground tabular-nums">
 											{total ? Math.round((entry.weight / total) * 100) : 0} %
 										</span>
 										{#if canEdit}
 											<Button
 												size="icon-xs"
+												class="pointer-coarse:size-10"
 												variant="ghost"
 												onclick={() => move(role, i, -1)}
 												disabled={i === 0}
@@ -258,6 +259,7 @@
 											>
 											<Button
 												size="icon-xs"
+												class="pointer-coarse:size-10"
 												variant="ghost"
 												onclick={() => move(role, i, 1)}
 												disabled={i === entries.length - 1}
@@ -266,13 +268,16 @@
 											>
 											<Button
 												size="icon-xs"
+												class="pointer-coarse:size-10"
 												variant="ghost"
 												onclick={() => remove(role, i)}
 												aria-label={`${PROVIDER_LABELS[entry.provider]} entfernen`}><X /></Button
 											>
 										{/if}
 									</div>
-									<div class="grid items-center gap-2 sm:grid-cols-[1fr_auto_minmax(0,10rem)]">
+									<div
+										class="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-2 sm:grid-cols-[1fr_auto_minmax(0,10rem)]"
+									>
 										<Slider
 											label={`Gewicht ${PROVIDER_LABELS[entry.provider]} für ${ROLE_LABELS[role]}`}
 											min={0}
@@ -281,7 +286,7 @@
 											bind:value={entry.weight}
 											disabled={!canEdit}
 										/>
-										<span class="w-14 text-xs tabular-nums">
+										<span class="w-16 text-xs tabular-nums">
 											{entry.weight === 0 ? 'nie' : `Gewicht ${entry.weight}`}
 										</span>
 										<Input
@@ -291,7 +296,7 @@
 											placeholder="Modell (Standard)"
 											aria-label={`Modell für ${PROVIDER_LABELS[entry.provider]}`}
 											maxlength={120}
-											class="h-7 text-xs"
+											class="col-span-2 h-9 text-xs sm:col-span-1 sm:h-7"
 											disabled={!canEdit}
 										/>
 									</div>
@@ -320,7 +325,7 @@
 				<Card.Description>Gelten für alle Läufe aller Projekte.</Card.Description>
 			</Card.Header>
 			<Card.Content>
-				<div class="grid gap-4 sm:grid-cols-2">
+				<div class="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
 					{#each LIMIT_FIELDS as f (f.key)}
 						<FormField label={f.label} id={`limit-${f.key}`} hint={f.hint}>
 							<NumberStepper

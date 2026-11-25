@@ -48,7 +48,7 @@
 	}
 </script>
 
-<div class="relative">
+<div class="relative min-w-0">
 	<div class="mb-2 flex items-center justify-between gap-2 text-xs text-muted-foreground">
 		<span class="tabular-nums">{events.length} Ereignisse</span>
 		<Button
@@ -63,7 +63,7 @@
 	<div
 		bind:this={scroller}
 		{onscroll}
-		class="h-[calc(100dvh-22rem)] min-h-80 overflow-y-auto rounded-lg border bg-card px-2 py-2 sm:px-3"
+		class="h-[calc(100dvh-22rem)] min-h-80 overflow-x-hidden overflow-y-auto overscroll-contain rounded-lg border bg-card px-2 py-2 sm:px-3"
 		role="log"
 		aria-label="Verlauf des Laufs"
 		aria-busy={loading}
@@ -87,7 +87,7 @@
 			{/each}
 			{#if running}
 				<div
-					class="flex items-center gap-2 py-2 pl-15 text-xs text-muted-foreground"
+					class="flex items-center gap-2 py-2 pl-12 text-xs text-muted-foreground sm:pl-15"
 					aria-hidden="true"
 				>
 					<span class="size-1.5 animate-pulse rounded-full bg-info"></span>

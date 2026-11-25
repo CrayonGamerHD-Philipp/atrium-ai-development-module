@@ -62,14 +62,14 @@
 
 <div class="flex h-full min-h-0 flex-col bg-background">
 	<div
-		class="flex h-9 shrink-0 items-center gap-1 overflow-x-auto border-b px-2"
+		class="flex h-9 shrink-0 items-center gap-1 overflow-x-auto border-b px-2 pointer-coarse:h-12"
 		role="tablist"
 		aria-label="Terminals"
 	>
 		{#each sessions as s (s.key)}
 			<div
 				class={cn(
-					'group inline-flex h-7 shrink-0 items-center gap-1 rounded-md pr-1 pl-2 text-xs',
+					'group inline-flex h-7 shrink-0 items-center gap-1 rounded-md pr-1 pl-2 text-xs pointer-coarse:h-10',
 					active === s.key ? 'bg-muted text-foreground' : 'text-muted-foreground hover:bg-muted/60'
 				)}
 			>
@@ -77,7 +77,7 @@
 					type="button"
 					role="tab"
 					aria-selected={active === s.key}
-					class="inline-flex items-center gap-1.5"
+					class="inline-flex h-full items-center gap-1.5"
 					onclick={() => select(s.key)}
 				>
 					<span
@@ -97,7 +97,7 @@
 				</button>
 				<button
 					type="button"
-					class="rounded-sm p-0.5 opacity-60 hover:bg-background hover:opacity-100"
+					class="rounded-sm p-0.5 opacity-60 hover:bg-background hover:opacity-100 pointer-coarse:p-2"
 					aria-label={`${s.label} schließen`}
 					onclick={() => close(s.key)}><X class="size-3" /></button
 				>
