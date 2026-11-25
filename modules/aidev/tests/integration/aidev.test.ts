@@ -3,6 +3,8 @@
  * Anmelden → Freigabe → Projekt + Auftrag → Angebot (pending) → Annahme → Ereignisse (doppelte seq ignoriert) →
  * Verbrauch → Abschluss mit PR (Auftrag `review`, pull_request); Lease-Ablauf → Job → neu eingeplant;
  * Limit → Wartezeit → zweites Konto übernimmt; Orchestrierung → Teilaufträge mit Abhängigkeiten → Ausliefern;
+ * Master-Agent: Koordinationsrunden (Folgeaufträge, fehlgeschlagene Teilaufträge, Wiederholen, höchste Runde,
+ * ohne Runden altes Verhalten);
  * Zyklus im Plan abgelehnt; Konflikt → Konfliktlösung; Rechte; bestehenden PR bearbeiten (`targetPr`, pr-update);
  * PR-Sync löscht Branches gemergter `aidev/`-PRs (nur Runner mit `branchCleanup`; keine Forks, nichts Genutztes,
  * unter der Sperre der Branch-Vergabe, mit Rotation); SSE (Projekt, Runner) inkl.
@@ -321,7 +323,11 @@ describe('aidev', () => {
 			])
 		) as Routing;
 		const put = ok<{ routing: Routing }>(
-			await call('admin', 'PUT', '/routing', { routing, limits: DEFAULT_LIMITS })
+			await call('admin', 'PUT', '/routing', {
+				routing,
+				// ältere Orchestrierungstests: ohne Master-Agent (eigene Tests setzen die Runden)
+				limits: { ...DEFAULT_LIMITS, coordinationRounds: 0 }
+			})
 		);
 		expect(put.routing.implement[0]!.provider).toBe('fake');
 	});
@@ -698,6 +704,331 @@ describe('aidev', () => {
 		const d = await task(parent.id);
 		expect(d.task.errorMessage).toContain('Zyklus');
 		expect(d.children).toHaveLength(0);
+	});
+
+	// ------------------------------------------------------------ Master-Agent (Koordinationsrunden)
+
+	/** Koordinationsrunden einstellen (Rest der Einstellungen bleibt) */
+	async function setCoordinationRounds(n: number) {
+		const current = ok<{ routing: Routing; limits: typeof DEFAULT_LIMITS }>(
+			await call('admin', 'GET', '/routing')
+		);
+		const put = ok<{ limits: typeof DEFAULT_LIMITS }>(
+			await call('admin', 'PUT', '/routing', {
+				routing: current.routing,
+				limits: { ...current.limits, coordinationRounds: n }
+			})
+		);
+		expect(put.limits.coordinationRounds).toBe(n);
+	}
+
+	/** Angebot annehmen und abschließen */
+	async function complete(offer: RunOffer, body: Record<string, unknown>) {
+		ok(await call('runner', 'POST', `/runner/runs/${offer.runId}/accept`), 201);
+		return ok(await finish(offer.runId, body), 201);
+	}
+
+	const decision = (value: unknown, text = 'Entscheidung des Master-Agents') =>
+		`${text}\n\n\`\`\`json\n${JSON.stringify(value, null, 2)}\n\`\`\``;
+
+	/** Orchestrierung anlegen und den Plan übernehmen lassen */
+	async function planned(
+		prompt: string,
+		subtasks: Record<string, unknown>[],
+		extra: Record<string, unknown> = {}
+	) {
+		const parent = await createTask({ prompt, decompose: true, ...extra });
+		const planOffer = await offerFor(parent.id);
+		await complete(planOffer, {
+			status: 'succeeded',
+			summary: 'Plan erstellt',
+			plan: { summary: 'Plan', subtasks }
+		});
+		return { parent, planOffer, detail: await task(parent.id) };
+	}
+
+	it('Master-Agent: Koordination → Folgeauftrag mit Ergebnis → zweite Koordination → Ausliefern', async () => {
+		await setCoordinationRounds(2);
+		try {
+			const { parent, planOffer, detail } = await planned('Feature mit Master-Agent', [
+				{ key: 'a', title: 'Recherche', prompt: 'Recherchiere', role: 'research' },
+				{
+					key: 'b',
+					title: 'Umsetzung',
+					prompt: 'Baue es',
+					role: 'implement',
+					dependsOn: ['a']
+				}
+			]);
+			expect(planOffer.systemPrompt).toContain('up to 2 rounds');
+			expect(detail.task.status).toBe('blocked');
+			expect(detail.task.coordination).toEqual({ phase: 'subtasks', round: 1, maxRounds: 2 });
+			const [a, b] = detail.children;
+			expect(a!.coordination).toBeNull();
+
+			const oa = await offerFor(a!.id);
+			await complete(oa, { status: 'succeeded', summary: 'Ergebnis der Recherche A' });
+			expect((await task(parent.id)).task.status).toBe('blocked');
+			await complete(await offerFor(b!.id), {
+				status: 'succeeded',
+				summary: 'Umsetzung B fertig',
+				merged: true
+			});
+
+			// Runde 1 beendet → Koordinationslauf (nur lesen) auf dem Integrations-Branch
+			const afterRound1 = (await task(parent.id)).task;
+			expect(afterRound1.status).toBe('queued');
+			expect(afterRound1.coordination).toEqual({ phase: 'coordinate', round: 1, maxRounds: 2 });
+			const c1 = await offerFor(parent.id);
+			expect(c1).toMatchObject({
+				role: 'orchestrate',
+				readOnly: true,
+				expectPlan: true,
+				branch: detail.task.branch,
+				baseRef: 'main'
+			});
+			expect(c1.delivery.mode).toBe('none');
+			expect(c1.systemPrompt).toContain('master agent (coordinator)');
+			expect(c1.prompt).toContain('Feature mit Master-Agent');
+			expect(c1.prompt).toContain('round 1 of 2');
+			expect(c1.prompt).toContain('[key: a]');
+			expect(c1.prompt).toContain('Ergebnis der Recherche A');
+			expect(c1.prompt).toContain('Umsetzung B fertig');
+			await complete(c1, {
+				status: 'succeeded',
+				summary: decision({
+					summary: 'Die Umsetzung braucht die Recherche',
+					done: false,
+					subtasks: [
+						{
+							key: 'c',
+							title: 'Nacharbeit',
+							prompt: 'Nutze die Recherche',
+							role: 'implement',
+							dependsOn: ['a']
+						}
+					]
+				})
+			});
+
+			// Folgeauftrag angehängt: nächste Position, Abhängigkeit auf den vorhandenen Teilauftrag
+			const round2 = await task(parent.id);
+			expect(round2.task).toMatchObject({
+				status: 'blocked',
+				resultSummary: 'Die Umsetzung braucht die Recherche',
+				coordination: { phase: 'subtasks', round: 2, maxRounds: 2 }
+			});
+			expect(round2.children.map((c) => [c.position, c.title, c.status])).toEqual([
+				[0, 'Recherche', 'done'],
+				[1, 'Umsetzung', 'done'],
+				[2, 'Nacharbeit', 'queued']
+			]);
+			const c = round2.children[2]!;
+			expect(c.dependsOn).toEqual([a!.id]);
+			const oc = await offerFor(c.id);
+			expect(oc.branch).toMatch(new RegExp(`^aidev/${parent.id.replace(/-/g, '').slice(0, 8)}/3-`));
+			expect(oc.prompt).toContain('Ergebnis der Recherche A');
+			await complete(oc, { status: 'succeeded', summary: 'Nacharbeit erledigt', merged: true });
+
+			// Runde 2 beendet → zweite Koordination; `done` → Ausliefern
+			expect((await task(parent.id)).task.coordination).toEqual({
+				phase: 'coordinate',
+				round: 2,
+				maxRounds: 2
+			});
+			const c2 = await offerFor(parent.id);
+			expect(c2).toMatchObject({ role: 'orchestrate', readOnly: true });
+			expect(c2.prompt).toContain('round 2 of 2');
+			expect(c2.prompt).toContain('Nacharbeit erledigt');
+			// Ausweichweg: Entscheidung nur in `finish.plan`
+			await complete(c2, {
+				status: 'succeeded',
+				summary: 'Ziel erreicht',
+				plan: { summary: 'Alles erledigt', done: true, subtasks: [] }
+			});
+			const ready = (await task(parent.id)).task;
+			expect(ready).toMatchObject({
+				status: 'queued',
+				coordination: { phase: 'deliver', round: 2, maxRounds: 2 }
+			});
+			const deliver = await offerFor(parent.id);
+			expect(deliver).toMatchObject({
+				role: 'implement',
+				readOnly: false,
+				branch: detail.task.branch
+			});
+			expect(deliver.delivery.mode).toBe('pr');
+			await complete(deliver, {
+				status: 'succeeded',
+				summary: 'ausgeliefert',
+				pr: { number: 12, url: 'https://github.com/acme/widgets/pull/12' }
+			});
+			expect((await task(parent.id)).task).toMatchObject({ status: 'review', prNumber: 12 });
+		} finally {
+			await setCoordinationRounds(0);
+		}
+	});
+
+	it('Master-Agent: fehlgeschlagener Teilauftrag → Koordination statt Scheitern, ungültige Entscheidung, Wiederholen', async () => {
+		await setCoordinationRounds(1);
+		try {
+			const { parent, detail } = await planned(
+				'Feature mit Fehler',
+				[
+					{ key: 'a', title: 'Teil A', prompt: 'Baue A', role: 'implement' },
+					{ key: 'b', title: 'Teil B', prompt: 'Baue B', role: 'implement', dependsOn: ['a'] }
+				],
+				{ maxAttempts: 1 }
+			);
+			const [a, b] = detail.children;
+			const oa = await offerFor(a!.id);
+			await complete(oa, { status: 'failed', errorKind: 'agent', errorMessage: 'Tests kaputt' });
+
+			// Teilauftrag endgültig fehlgeschlagen: Geschwister abgebrochen, Elternauftrag koordiniert
+			const d = await task(parent.id);
+			expect(d.children.map((c) => c.status)).toEqual(['failed', 'cancelled']);
+			expect(d.task.status).toBe('queued');
+			expect(d.task.coordination).toEqual({ phase: 'coordinate', round: 1, maxRounds: 1 });
+			const c1 = await offerFor(parent.id);
+			expect(c1).toMatchObject({ role: 'orchestrate', readOnly: true });
+			expect(c1.prompt).toContain('Tests kaputt');
+			expect(c1.prompt).toContain('[key: a] (implement, failed');
+			expect(c1.prompt).toContain('[key: b] (implement, cancelled');
+
+			// Keine gültige Entscheidung (auch kein vorhandener Schlüssel) → Fehlversuch
+			const bad = await complete(c1, {
+				status: 'succeeded',
+				summary: decision({
+					done: false,
+					subtasks: [{ key: 'a', title: 'A neu', prompt: 'Nochmal', role: 'implement' }]
+				})
+			});
+			expect(bad.taskStatus).toBe('failed');
+			expect((await task(parent.id)).task.errorMessage).toContain('Koordination ungültig');
+
+			// Wiederholen in Phase `coordinate` → erneut koordinieren, Teilaufträge bleiben
+			ok(await call('admin', 'POST', `/tasks/${parent.id}/retry`), 201);
+			expect((await task(parent.id)).children.map((c) => c.status)).toEqual([
+				'failed',
+				'cancelled'
+			]);
+			const c2 = await offerFor(parent.id);
+			expect(c2.role).toBe('orchestrate');
+			const doneButNothing = await complete(c2, {
+				status: 'succeeded',
+				summary: decision({ summary: 'Aufgeben', done: true, subtasks: [] })
+			});
+			expect(doneButNothing.taskStatus).toBe('failed');
+			const failed = (await task(parent.id)).task;
+			expect(failed.errorMessage).toContain('kein Teilauftrag war erfolgreich');
+			expect(failed.coordination?.phase).toBe('deliver');
+
+			// Wiederholen ohne erledigten Teilauftrag → neu koordinieren statt leer auszuliefern
+			ok(await call('admin', 'POST', `/tasks/${parent.id}/retry`), 201);
+			expect((await task(parent.id)).task).toMatchObject({
+				status: 'queued',
+				coordination: { phase: 'coordinate' }
+			});
+			const c3 = await offerFor(parent.id);
+			await complete(c3, {
+				status: 'succeeded',
+				summary: decision({
+					summary: 'Anders versuchen',
+					done: false,
+					subtasks: [
+						{ key: 'a2', title: 'Teil A anders', prompt: 'Baue A anders', role: 'implement' }
+					]
+				})
+			});
+			const round2 = await task(parent.id);
+			expect(round2.task.coordination).toEqual({ phase: 'subtasks', round: 2, maxRounds: 1 });
+			const a2 = round2.children.find((c) => c.title === 'Teil A anders')!;
+			expect(a2.position).toBe(2);
+			expect(b!.id).not.toBe(a2.id);
+			const oa2 = await offerFor(a2.id);
+			await complete(oa2, { status: 'succeeded', summary: 'A anders gebaut', merged: true });
+
+			// letzte Runde erreicht → direkt ausliefern
+			const ready = (await task(parent.id)).task;
+			expect(ready).toMatchObject({ status: 'queued', coordination: { phase: 'deliver' } });
+			const deliver = await offerFor(parent.id);
+			expect(deliver).toMatchObject({ role: 'implement', readOnly: false });
+			ok(await call('admin', 'POST', `/tasks/${parent.id}/cancel`), 201);
+		} finally {
+			await setCoordinationRounds(0);
+		}
+	});
+
+	it('Master-Agent: höchste Runde erreicht → ohne weitere Koordination ausliefern', async () => {
+		await setCoordinationRounds(1);
+		try {
+			const { parent, detail } = await planned('Feature mit einer Runde', [
+				{ key: 'a', title: 'Teil A', prompt: 'Baue A', role: 'implement' }
+			]);
+			await complete(await offerFor(detail.children[0]!.id), {
+				status: 'succeeded',
+				summary: 'A gebaut',
+				merged: true
+			});
+			const c1 = await offerFor(parent.id);
+			expect(c1.role).toBe('orchestrate');
+			await complete(c1, {
+				status: 'succeeded',
+				summary: decision({
+					summary: 'Noch ein Review',
+					subtasks: [
+						{ key: 'r', title: 'Review', prompt: 'Prüfe', role: 'review', dependsOn: ['a'] }
+					]
+				})
+			});
+			const review = (await task(parent.id)).children.find((c) => c.title === 'Review')!;
+			const or = await offerFor(review.id);
+			expect(or).toMatchObject({ role: 'review', readOnly: true });
+			expect(or.prompt).toContain('A gebaut');
+			await complete(or, { status: 'succeeded', summary: 'Keine Befunde' });
+			expect((await task(parent.id)).task).toMatchObject({
+				status: 'queued',
+				coordination: { phase: 'deliver', round: 2, maxRounds: 1 }
+			});
+			const deliver = await offerFor(parent.id);
+			expect(deliver).toMatchObject({ role: 'implement', readOnly: false });
+			await complete(deliver, { status: 'succeeded', summary: 'ausgeliefert', merged: true });
+			expect((await task(parent.id)).task.status).toBe('done');
+		} finally {
+			await setCoordinationRounds(0);
+		}
+	});
+
+	it('Ohne Koordinationsrunden: altes Verhalten (Ausliefern bzw. Scheitern)', async () => {
+		const { parent, planOffer, detail } = await planned('Feature ohne Master-Agent', [
+			{ key: 'a', title: 'Teil A', prompt: 'Baue A', role: 'implement' }
+		]);
+		expect(planOffer.systemPrompt).not.toContain('master agent');
+		expect(detail.task.coordination).toBeNull();
+		await complete(await offerFor(detail.children[0]!.id), {
+			status: 'succeeded',
+			summary: 'A gebaut',
+			merged: true
+		});
+		expect((await task(parent.id)).task).toMatchObject({ status: 'queued', coordination: null });
+		const deliver = await offerFor(parent.id);
+		expect(deliver).toMatchObject({ role: 'implement', readOnly: false });
+		ok(await call('admin', 'POST', `/tasks/${parent.id}/cancel`), 201);
+
+		const second = await planned(
+			'Feature ohne Master-Agent mit Fehler',
+			[{ key: 'a', title: 'Teil A', prompt: 'Baue A', role: 'implement' }],
+			{ maxAttempts: 1 }
+		);
+		await complete(await offerFor(second.detail.children[0]!.id), {
+			status: 'failed',
+			errorMessage: 'kaputt'
+		});
+		expect((await task(second.parent.id)).task).toMatchObject({
+			status: 'failed',
+			coordination: null
+		});
+		expect((await task(second.parent.id)).task.errorMessage).toContain('Teil A');
 	});
 
 	it('Konflikt → Konfliktlösung übernimmt das Ergebnis', async () => {
