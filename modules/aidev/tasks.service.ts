@@ -34,16 +34,25 @@
  *
  * Chat: Erreicht ein Auftrag ohne Elternteil `done`/`review`/`failed`/`needs-input` (Teilaufträge nur bei
  * `needs-input`), entsteht eine `agent`-Nachricht mit Titel, Ergebnis und ggf. PR im Projekt-Chat.
+ * Aktionsvorschläge (`aidev-actions`-Block, `actions.ts`) von Chat-Fragen und einfachen Aufträgen werden dabei aus
+ * dem Ergebnis entfernt und als `pending` an der Nachricht gespeichert (`chat_message.actions`).
  */
 import { sql } from 'drizzle-orm';
 import { errors, inList, num, rowsOf, str, type RequestContext } from '$lib/sdk/server';
+import { extractChatActions, type ChatAction, type StoredChatAction } from './actions';
 import { clip, jsonb, jsonOf, oneOf, shortId, stringList, type Row, type Tx } from './db';
 import type { Effects } from './effects';
 import { sendCommand } from './effects';
 import { slugify, slugOrNull, titleFromPrompt } from './prompts';
 import { planSchema, READ_ONLY_ROLES, type Plan, type Role } from './protocol';
 import { findCycle } from './scheduler';
-import { FINAL_TASK_STATUSES, PERM, type TaskInput, type TaskStatus } from './schemas';
+import {
+	FINAL_TASK_STATUSES,
+	PERM,
+	type TaskInput,
+	type TaskPatch,
+	type TaskStatus
+} from './schemas';
 
 /** Gespeicherter Plan eines Orchestrierungs-Auftrags */
 export type StoredPlan = Plan & { delivered: boolean };
@@ -133,15 +142,40 @@ export async function insertChat(
 		kind: 'user' | 'agent' | 'system';
 		body: string;
 		authorUserId?: string | null;
+		/** Aktionsvorschläge des Agents (nur `agent`-Nachrichten) */
+		actions?: StoredChatAction[] | null;
 	}
 ): Promise<string> {
 	const id = crypto.randomUUID();
+	const actions = m.actions?.length ? jsonb(m.actions) : null;
 	await tx.execute(
-		sql`INSERT INTO chat_message (id, project_id, task_id, author_user_id, kind, body)
-			VALUES (${id}, ${m.projectId}, ${m.taskId}, ${m.authorUserId ?? null}, ${m.kind}, ${clip(m.body, m.kind === 'agent' ? 40_000 : 20_000)})`
+		sql`INSERT INTO chat_message (id, project_id, task_id, author_user_id, kind, body, actions)
+			VALUES (${id}, ${m.projectId}, ${m.taskId}, ${m.authorUserId ?? null}, ${m.kind}, ${clip(m.body, m.kind === 'agent' ? 40_000 : 20_000)}, ${actions})`
 	);
 	fx.chat.add(id);
 	return id;
+}
+
+/** Rollen einfacher Aufträge, deren Agent Plattformaktionen vorschlagen darf */
+const ACTION_ROLES: Role[] = ['research', 'implement', 'review', 'fix'];
+
+/** Darf das Ergebnis dieses Auftrags Aktionsvorschläge enthalten? (Chat-Fragen und einfache Aufträge ohne Plan) */
+function acceptsChatActions(task: Row): boolean {
+	if (task.parent_id) return false;
+	if (task.chat_question === true) return true;
+	return ACTION_ROLES.includes(String(task.role) as Role) && !planOf(task);
+}
+
+/** Neue, noch nicht entschiedene Vorschläge */
+export function pendingActions(actions: ChatAction[]): StoredChatAction[] {
+	return actions.map((action) => ({
+		action,
+		state: 'pending',
+		taskId: null,
+		error: null,
+		decidedBy: null,
+		decidedAt: null
+	}));
 }
 
 function agentText(task: Row, status: TaskStatus): string {
@@ -227,11 +261,32 @@ export async function transition(
 				(row.chat_question === true && status === 'cancelled'))) ||
 		(hasParent && status === 'needs-input')
 	) {
+		let actions: StoredChatAction[] = [];
+		let note = '';
+		const summary = str(row.result_summary);
+		if ((status === 'done' || status === 'review') && summary && acceptsChatActions(row)) {
+			const found = extractChatActions(summary);
+			if (found.actions.length || found.invalid) {
+				// Block aus dem Ergebnis entfernen – sichtbar bleibt nur der Text, die Vorschläge hängen an der Nachricht
+				const stripped = found.body.trim() ? found.body : null;
+				await tx.execute(sql`UPDATE task SET result_summary = ${stripped} WHERE id = ${id}`);
+				row.result_summary = stripped;
+				actions = pendingActions(found.actions);
+				if (found.invalid) {
+					note =
+						found.invalid === 1
+							? 'Hinweis: 1 ungültiger Vorschlag wurde ignoriert.'
+							: `Hinweis: ${found.invalid} ungültige Vorschläge wurden ignoriert.`;
+				}
+			}
+		}
+		const text = agentText(row, status);
 		await insertChat(tx, fx, {
 			projectId: String(row.project_id),
 			taskId: id,
 			kind: 'agent',
-			body: agentText(row, status)
+			body: note ? `${text}\n\n${note}` : text,
+			actions
 		});
 	}
 	await propagate(tx, fx, row);
@@ -373,6 +428,42 @@ export async function createTask(
 		metadata: { projectId: String(project.id), role, draft: input.draft }
 	});
 	return id;
+}
+
+// ---------------------------------------------------------------- Ändern
+
+/**
+ * Auftrag ändern (`PATCH /tasks/:id`, Vorschlag „Auftrag ändern“): Rechte wie `assertCanEditTask`; der Auftragstext
+ * ist nur änderbar, solange kein Lauf aktiv ist. `task` vorher mit `FOR UPDATE` laden.
+ */
+export async function updateTask(
+	tx: Tx,
+	fx: Effects,
+	ctx: RequestContext,
+	task: Row,
+	patch: TaskPatch
+): Promise<void> {
+	assertCanEditTask(ctx, task);
+	if (patch.prompt !== undefined && patch.prompt !== task.prompt) {
+		const active = await oneOf(
+			tx,
+			sql`SELECT 1 FROM run WHERE task_id = ${task.id} AND status IN ('offered', 'running') LIMIT 1`
+		);
+		if (active || task.status === 'running') {
+			throw errors.conflict('Der Auftragstext lässt sich während eines Laufs nicht ändern');
+		}
+	}
+	await tx.execute(
+		sql`UPDATE task SET title = ${patch.title ?? String(task.title)},
+				prompt = ${patch.prompt ?? String(task.prompt)},
+				priority = ${patch.priority ?? num(task.priority)},
+				provider_hint = ${patch.providerHint === undefined ? str(task.provider_hint) : patch.providerHint},
+				max_attempts = ${patch.maxAttempts ?? num(task.max_attempts)},
+				updated_at = now()
+			WHERE id = ${task.id}`
+	);
+	fx.tasks.add(String(task.id));
+	fx.dispatch = true;
 }
 
 // ---------------------------------------------------------------- Plan
@@ -623,6 +714,17 @@ export async function cancelTask(tx: Tx, fx: Effects, task: Row): Promise<void> 
 		target: String(task.id),
 		metadata: { projectId: String(task.project_id), runs: runs.length }
 	});
+}
+
+/** Abbrechen im Namen einer Person (`POST /tasks/:id/cancel`, Vorschlag „Auftrag abbrechen“): mit Rechteprüfung */
+export async function cancelTaskAs(
+	tx: Tx,
+	fx: Effects,
+	ctx: RequestContext,
+	task: Row
+): Promise<void> {
+	assertCanEditTask(ctx, task);
+	await cancelTask(tx, fx, task);
 }
 
 async function assertParentAllowsRestart(tx: Tx, task: Row): Promise<void> {

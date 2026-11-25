@@ -22,7 +22,7 @@ import { requireProject } from './projects.service';
 import { callRunner, parseResult, projectAndRunner, rpcProjectOf } from './rpc.service';
 import {
 	assertCanEditTask,
-	cancelTask,
+	cancelTaskAs,
 	createTask,
 	descendantIds,
 	insertChat,
@@ -31,7 +31,8 @@ import {
 	requireTask,
 	restartTask,
 	RETRYABLE,
-	transition
+	transition,
+	updateTask
 } from './tasks.service';
 import {
 	idParams,
@@ -120,27 +121,7 @@ export const taskEndpoints: AnyApiEndpoint[] = [
 			const fx = newEffects();
 			const dto = await mdb().transaction(async (tx) => {
 				const task = await requireTask(tx, params.id, true);
-				assertCanEditTask(ctx, task);
-				if (body.prompt !== undefined && body.prompt !== task.prompt) {
-					const active = await oneOf(
-						tx,
-						sql`SELECT 1 FROM run WHERE task_id = ${task.id} AND status IN ('offered', 'running') LIMIT 1`
-					);
-					if (active || task.status === 'running') {
-						throw errors.conflict('Der Auftragstext lässt sich während eines Laufs nicht ändern');
-					}
-				}
-				await tx.execute(
-					sql`UPDATE task SET title = ${body.title ?? String(task.title)},
-							prompt = ${body.prompt ?? String(task.prompt)},
-							priority = ${body.priority ?? num(task.priority)},
-							provider_hint = ${body.providerHint === undefined ? str(task.provider_hint) : body.providerHint},
-							max_attempts = ${body.maxAttempts ?? num(task.max_attempts)},
-							updated_at = now()
-						WHERE id = ${task.id}`
-				);
-				fx.tasks.add(params.id);
-				fx.dispatch = true;
+				await updateTask(tx, fx, ctx, task, body);
 				return (await loadTaskDto(tx, params.id))!;
 			});
 			await publish(ctx, fx);
@@ -179,9 +160,7 @@ export const taskEndpoints: AnyApiEndpoint[] = [
 		handler: async ({ ctx, params }): Promise<TaskDto> => {
 			const fx = newEffects();
 			const dto = await mdb().transaction(async (tx) => {
-				const task = await requireTask(tx, params.id, true);
-				assertCanEditTask(ctx, task);
-				await cancelTask(tx, fx, task);
+				await cancelTaskAs(tx, fx, ctx, await requireTask(tx, params.id, true));
 				return (await loadTaskDto(tx, params.id))!;
 			});
 			await publish(ctx, fx);
