@@ -16,7 +16,10 @@
 </script>
 
 <span
-	class={cn('inline-flex items-center gap-1.5 text-xs text-muted-foreground', className)}
+	class={cn(
+		'inline-flex shrink-0 items-center gap-1.5 text-xs whitespace-nowrap text-muted-foreground',
+		className
+	)}
 	role="status"
 	aria-live="polite"
 >

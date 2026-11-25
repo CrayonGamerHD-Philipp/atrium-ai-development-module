@@ -34,7 +34,7 @@
 			</div>
 			<ProviderBadge provider={r.provider} model={compact ? '' : r.model} />
 			{#if r.status !== 'running'}<StatusBadge status={r.status} run />{/if}
-			<span class="w-20 text-right text-xs text-muted-foreground tabular-nums">
+			<span class="w-20 shrink-0 text-right text-xs text-muted-foreground tabular-nums">
 				{elapsed(r.startedAt, r.finishedAt, now)}
 			</span>
 		</li>
