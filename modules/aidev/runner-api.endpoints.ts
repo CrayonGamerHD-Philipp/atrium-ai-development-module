@@ -246,8 +246,12 @@ export const runnerApiEndpoints: AnyApiEndpoint[] = [
 		rateLimit: { limit: 600, windowSec: 60 },
 		params: idParams,
 		body: finishInput,
-		handler: ({ ctx, params, body }) =>
-			asRunner(ctx, (tx, fx, runner) => finishRun(tx, fx, String(runner.id), params.id, body))
+		handler: async ({ ctx, params, body }) => {
+			const { limits } = await loadSettings();
+			return asRunner(ctx, (tx, fx, runner) =>
+				finishRun(tx, fx, String(runner.id), params.id, body, limits)
+			);
+		}
 	}),
 	defineEndpoint({
 		method: 'POST',

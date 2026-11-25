@@ -158,14 +158,20 @@ export const limitsSchema = z.object({
 	/** Geschätzter Verbrauch je Lauf (Einheiten), bis echte Werte da sind */
 	estimatedUnitsPerRun: z.number().int().min(0).max(100_000_000),
 	/** Höchstzahl Ereignisse je Lauf */
-	maxEventsPerRun: z.number().int().min(100).max(1_000_000)
+	maxEventsPerRun: z.number().int().min(100).max(1_000_000),
+	/**
+	 * Koordinationsrunden des Master-Agents je Orchestrierung (0 = keine: nach den Teilaufträgen direkt
+	 * ausliefern). Maßgeblich ist der Wert bei Übernahme des Plans.
+	 */
+	coordinationRounds: z.number().int().min(0).max(10)
 });
 export type Limits = z.infer<typeof limitsSchema>;
 export const DEFAULT_LIMITS: Limits = {
 	runTimeoutMin: 90,
 	eventRetentionDays: 30,
 	estimatedUnitsPerRun: 400_000,
-	maxEventsPerRun: 20_000
+	maxEventsPerRun: 20_000,
+	coordinationRounds: 2
 };
 
 // ---------------------------------------------------------------- Eingaben (Browser → Server)
@@ -369,6 +375,21 @@ export interface TaskDto {
 	finishedAt: string | null;
 	/** Laufender bzw. letzter Lauf (Kurzform) */
 	lastRun: RunSummaryDto | null;
+	/**
+	 * Master-Agent-Koordination einer Orchestrierung; `null` bei anderen Rollen, vor dem Plan und bei Plänen
+	 * ohne Koordinationsrunden
+	 */
+	coordination: TaskCoordinationDto | null;
+}
+
+/** Phase einer Orchestrierung nach dem Plan: Teilaufträge einer Runde, Koordinationslauf, Ausliefern */
+export type CoordinationPhase = 'subtasks' | 'coordinate' | 'deliver';
+export interface TaskCoordinationDto {
+	phase: CoordinationPhase;
+	/** Aktuelle Runde der Teilaufträge (1-basiert; nach Runde `maxRounds + 1` wird direkt ausgeliefert) */
+	round: number;
+	/** Höchstzahl der Koordinationsläufe (Einstellung bei Übernahme des Plans) */
+	maxRounds: number;
 }
 
 export interface RunSummaryDto {
@@ -634,7 +655,7 @@ export type TerminalLiveEvent =
  * | GET | /accounts | project.view | – | AccountDto[] |
  * | PATCH | /accounts/:id | account.manage | accountPatch | AccountDto |
  * | POST | /accounts/:id/clear-cooldown | account.manage | – | AccountDto |
- * | GET | /routing | project.view | – | { routing: Routing, limits: Limits } |
+ * | GET | /routing | project.view | – | { routing: Routing, limits: Limits } (fehlende Grenzwerte = Standard) |
  * | PUT | /routing | settings.manage | { routing, limits } | { routing, limits } |
  */
 export const API_DOC = true;

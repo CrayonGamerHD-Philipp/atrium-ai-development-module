@@ -66,11 +66,20 @@ export interface AidevSettings {
 	limits: Limits;
 }
 
-/** Routing und Grenzwerte (ungültige gespeicherte Werte → Standard). NICHT in einer Transaktion aufrufen. */
+/**
+ * Routing und Grenzwerte (ungültige gespeicherte Werte → Standard). Gespeicherte Grenzwerte werden mit den
+ * Standardwerten zusammengeführt, damit Werte älterer Versionen ohne neue Felder (z. B. `coordinationRounds`)
+ * gültig bleiben. NICHT in einer Transaktion aufrufen.
+ */
 export async function loadSettings(): Promise<AidevSettings> {
 	const values = await core.settings.getMany([SETTING_ROUTING, SETTING_LIMITS]);
 	const routing = routingSchema.safeParse(values[SETTING_ROUTING]);
-	const limits = limitsSchema.safeParse(values[SETTING_LIMITS]);
+	const storedLimits = values[SETTING_LIMITS];
+	const limits = limitsSchema.safeParse(
+		storedLimits && typeof storedLimits === 'object' && !Array.isArray(storedLimits)
+			? { ...DEFAULT_LIMITS, ...storedLimits }
+			: storedLimits
+	);
 	return {
 		routing: routing.success ? routing.data : DEFAULT_ROUTING,
 		limits: limits.success ? limits.data : DEFAULT_LIMITS

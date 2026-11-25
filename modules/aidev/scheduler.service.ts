@@ -10,6 +10,8 @@
  *   Beim ersten Teilauftrag existiert `origin/<Integrations-Branch>` evtl. noch nicht – der Runner legt ihn dann
  *   aus dem Haupt-Branch an und pusht ihn (gleiche Regel gilt für jede fehlende Basis).
  * - Konfliktlösung und Ausliefern: vorhandener Branch des (ursprünglichen) Auftrags.
+ * - Koordinationslauf des Master-Agents: Integrations-Branch, nur lesen (sieht den integrierten Stand); fehlt
+ *   der Branch noch (keine Commits), startet der Runner vom Haupt-Branch.
  * - Auftrag mit `target_pr` (bestehenden PR bearbeiten): `createTask` setzt `branch` = Head-Branch des PR und
  *   `base_ref` = Haupt-Branch; `branchPlan` übernimmt beides. Bei `orchestrate` wird der PR-Branch so zum
  *   Integrations-Branch (Teilaufträge zweigen von ihm ab und werden hineingemergt), das Ausliefern pusht in den PR.
@@ -40,7 +42,14 @@ import {
 import { publish } from './publish.service';
 import { loseRun } from './runs.service';
 import { planAssignments, type ProjectState, type TaskCandidate } from './scheduler';
-import { effectiveRole, getTask, planOf, resolveInfoOf, topBranchOf } from './tasks.service';
+import {
+	effectiveRole,
+	getTask,
+	planOf,
+	resolveInfoOf,
+	subtasksOf,
+	topBranchOf
+} from './tasks.service';
 import { loadAccountViews } from './usage.service';
 import { LEASE_SEC, OFFER_LEASE_SEC, RUNNER_STALE_SEC } from './db';
 
@@ -130,22 +139,57 @@ const DELIVER_PROMPT = (branch: string, prompt: string) =>
 	`Alle Teilaufträge sind im Integrations-Branch „${branch}“ zusammengeführt. Prüfe die Integration, führe die ` +
 	`Tests aus, behebe Kleinigkeiten und liefere das Ergebnis aus.\n\nUrsprünglicher Auftrag:\n${prompt}`;
 
-async function promptContext(tx: Tx, task: Row, project: Row, role: Role): Promise<PromptContext> {
-	const deliver = !!planOf(task);
-	const resultRows = deliver
-		? await rowsOf(
-				tx,
-				sql`SELECT title, role, result_summary FROM task
+/** Teilauftrags-Ergebnisse für den Koordinationslauf des Master-Agents */
+async function coordinationContext(
+	tx: Tx,
+	task: Row
+): Promise<NonNullable<PromptContext['coordination']> | undefined> {
+	const plan = planOf(task);
+	if (!plan || plan.phase !== 'coordinate') return undefined;
+	const entries = await subtasksOf(tx, task, plan);
+	const subtasks: NonNullable<PromptContext['coordination']>['subtasks'] = [];
+	for (const { key, spec, row } of entries) {
+		const status = String(row?.status ?? 'cancelled');
+		if (status !== 'done' && status !== 'failed' && status !== 'cancelled') continue;
+		subtasks.push({
+			key,
+			title: String(row?.title ?? spec.title),
+			role: String(row?.role ?? spec.role) as Role,
+			status,
+			provider: str(row?.last_provider) ?? str(row?.provider_hint) ?? spec.provider ?? null,
+			summary: str(row?.result_summary) ?? '',
+			error: status === 'done' ? null : (str(row?.error_message) ?? null)
+		});
+	}
+	return { round: plan.round ?? 1, maxRounds: plan.maxRounds ?? 0, subtasks };
+}
+
+async function promptContext(
+	tx: Tx,
+	task: Row,
+	project: Row,
+	role: Role,
+	settings: AidevSettings
+): Promise<PromptContext> {
+	const plan = planOf(task);
+	const coordination = await coordinationContext(tx, task);
+	const deliver = !!plan && !coordination;
+	const resultRows = coordination
+		? []
+		: deliver
+			? await rowsOf(
+					tx,
+					sql`SELECT title, role, result_summary FROM task
 					WHERE parent_id = ${task.id} AND role <> 'resolve' AND status = 'done'
 					ORDER BY position, created_at`
-			)
-		: await rowsOf(
-				tx,
-				sql`SELECT t.title, t.role, t.result_summary FROM task_dep d
+				)
+			: await rowsOf(
+					tx,
+					sql`SELECT t.title, t.role, t.result_summary FROM task_dep d
 					JOIN task t ON t.id = d.depends_on_id
 					WHERE d.task_id = ${task.id} AND t.status = 'done'
 					ORDER BY t.position, t.created_at`
-			);
+				);
 	const replies = await rowsOf(
 		tx,
 		// die Chat-Nachricht, aus der der Auftrag entstand (gleiche Transaktion), ist kein Nachtrag
@@ -186,7 +230,12 @@ async function promptContext(tx: Tx, task: Row, project: Row, role: Role): Promi
 		replies: replies.map((r) => String(r.body)),
 		parent: parent ? { title: String(parent.title), prompt: String(parent.prompt) } : null,
 		conflictFiles: resolveInfoOf(task)?.conflictFiles ?? [],
-		previousError: str(task.error_message)
+		previousError: str(task.error_message),
+		// Erstplanung: Zahl der Koordinationsrunden (maßgeblich wird der Wert bei Übernahme des Plans)
+		...(role === 'orchestrate' && !plan
+			? { masterRounds: settings.limits.coordinationRounds }
+			: {}),
+		...(coordination ? { coordination } : {})
 	};
 }
 
@@ -203,7 +252,7 @@ export async function buildOffer(
 		: null;
 	if (!task || !project || !account) return null;
 	const role = effectiveRole(task);
-	const ctx = await promptContext(tx, task, project, role);
+	const ctx = await promptContext(tx, task, project, role, settings);
 	const plan = await branchPlan(tx, task, project);
 	ctx.delivery = await deliveryOf(tx, task, project);
 	const sessionAccount = str(task.session_account_id);
@@ -264,7 +313,7 @@ export async function pendingOffers(
 async function candidates(tx: Tx): Promise<Row[]> {
 	return rowsOf(
 		tx,
-		sql`SELECT t.* FROM task t
+		sql`SELECT t.*, (SELECT pt.role FROM task pt WHERE pt.id = t.parent_id) AS parent_role FROM task t
 			JOIN project p ON p.id = t.project_id
 			WHERE t.status = 'queued' AND p.archived_at IS NULL
 				AND NOT EXISTS (SELECT 1 FROM run r WHERE r.task_id = t.id AND r.status IN ('offered', 'running'))
@@ -278,6 +327,57 @@ async function candidates(tx: Tx): Promise<Row[]> {
 			ORDER BY t.priority DESC, t.created_at, t.id
 			LIMIT 500`
 	);
+}
+
+/**
+ * Geschwistergruppen für die Verteilung auf verschiedene Anbieter: Teilaufträge einer Orchestrierung (ohne
+ * Konfliktlösungen) erhalten `groupId` = Elternauftrag und die Anbieter/Konten der aktiven Läufe
+ * (`offered`/`running`) ihrer Geschwister. Liefert Auftrags-ID → Gruppenfelder.
+ */
+async function siblingGroups(
+	tx: Tx,
+	rows: Row[]
+): Promise<Map<string, Pick<TaskCandidate, 'groupId' | 'groupProviders' | 'groupAccounts'>>> {
+	const grouped = rows.filter(
+		(r) => !!r.parent_id && r.parent_role === 'orchestrate' && r.role !== 'resolve'
+	);
+	const out = new Map<
+		string,
+		Pick<TaskCandidate, 'groupId' | 'groupProviders' | 'groupAccounts'>
+	>();
+	if (!grouped.length) return out;
+	const parents = [...new Set(grouped.map((r) => String(r.parent_id)))];
+	const active = await rowsOf(
+		tx,
+		sql`SELECT t.parent_id, r.provider, r.account_id, count(*) AS n FROM run r
+			JOIN task t ON t.id = r.task_id
+			WHERE t.parent_id IN (${inList(parents)}) AND t.role <> 'resolve'
+				AND r.status IN ('offered', 'running')
+			GROUP BY t.parent_id, r.provider, r.account_id`
+	);
+	const usage = new Map<
+		string,
+		{ providers: Partial<Record<Provider, number>>; accounts: Record<string, number> }
+	>();
+	for (const a of active) {
+		const key = String(a.parent_id);
+		const u = usage.get(key) ?? { providers: {}, accounts: {} };
+		const provider = String(a.provider) as Provider;
+		u.providers[provider] = (u.providers[provider] ?? 0) + num(a.n);
+		const account = str(a.account_id);
+		if (account) u.accounts[account] = (u.accounts[account] ?? 0) + num(a.n);
+		usage.set(key, u);
+	}
+	for (const r of grouped) {
+		const parentId = String(r.parent_id);
+		const u = usage.get(parentId);
+		out.set(String(r.id), {
+			groupId: parentId,
+			groupProviders: { ...(u?.providers ?? {}) },
+			groupAccounts: { ...(u?.accounts ?? {}) }
+		});
+	}
+	return out;
 }
 
 async function projectStates(tx: Tx, ids: string[]): Promise<ProjectState[]> {
@@ -361,6 +461,7 @@ async function dispatchIn(tx: Tx, fx: Effects, settings: AidevSettings): Promise
 	const without = (caps: Set<string> | null) =>
 		caps ? accounts.filter((a) => !caps.has(a.state.runnerId)).map((a) => a.state.id) : [];
 	const byId = new Map(rows.map((r) => [String(r.id), r]));
+	const groups = await siblingGroups(tx, rows);
 	const tasks: TaskCandidate[] = rows.map((r) => ({
 		id: String(r.id),
 		projectId: String(r.project_id),
@@ -375,7 +476,8 @@ async function dispatchIn(tx: Tx, fx: Effects, settings: AidevSettings): Promise
 			...without(restricted.get(String(r.id)) ?? null)
 		],
 		sessionAccountId: str(r.session_account_id),
-		estimatedUnits: settings.limits.estimatedUnitsPerRun
+		estimatedUnits: settings.limits.estimatedUnitsPerRun,
+		...(groups.get(String(r.id)) ?? {})
 	}));
 	const assignments = planAssignments({
 		tasks,

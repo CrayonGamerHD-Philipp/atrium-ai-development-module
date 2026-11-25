@@ -12,18 +12,38 @@
  * 1. Planungslauf (nur lesen, `expectPlan`). Erfolg → Plan aus `finish.plan` bzw. `extractPlan(summary)` gegen
  *    `planSchema` prüfen (eindeutige Schlüssel, bekannte Abhängigkeiten, kein Zyklus per `findCycle`).
  *    Ungültig → normaler Fehlversuch. Gültig → Teilaufträge (position = Index, Abhängigkeiten über `key`),
- *    Plan in `task.plan` (mit `delivered: false`), `task.branch` = Integrations-Branch `aidev/<kurz-id>-<slug>`,
- *    Elternauftrag `blocked`.
+ *    Plan in `task.plan` (`delivered: false`, `phase: 'subtasks'`, `round: 1`, `maxRounds` = Einstellung
+ *    `limits.coordinationRounds` bei Übernahme, `ids` = Schlüssel → Auftrags-ID), `task.branch` =
+ *    Integrations-Branch `aidev/<kurz-id>-<slug>`, Elternauftrag `blocked`. Der Planungs-Prompt nennt die Zahl
+ *    der Koordinationsrunden (`masterRounds`).
  * 2. Teilaufträge laufen auf `aidev/<eltern-kurz>/<n>-<slug>` mit Basis = Integrations-Branch und Auslieferung
- *    `integrate` (Runner legt den Integrations-Branch aus dem Haupt-Branch an, falls er noch fehlt).
- * 3. Sind alle Teilaufträge (ohne Konfliktlösungen) beendet und mindestens einer `done` (abgebrochene zählen als
- *    erledigt), wird der Elternauftrag wieder `queued` (Versuche = 0) für den Lauf „Ausliefern“: Rolle
- *    `implement`, schreibend, auf dem Integrations-Branch, Auslieferung nach Projekt-Policy (PR / Auto-Merge /
- *    direkt). Erfolg → `plan.delivered = true`, danach wie jeder Auftrag (`review` bzw. `done`).
- *    Sind alle Teilaufträge abgebrochen, wird der Elternauftrag `cancelled`.
- * 4. Ein Teilauftrag endgültig `failed` → Elternauftrag `failed`; offene Teilaufträge ohne aktiven Lauf werden
- *    abgebrochen (laufende enden regulär, ändern den Elternauftrag aber nicht mehr). „Wiederholen“ am
- *    Elternauftrag setzt fehlgeschlagene/abgebrochene Teilaufträge zurück und blockiert ihn erneut.
+ *    `integrate` (Runner legt den Integrations-Branch aus dem Haupt-Branch an, falls er noch fehlt). Der
+ *    Scheduler verteilt Geschwister bevorzugt auf verschiedene Anbieter/Konten (`groupId` = Elternauftrag).
+ * 3. Koordination (Master-Agent), solange `round <= maxRounds`: Sind alle Teilaufträge (ohne Konfliktlösungen)
+ *    final (`done`/`failed`/`cancelled`) und mindestens einer `done` oder `failed`, wird der Elternauftrag
+ *    `queued` (Versuche = 0) mit `phase: 'coordinate'`: Rolle `orchestrate`, nur lesen (`expectPlan`), auf dem
+ *    Integrations-Branch (fehlt er noch, startet der Runner vom Haupt-Branch), Prompt = ursprünglicher Auftrag
+ *    plus Ergebnisse aller Teilaufträge (`coordination`). Ergebnis (`extractCoordination`, Ausweichweg
+ *    `finish.plan`; ungültig → Fehlversuch):
+ *    - `done` → `phase: 'deliver'`, weiter mit 4. (kein Teilauftrag erledigt → `failed` bzw. `cancelled`).
+ *    - Folgeaufträge → angehängt (`position` fortlaufend, Graph über alle Schlüssel geprüft, höchstens
+ *      `MAX_TOTAL_SUBTASKS` insgesamt); `dependsOn` auf vorhandene erledigte Schlüssel übergibt deren Ergebnis,
+ *      auf nicht erledigte entfällt. `round + 1`, `phase: 'subtasks'`, Elternauftrag `blocked`, Zusammenfassung
+ *      des Master-Agents als Ergebnis.
+ *    Ein endgültig fehlgeschlagener Teilauftrag lässt den Elternauftrag dabei nicht scheitern: offene Geschwister
+ *    ohne aktiven Lauf werden abgebrochen, sind alle final, folgt die Koordination.
+ * 4. Ausliefern (ohne verbleibende Runde bzw. nach `done`): Sind alle Teilaufträge beendet und mindestens einer
+ *    `done` (abgebrochene und – bei Plänen mit Koordination – fehlgeschlagene früherer Runden zählen als
+ *    beendet), wird der Elternauftrag `queued` (Versuche = 0) mit `phase: 'deliver'`: Rolle `implement`,
+ *    schreibend, auf dem Integrations-Branch, Auslieferung nach Projekt-Policy (PR / Auto-Merge / direkt).
+ *    Erfolg → `plan.delivered = true`, danach wie jeder Auftrag (`review` bzw. `done`). Sind alle
+ *    Teilaufträge abgebrochen, wird der Elternauftrag `cancelled`.
+ * 5. Ohne verbleibende Runde (auch Pläne älterer Versionen: `maxRounds` fehlt = 0): Ein Teilauftrag endgültig
+ *    `failed` → Elternauftrag `failed`; offene Teilaufträge ohne aktiven Lauf werden abgebrochen (laufende enden
+ *    regulär, ändern den Elternauftrag aber nicht mehr).
+ * 6. „Wiederholen“ am Elternauftrag (siehe `restartTask`): in `coordinate` erneut koordinieren, in `deliver`
+ *    nach einer Koordination erneut ausliefern, sonst fehlgeschlagene/abgebrochene Teilaufträge zurücksetzen
+ *    und den Elternauftrag erneut blockieren.
  *
  * Konflikte (`finish.status = failed`, `errorKind = conflict`)
  * - Es entsteht ein Kind-Auftrag Rolle `resolve` (Konfliktdateien in `plan.conflictFiles` und im Prompt), auf
@@ -43,10 +63,31 @@ import { sendCommand } from './effects';
 import { slugify, slugOrNull, titleFromPrompt } from './prompts';
 import { planSchema, READ_ONLY_ROLES, type Plan, type Role } from './protocol';
 import { findCycle } from './scheduler';
-import { FINAL_TASK_STATUSES, PERM, type TaskInput, type TaskStatus } from './schemas';
+import type { Coordination } from './prompts';
+import {
+	FINAL_TASK_STATUSES,
+	PERM,
+	type CoordinationPhase,
+	type TaskInput,
+	type TaskStatus
+} from './schemas';
 
-/** Gespeicherter Plan eines Orchestrierungs-Auftrags */
-export type StoredPlan = Plan & { delivered: boolean };
+/**
+ * Gespeicherter Plan eines Orchestrierungs-Auftrags. `subtasks` enthält die Teilaufträge aller Runden (in der
+ * Reihenfolge des Anlegens), `ids` ordnet ihre Schlüssel den Auftrags-IDs zu. Pläne älterer Versionen haben weder
+ * `phase`/`round`/`maxRounds` noch `ids`: Sie laufen ohne Koordination (maxRounds 0), Zuordnung über `position`.
+ */
+export type StoredPlan = Plan & {
+	delivered: boolean;
+	phase?: CoordinationPhase;
+	/** Aktuelle Runde der Teilaufträge (1-basiert) */
+	round?: number;
+	/** Höchstzahl der Koordinationsläufe (`limits.coordinationRounds` bei Übernahme des Plans) */
+	maxRounds?: number;
+	ids?: Record<string, string>;
+};
+/** Höchstzahl der Teilaufträge einer Orchestrierung über alle Runden (schützt vor endlosem Nachplanen) */
+export const MAX_TOTAL_SUBTASKS = 60;
 /** Zusatzdaten einer Konfliktlösung (in `task.plan`) */
 export interface ResolveInfo {
 	kind: 'resolve';
@@ -83,9 +124,16 @@ export function resolveInfoOf(task: Row): ResolveInfo | null {
 	return info ? { kind: 'resolve', conflictFiles: stringList(info.conflictFiles) } : null;
 }
 
-/** Rolle des nächsten Laufs: Orchestrierung mit Plan → Ausliefern (`implement`) */
+/** Bleibt nach der aktuellen Runde von Teilaufträgen noch ein Koordinationslauf? */
+export const hasRoundsLeft = (plan: StoredPlan) => (plan.round ?? 1) <= (plan.maxRounds ?? 0);
+
+/**
+ * Rolle des nächsten Laufs: Orchestrierung mit Plan in Phase `coordinate` → Master-Agent (`orchestrate`, nur
+ * lesen), sonst mit Plan → Ausliefern (`implement`)
+ */
 export function effectiveRole(task: Row): Role {
-	if (planOf(task)) return 'implement';
+	const plan = planOf(task);
+	if (plan) return plan.phase === 'coordinate' ? 'orchestrate' : 'implement';
 	return String(task.role) as Role;
 }
 
@@ -259,21 +307,38 @@ async function propagate(tx: Tx, fx: Effects, task: Row): Promise<void> {
 	}
 
 	if (parent.role !== 'orchestrate' || isFinal(parent.status)) return;
+	const plan = planOf(parent);
+	// Koordinationsrunde übrig: Der Master-Agent entscheidet auch über fehlgeschlagene Teilaufträge
+	const coordinate = !!plan && hasRoundsLeft(plan);
 
 	if (status === 'failed') {
 		await failChildrenOf(tx, fx, String(parent.id), String(task.id));
-		await transition(tx, fx, String(parent.id), 'failed', {
-			error: `Teilauftrag „${String(task.title)}“ ist fehlgeschlagen${task.error_message ? `: ${String(task.error_message)}` : ''}`
-		});
-		return;
+		if (!coordinate) {
+			await transition(tx, fx, String(parent.id), 'failed', {
+				error: `Teilauftrag „${String(task.title)}“ ist fehlgeschlagen${task.error_message ? `: ${String(task.error_message)}` : ''}`
+			});
+			return;
+		}
 	}
-	if ((status === 'done' || status === 'cancelled') && parent.status === 'blocked') {
+	if (
+		(status === 'done' || status === 'cancelled' || (coordinate && status === 'failed')) &&
+		parent.status === 'blocked'
+	) {
 		const children = await rowsOf(
 			tx,
 			sql`SELECT status FROM task WHERE parent_id = ${parent.id} AND role <> 'resolve'`
 		);
-		if (!children.every((c) => c.status === 'done' || c.status === 'cancelled')) return;
-		if (children.some((c) => c.status === 'done')) {
+		// Fehlgeschlagene Teilaufträge früherer Runden hat der Master-Agent bereits gesehen: zählen als beendet
+		const coordinated = (plan?.maxRounds ?? 0) > 0;
+		const settled = (s: unknown) =>
+			s === 'done' || s === 'cancelled' || (coordinated && s === 'failed');
+		if (!children.every((c) => settled(c.status))) return;
+		const anyDone = children.some((c) => c.status === 'done');
+		if (plan && coordinate && (anyDone || children.some((c) => c.status === 'failed'))) {
+			await savePlan(tx, String(parent.id), { ...plan, phase: 'coordinate' });
+			await transition(tx, fx, String(parent.id), 'queued', { error: null, resetAttempts: true });
+		} else if (anyDone) {
+			if (plan) await savePlan(tx, String(parent.id), { ...plan, phase: 'deliver' });
 			await transition(tx, fx, String(parent.id), 'queued', { error: null, resetAttempts: true });
 		} else {
 			await transition(tx, fx, String(parent.id), 'cancelled', {
@@ -283,7 +348,11 @@ async function propagate(tx: Tx, fx: Effects, task: Row): Promise<void> {
 	}
 }
 
-/** Offene Geschwister ohne aktiven Lauf abbrechen (Elternauftrag scheitert) */
+async function savePlan(tx: Tx, id: string, plan: StoredPlan): Promise<void> {
+	await tx.execute(sql`UPDATE task SET plan = ${jsonb(plan)}, updated_at = now() WHERE id = ${id}`);
+}
+
+/** Offene Geschwister ohne aktiven Lauf abbrechen (Elternauftrag scheitert bzw. wird neu koordiniert) */
 async function failChildrenOf(tx: Tx, fx: Effects, parentId: string, exceptId: string) {
 	const rows = await rowsOf(
 		tx,
@@ -391,40 +460,48 @@ export function checkPlan(raw: unknown): PlanCheck {
 		};
 	}
 	const plan = parsed.data;
+	const error = graphError(plan.subtasks);
+	return error ? { ok: false, error: `Plan ungültig: ${error}` } : { ok: true, plan };
+}
+
+type SubtaskSpec = Plan['subtasks'][number];
+
+/** Schlüssel eindeutig, Abhängigkeiten bekannt, keine Selbstbezüge, kein Zyklus (`findCycle`); sonst Fehlertext */
+function graphError(subtasks: readonly SubtaskSpec[]): string | null {
 	const keys = new Set<string>();
-	for (const st of plan.subtasks) {
-		if (keys.has(st.key))
-			return { ok: false, error: `Plan ungültig: Schlüssel „${st.key}“ doppelt` };
+	for (const st of subtasks) {
+		if (keys.has(st.key)) return `Schlüssel „${st.key}“ doppelt`;
 		keys.add(st.key);
 	}
 	const graph = new Map<string, string[]>();
-	for (const st of plan.subtasks) {
+	for (const st of subtasks) {
 		for (const dep of st.dependsOn) {
-			if (!keys.has(dep)) {
-				return { ok: false, error: `Plan ungültig: unbekannte Abhängigkeit „${dep}“` };
-			}
-			if (dep === st.key) return { ok: false, error: `Plan ungültig: „${dep}“ hängt von sich ab` };
+			if (!keys.has(dep)) return `unbekannte Abhängigkeit „${dep}“`;
+			if (dep === st.key) return `„${dep}“ hängt von sich ab`;
 		}
 		graph.set(st.key, [...new Set(st.dependsOn)]);
 	}
 	const cycle = findCycle(graph);
-	if (cycle) return { ok: false, error: `Plan ungültig: Zyklus ${cycle.join(' → ')}` };
-	return { ok: true, plan };
+	return cycle ? `Zyklus ${cycle.join(' → ')}` : null;
 }
 
-/** Teilaufträge aus einem geprüften Plan anlegen, Elternauftrag blockieren */
-export async function applyPlan(
+/**
+ * Teilaufträge anlegen (`position` fortlaufend ab `start`). Abhängigkeiten auf neue Schlüssel und auf `known`
+ * (Schlüssel → Auftrags-ID vorhandener Teilaufträge); liefert Schlüssel → ID der neuen Teilaufträge.
+ */
+async function insertSubtasks(
 	tx: Tx,
 	fx: Effects,
 	parent: Row,
-	plan: Plan,
-	summary: string | null
-): Promise<void> {
-	const ids = new Map<string, string>();
-	for (const st of plan.subtasks) ids.set(st.key, crypto.randomUUID());
-	let position = 0;
-	for (const st of plan.subtasks) {
-		const id = ids.get(st.key)!;
+	subtasks: readonly SubtaskSpec[],
+	start: number,
+	known: Readonly<Record<string, string>> = {}
+): Promise<Record<string, string>> {
+	const ids: Record<string, string> = {};
+	for (const st of subtasks) ids[st.key] = crypto.randomUUID();
+	let position = start;
+	for (const st of subtasks) {
+		const id = ids[st.key]!;
 		await tx.execute(
 			sql`INSERT INTO task (id, project_id, parent_id, position, title, prompt, role, status, priority,
 					max_attempts, provider_hint, required_context_k, created_by)
@@ -435,14 +512,39 @@ export async function applyPlan(
 		position++;
 		fx.tasks.add(id);
 	}
-	for (const st of plan.subtasks) {
+	for (const st of subtasks) {
 		for (const dep of new Set(st.dependsOn)) {
+			const depId = ids[dep] ?? known[dep];
+			if (!depId) continue;
 			await tx.execute(
-				sql`INSERT INTO task_dep (task_id, depends_on_id) VALUES (${ids.get(st.key)!}, ${ids.get(dep)!})`
+				sql`INSERT INTO task_dep (task_id, depends_on_id) VALUES (${ids[st.key]!}, ${depId})`
 			);
 		}
 	}
-	const stored: StoredPlan = { ...plan, delivered: false };
+	return ids;
+}
+
+/**
+ * Teilaufträge aus einem geprüften Plan anlegen, Elternauftrag blockieren. `maxRounds` = Koordinationsrunden
+ * des Master-Agents (Einstellung `limits.coordinationRounds` bei Übernahme).
+ */
+export async function applyPlan(
+	tx: Tx,
+	fx: Effects,
+	parent: Row,
+	plan: Plan,
+	summary: string | null,
+	maxRounds = 0
+): Promise<void> {
+	const ids = await insertSubtasks(tx, fx, parent, plan.subtasks, 0);
+	const stored: StoredPlan = {
+		...plan,
+		delivered: false,
+		phase: 'subtasks',
+		round: 1,
+		maxRounds: Math.max(0, maxRounds),
+		ids
+	};
 	// Bestehender PR: dessen Head-Branch bleibt der Integrations-Branch (Ausliefern pusht in den PR)
 	const integrationBranch = integrationBranchOf(parent, plan);
 	await tx.execute(
@@ -455,6 +557,103 @@ export async function applyPlan(
 		summary: plan.summary || summary
 	});
 	fx.dispatch = true;
+}
+
+/** Teilauftrag einer Orchestrierung samt Schlüssel und Plan-Eintrag */
+export interface SubtaskEntry {
+	key: string;
+	spec: SubtaskSpec;
+	/** Auftragszeile (mit `last_provider` = Anbieter des letzten Laufs); fehlt, wenn gelöscht */
+	row: Row | null;
+}
+
+/**
+ * Teilaufträge (ohne Konfliktlösungen) den Plan-Einträgen zuordnen: über `plan.ids`, bei älteren Plänen über die
+ * Reihenfolge (`position` = Index im Plan).
+ */
+export async function subtasksOf(tx: Tx, parent: Row, plan: StoredPlan): Promise<SubtaskEntry[]> {
+	const rows = await rowsOf(
+		tx,
+		sql`SELECT t.*, (SELECT r.provider FROM run r WHERE r.task_id = t.id
+					ORDER BY r.created_at DESC, r.id DESC LIMIT 1) AS last_provider
+			FROM task t WHERE t.parent_id = ${parent.id} AND t.role <> 'resolve'
+			ORDER BY t.position, t.created_at, t.id`
+	);
+	const byId = new Map(rows.map((r) => [String(r.id), r]));
+	return plan.subtasks.map((spec, i) => ({
+		key: spec.key,
+		spec,
+		row: plan.ids ? (byId.get(plan.ids[spec.key] ?? '') ?? null) : (rows[i] ?? null)
+	}));
+}
+
+/**
+ * Entscheidung des Master-Agents übernehmen (Koordinationslauf erfolgreich). `done` → Phase `deliver` und
+ * Ausliefern wie bisher (kein Teilauftrag `done` → `failed` bzw. `cancelled`). Folgeaufträge → anhängen
+ * (höchstens `MAX_TOTAL_SUBTASKS` insgesamt, Graph über alle Schlüssel geprüft), nächste Runde, Elternauftrag
+ * `blocked`. Abhängigkeiten auf vorhandene, nicht erledigte Teilaufträge entfallen (deren Ergebnis fehlt, sie
+ * würden nie einplanbar). Liefert einen Fehlertext, wenn die Entscheidung nicht übernommen werden kann.
+ */
+export async function applyCoordination(
+	tx: Tx,
+	fx: Effects,
+	parent: Row,
+	plan: StoredPlan,
+	decision: Coordination,
+	summary: string | null
+): Promise<string | null> {
+	const entries = await subtasksOf(tx, parent, plan);
+	const id = String(parent.id);
+	const text = decision.summary || summary;
+	if (decision.done || decision.subtasks.length === 0) {
+		await savePlan(tx, id, { ...plan, phase: 'deliver' });
+		const statuses = entries.map((e) => e.row?.status);
+		if (statuses.includes('done')) {
+			await transition(tx, fx, id, 'queued', { error: null, resetAttempts: true, summary: text });
+		} else if (statuses.includes('failed')) {
+			await transition(tx, fx, id, 'failed', {
+				error:
+					'Der Master-Agent hat die Orchestrierung beendet, aber kein Teilauftrag war erfolgreich',
+				summary: text
+			});
+		} else {
+			await transition(tx, fx, id, 'cancelled', {
+				error: 'Alle Teilaufträge wurden abgebrochen',
+				summary: text
+			});
+		}
+		return null;
+	}
+	const total = plan.subtasks.length + decision.subtasks.length;
+	if (total > MAX_TOTAL_SUBTASKS) {
+		return `Koordination ungültig: höchstens ${MAX_TOTAL_SUBTASKS} Teilaufträge insgesamt (wären ${total})`;
+	}
+	const graph = graphError([...plan.subtasks, ...decision.subtasks]);
+	if (graph) return `Koordination ungültig: ${graph}`;
+	const done: Record<string, string> = {};
+	for (const e of entries) if (e.row?.status === 'done') done[e.key] = String(e.row.id);
+	const fresh = new Set(decision.subtasks.map((s) => s.key));
+	const subtasks = decision.subtasks.map((s) => ({
+		...s,
+		dependsOn: s.dependsOn.filter((d) => fresh.has(d) || d in done)
+	}));
+	const [pos] = await rowsOf(
+		tx,
+		sql`SELECT COALESCE(max(position), -1) + 1 AS p FROM task WHERE parent_id = ${parent.id}`
+	);
+	const ids = await insertSubtasks(tx, fx, parent, subtasks, num(pos?.p), done);
+	const known: Record<string, string> = {};
+	for (const e of entries) if (e.row) known[e.key] = String(e.row.id);
+	await savePlan(tx, id, {
+		...plan,
+		subtasks: [...plan.subtasks, ...subtasks],
+		ids: { ...known, ...(plan.ids ?? {}), ...ids },
+		phase: 'subtasks',
+		round: (plan.round ?? 1) + 1
+	});
+	await transition(tx, fx, id, 'blocked', { error: null, summary: text });
+	fx.dispatch = true;
+	return null;
 }
 
 // ---------------------------------------------------------------- Konflikte
@@ -641,8 +840,12 @@ async function hasActiveRun(tx: Tx, taskId: string): Promise<boolean> {
 }
 
 /**
- * Neu starten (Versuche = 0, Ausschlüsse leeren). Orchestrierung mit Plan: fehlgeschlagene/abgebrochene
- * Teilaufträge zurücksetzen und wieder blockieren (alle erledigt → Ausliefern).
+ * Neu starten (Versuche = 0, Ausschlüsse leeren). Orchestrierung mit Plan je nach Phase:
+ * - `coordinate` → erneut koordinieren (Teilaufträge bleiben unverändert).
+ * - `deliver` nach einer Entscheidung des Master-Agents (`maxRounds > 0`) → erneut ausliefern; ist kein
+ *   Teilauftrag erledigt, wird stattdessen neu koordiniert.
+ * - sonst (`subtasks`, ältere Pläne): fehlgeschlagene/abgebrochene Teilaufträge zurücksetzen und wieder
+ *   blockieren (alle erledigt → Koordination bzw. Ausliefern).
  */
 export async function restartTask(tx: Tx, fx: Effects, task: Row): Promise<void> {
 	await assertParentAllowsRestart(tx, task);
@@ -653,6 +856,21 @@ export async function restartTask(tx: Tx, fx: Effects, task: Row): Promise<void>
 		sql`UPDATE task SET excluded_account_ids = '[]'::jsonb, attempts = 0 WHERE id = ${task.id}`
 	);
 	const plan = planOf(task);
+	if (plan && !plan.delivered && plan.phase === 'coordinate') {
+		// Koordinationslauf gescheitert/abgebrochen → erneut koordinieren (Teilaufträge bleiben, wie sie sind)
+		await transition(tx, fx, String(task.id), 'queued', { error: null, resetAttempts: true });
+		return;
+	}
+	if (plan && !plan.delivered && plan.phase === 'deliver' && (plan.maxRounds ?? 0) > 0) {
+		// Der Master-Agent hat bereits entschieden: Ausliefern wiederholen, ohne erledigt = Neu koordinieren
+		const anyDone = await oneOf(
+			tx,
+			sql`SELECT 1 FROM task WHERE parent_id = ${task.id} AND role <> 'resolve' AND status = 'done' LIMIT 1`
+		);
+		if (!anyDone) await savePlan(tx, String(task.id), { ...plan, phase: 'coordinate' });
+		await transition(tx, fx, String(task.id), 'queued', { error: null, resetAttempts: true });
+		return;
+	}
 	if (plan && !plan.delivered) {
 		const reset = await rowsOf(
 			tx,
@@ -668,9 +886,14 @@ export async function restartTask(tx: Tx, fx: Effects, task: Row): Promise<void>
 				AND status NOT IN ('done', 'cancelled') LIMIT 1`
 		);
 		if (open) {
+			if (plan.phase) await savePlan(tx, String(task.id), { ...plan, phase: 'subtasks' });
 			await transition(tx, fx, String(task.id), 'blocked', { error: null, resetAttempts: true });
 			fx.dispatch = true;
 			return;
+		}
+		if (plan.phase) {
+			const phase = hasRoundsLeft(plan) ? 'coordinate' : 'deliver';
+			await savePlan(tx, String(task.id), { ...plan, phase });
 		}
 	}
 	await transition(tx, fx, String(task.id), 'queued', { error: null, resetAttempts: true });
