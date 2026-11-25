@@ -147,6 +147,14 @@ Im Scheduler:
 Ältere Runner ohne die Fähigkeit `limitReport` funktionieren weiter. Für ihre Konten steht „Keine Limit-Daten vom
 Runner“, und es gilt nur die eigene Schätzung.
 
+### Runner neu starten
+
+Ein Runner darf auch mit laufenden Aufträgen neu gestartet werden. Geordnet beendete Läufe meldet er als abgebrochen,
+Atrium plant sie ohne Zählung des Versuchs neu ein. Mit `DRAIN_SEC` wartet der Runner vorher, bis laufende Läufe fertig
+sind; in der Zeit steht er unter **Runner & Konten** als „Wird beendet“ und bekommt nichts Neues. Nach einem harten Ende
+meldet er bei der nächsten Anmeldung, dass er nichts mehr ausführt (`runIds`), und Atrium gibt die verwaisten Läufe
+sofort frei, statt die Lease (90 s) abzuwarten. Details: [`runner/README.md`](runner/README.md#neustart-während-laufender-aufträge).
+
 ## Entwicklung
 
 ```bash

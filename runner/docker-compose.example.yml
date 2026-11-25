@@ -39,6 +39,9 @@ services:
       # Das Token bleibt auf dem Runner, an Atrium gehen nur die Limit-Werte.
       # LIMIT_PROBE: 'false'
       # LIMIT_PROBE_MIN: '5'
+      # Beim Beenden bis zu N Sekunden auf laufende Läufe warten (Standard 0 = sofort abbrechen, neu einplanen).
+      # stop_grace_period muss dann größer als DRAIN_SEC + 30 s sein.
+      # DRAIN_SEC: '900'
     volumes:
       - ./config:/config:ro
       - runner-work:/work

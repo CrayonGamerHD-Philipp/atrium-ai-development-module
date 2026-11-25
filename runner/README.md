@@ -39,6 +39,7 @@ Vorlage: [`runner.config.example.json`](runner.config.example.json)):
 | `LOG_LEVEL` | `debug`, `info`, `warn`, `error` | `info` |
 | `LIMIT_PROBE` | aktive Limit-Abfrage ohne Lauf (`true`/`false`, Datei: `limitProbe`) | an für Claude-Konten mit OAuth-Login |
 | `LIMIT_PROBE_MIN` | Abstand der aktiven Limit-Abfrage in Minuten (1–1440, Datei: `limitProbeMin`) | `5` |
+| `DRAIN_SEC` | beim Beenden so viele Sekunden auf laufende Läufe warten (0–86400, Datei: `drainSec`), siehe [Neustart](#neustart-während-laufender-aufträge) | `0` |
 
 Ein Konto (`accounts[]`):
 
@@ -129,7 +130,22 @@ dieser fehl, versucht er jeden Branch einzeln (→ `failed` mit gekürzter, bere
 „detached“ gestellt.
 
 Beim Beenden (`SIGTERM`/`SIGINT`) nimmt der Runner keine neuen Läufe an, bricht laufende ab und meldet sie als
-`cancelled`; Worktrees bleiben erhalten.
+`cancelled`; Worktrees bleiben erhalten. Mit `DRAIN_SEC` dürfen sie vorher noch fertig werden (siehe unten).
+
+### Neustart während laufender Aufträge
+
+Ein Neustart ist jederzeit möglich, kein Auftrag geht verloren:
+
+| Art des Beendens | Was mit laufenden Läufen passiert | Versuch zählt? |
+|---|---|---|
+| geordnet, `DRAIN_SEC=0` (Standard) | sofort abgebrochen, als `cancelled` gemeldet, Atrium plant sie neu ein; bekommt der Auftrag dasselbe Konto wieder, setzt der Agent seine Sitzung fort | nein |
+| geordnet, `DRAIN_SEC>0` | der Runner meldet `draining` (Atrium zeigt „Wird beendet“ und bietet ihm nichts Neues an) und wartet bis zu `DRAIN_SEC` Sekunden, bis die Läufe fertig sind (inkl. Commit, Push, PR); danach Rest wie oben | nein |
+| hart (`kill -9`, Absturz, Stromausfall) | beim nächsten Start meldet der Runner seine (leeren) Läufe bei der Anmeldung (`runIds`); Atrium gibt die verwaisten sofort frei und plant sie neu ein | ja |
+| Runner kommt nicht wieder | nach Ablauf der Lease (90 s) gibt der Scheduler-Job die Läufe frei | ja |
+
+Signale: Das erste `SIGTERM`/`SIGINT` startet das geordnete Beenden, ein zweites bricht die Wartefrist ab
+(laufende Läufe werden abgebrochen und neu eingeplant), ein drittes beendet sofort. Bei Docker muss
+`stop_grace_period` größer als `DRAIN_SEC` plus etwa 30 s sein, sonst beendet Docker den Runner hart.
 
 ## Annahmen zu den CLIs
 
