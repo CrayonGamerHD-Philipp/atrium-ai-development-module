@@ -109,13 +109,27 @@ export const deliverySchema = z.discriminatedUnion('mode', [
 	z.object({ mode: z.literal('direct') }),
 	/** Eigenen Branch pushen, ohne PR oder Push auf den Haupt-Branch */
 	z.object({ mode: z.literal('branch') }),
-	/** Teilauftrag: eigenen Branch in den Integrations-Branch des Elternauftrags mergen und pushen */
-	z.object({ mode: z.literal('integrate'), integrationBranch: shortText(200) }),
+	/**
+	 * Teilauftrag: eigenen Branch in den Integrations-Branch des Elternauftrags mergen und pushen.
+	 * `pullNumber`: Der Integrations-Branch ist der Head-Branch dieses bestehenden PR – der Runner prüft den PR
+	 * (offen, kein Fork, passender Branch) und legt den Branch nie neu an (nur an Runner mit `prUpdate`).
+	 */
+	z.object({
+		mode: z.literal('integrate'),
+		integrationBranch: shortText(200),
+		pullNumber: z.number().int().positive().optional()
+	}),
 	/**
 	 * Bestehenden PR `number` bearbeiten: in dessen Head-Branch (= `offer.branch`) pushen,
-	 * keinen neuen PR öffnen, kein Force-Push; Ergebnis als PR-Kommentar
+	 * keinen neuen PR öffnen, kein Force-Push; Ergebnis als PR-Kommentar.
+	 * `integrated`: Teilaufträge einer Orchestrierung haben bereits Änderungen in den PR-Branch gemergt – der PR
+	 * gilt dann auch ohne neuen Commit als aktualisiert.
 	 */
-	z.object({ mode: z.literal('pr-update'), number: z.number().int().positive() })
+	z.object({
+		mode: z.literal('pr-update'),
+		number: z.number().int().positive(),
+		integrated: z.boolean().optional()
+	})
 ]);
 export type Delivery = z.infer<typeof deliverySchema>;
 
