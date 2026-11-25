@@ -77,20 +77,22 @@
 		if (!store.chatLoaded) void store.loadChat().then(() => scrollToEnd());
 		else void scrollToEnd();
 
-		const mq = window.matchMedia('(min-width: 1024px)');
-		const onMq = () => (desktop = mq.matches);
-		onMq();
-		mq.addEventListener('change', onMq);
-
 		// Bildschirmtastatur: Höhe/Versatz der sichtbaren Fläche übernehmen, damit die Eingabe sichtbar bleibt
 		const vv = window.visualViewport;
 		const onVv = () => {
-			if (!vv) return;
+			// nur im Mobil-Vollbild nötig (am Desktop z. B. kein Neuzeichnen bei Pinch-Zoom)
+			if (!vv || desktop) return;
 			vvHeight = vv.height;
 			vvTop = vv.offsetTop;
 			if (stick) void scrollToEnd();
 		};
-		onVv();
+		const mq = window.matchMedia('(min-width: 1024px)');
+		const onMq = () => {
+			desktop = mq.matches;
+			onVv();
+		};
+		onMq();
+		mq.addEventListener('change', onMq);
 		vv?.addEventListener('resize', onVv);
 		vv?.addEventListener('scroll', onVv);
 
@@ -112,18 +114,55 @@
 		};
 	});
 
-	// Mobil-Vollbild: Seite dahinter nicht scrollen lassen (beim Verlassen/Unmount wiederherstellen)
+	// Mobil-Vollbild: Seite dahinter nicht scrollen lassen und für Tastatur/Screenreader sperren (`inert`),
+	// beim Verlassen/Unmount wiederherstellen
 	$effect(() => {
-		if (desktop) return;
+		if (desktop || !root) return;
 		const html = document.documentElement;
 		const prev = { html: html.style.overflow, body: document.body.style.overflow };
 		html.style.overflow = 'hidden';
 		document.body.style.overflow = 'hidden';
+		const inerted = inertOutside(root);
+		// Fokus in den Dialog holen (der auslösende Reiter ist jetzt gesperrt): auf „Zurück“, nicht ins Textfeld
+		// (sonst öffnet sich die Bildschirmtastatur)
+		if (!root.contains(document.activeElement))
+			root.querySelector<HTMLElement>('[data-chat-close]')?.focus({ preventScroll: true });
 		return () => {
 			html.style.overflow = prev.html;
 			document.body.style.overflow = prev.body;
+			for (const el of inerted) el.inert = false;
 		};
 	});
+
+	/**
+	 * Setzt alle Geschwister von `el` und seinen Vorfahren (bis `body`) auf `inert`. Ausgenommen sind Live-Regionen
+	 * (Toasts) und bereits gesperrte Elemente. Später geöffnete Portale (Menü, Blatt) liegen danach im `body`
+	 * und bleiben bedienbar. Rückgabe: geänderte Elemente zum Zurücksetzen.
+	 */
+	function inertOutside(el: HTMLElement): HTMLElement[] {
+		const changed: HTMLElement[] = [];
+		for (
+			let node: HTMLElement | null = el;
+			node && node !== document.body;
+			node = node.parentElement
+		) {
+			for (const sib of node.parentElement?.children ?? []) {
+				if (sib === node || !(sib instanceof HTMLElement) || sib.inert) continue;
+				if (sib.matches('script, style, [aria-live]') || sib.querySelector('[data-sonner-toaster]'))
+					continue;
+				sib.inert = true;
+				changed.push(sib);
+			}
+		}
+		return changed;
+	}
+
+	function onkeydown(e: KeyboardEvent) {
+		// Mobil-Vollbild: Escape schließt den Chat (nicht während der IME-Komposition)
+		if (desktop || e.key !== 'Escape' || e.defaultPrevented || e.isComposing) return;
+		e.preventDefault();
+		onclose?.();
+	}
 
 	// Neue Nachrichten/Indikator: unten bleiben, wenn man unten war
 	$effect(() => {
@@ -180,8 +219,11 @@
 	bind:this={root}
 	style={rootStyle}
 	aria-label="Projekt-Chat"
+	role={desktop ? undefined : 'dialog'}
+	aria-modal={desktop ? undefined : 'true'}
+	{onkeydown}
 	class={cn(
-		'flex flex-col overflow-hidden bg-background',
+		'flex flex-col overflow-hidden bg-background outline-none',
 		// Mobil: Vollbild über Kopfzeile/Navigation (z-40), unter Dialogen/Popovers (z-50) und Toasts
 		'max-lg:fixed max-lg:inset-x-0 max-lg:top-[var(--chat-vvtop,0px)] max-lg:z-[45] max-lg:h-[var(--chat-vvh,100dvh)]',
 		// Desktop: Karte bis zum Fensterrand
@@ -196,6 +238,7 @@
 			variant="ghost"
 			size="icon"
 			class="size-10"
+			data-chat-close
 			aria-label="Zurück zum Projekt"
 			title="Zurück zum Projekt"
 			onclick={() => onclose?.()}
@@ -213,10 +256,11 @@
 		<div
 			bind:this={scroller}
 			{onscroll}
-			class="min-h-0 flex-1 overflow-x-hidden overflow-y-auto overscroll-contain px-3 py-3 pr-[max(0.75rem,env(safe-area-inset-right))] pl-[max(0.75rem,env(safe-area-inset-left))] sm:px-4 lg:px-4"
-			aria-live="polite"
-			aria-label="Chatverlauf"
-			role="log"
+			class={cn(
+				'min-h-0 flex-1 overflow-x-hidden overflow-y-auto overscroll-contain px-3 py-3 pr-[max(0.75rem,env(safe-area-inset-right))] pl-[max(0.75rem,env(safe-area-inset-left))] sm:px-4 lg:px-4',
+				// Platz für den „Nach unten“-Knopf, damit er die letzte Zeile nicht verdeckt
+				!stick && 'pb-16'
+			)}
 		>
 			{#if store.chatLoading && !store.chatLoaded}
 				<LoadingState rows={4} rowClass="h-12 w-3/4" label="Chat" />
@@ -274,117 +318,121 @@
 					</div>
 				{/if}
 
-				{#each timeline as item (item.message.id)}
-					{@const m = item.message}
-					{@const task = m.taskId ? tasksById.get(m.taskId) : undefined}
-					{@const own = m.kind === 'user' && (!meId || m.author?.id === meId)}
-					{#if item.day}
-						<div
-							class="flex items-center gap-2 py-3 text-xs font-medium text-muted-foreground"
-							role="separator"
-							aria-label={item.day}
-						>
-							<span class="h-px flex-1 bg-border"></span>{item.day}<span
-								class="h-px flex-1 bg-border"
-							></span>
-						</div>
-					{/if}
-					{#if m.kind === 'system'}
-						<div class="flex justify-center py-1.5">
-							<p
-								class="inline-flex max-w-[90%] min-w-0 items-start gap-1.5 rounded-full bg-muted/60 px-3 py-1 text-center text-xs text-muted-foreground"
-							>
-								<Info class="mt-0.5 size-3.5 shrink-0" aria-hidden="true" />
-								<span class="min-w-0 break-words whitespace-pre-wrap">{m.body}</span>
-								<time datetime={m.createdAt} title={absolute(m.createdAt)} class="shrink-0"
-									>{clockTime(m.createdAt)}</time
-								>
-							</p>
-						</div>
-					{:else}
-						<article
-							class={cn(
-								'flex min-w-0 gap-2',
-								own && 'flex-row-reverse',
-								item.first ? 'mt-3 first:mt-0' : 'mt-1'
-							)}
-							aria-label={`${m.kind === 'agent' ? 'Agent' : (m.author?.name ?? 'Unbekannt')}, ${absolute(m.createdAt)}`}
-						>
-							<!-- Avatar nur bei der ersten Nachricht der Gruppe, sonst Platzhalter für die Einrückung -->
-							{#if own}
-								<!-- eigene Nachrichten ohne Avatar -->
-							{:else if item.first}
-								<div
-									class={cn(
-										'flex size-8 shrink-0 items-center justify-center rounded-full text-xs font-medium',
-										m.kind === 'agent'
-											? 'bg-info-muted text-info'
-											: 'bg-muted text-muted-foreground'
-									)}
-									aria-hidden="true"
-								>
-									{#if m.kind === 'agent'}<Bot class="size-4" />{:else}{(m.author?.name ?? '?')
-											.slice(0, 1)
-											.toUpperCase()}{/if}
-								</div>
-							{:else}
-								<div class="w-8 shrink-0" aria-hidden="true"></div>
-							{/if}
+				<!-- Nur die Nachrichten sind Live-Region (ohne Ladezustand, Vorschläge und Indikator); nur neue
+				     Nachrichten ansagen, keine Textänderungen wie Status-Chips -->
+				<div role="log" aria-live="polite" aria-relevant="additions" aria-label="Chatverlauf">
+					{#each timeline as item (item.message.id)}
+						{@const m = item.message}
+						{@const task = m.taskId ? tasksById.get(m.taskId) : undefined}
+						{@const own = m.kind === 'user' && (!meId || m.author?.id === meId)}
+						{#if item.day}
 							<div
-								class={cn(
-									'flex max-w-[88%] min-w-0 flex-col sm:max-w-[80%] lg:max-w-[min(80%,52rem)]',
-									own && 'items-end'
-								)}
+								class="flex items-center gap-2 py-3 text-xs font-medium text-muted-foreground"
+								role="separator"
+								aria-label={item.day}
 							>
-								{#if item.first}
+								<span class="h-px flex-1 bg-border"></span>{item.day}<span
+									class="h-px flex-1 bg-border"
+								></span>
+							</div>
+						{/if}
+						{#if m.kind === 'system'}
+							<div class="flex justify-center py-1.5">
+								<p
+									class="inline-flex max-w-[90%] min-w-0 items-start gap-1.5 rounded-full bg-muted/60 px-3 py-1 text-center text-xs text-muted-foreground"
+								>
+									<Info class="mt-0.5 size-3.5 shrink-0" aria-hidden="true" />
+									<span class="min-w-0 break-words whitespace-pre-wrap">{m.body}</span>
+									<time datetime={m.createdAt} title={absolute(m.createdAt)} class="shrink-0"
+										>{clockTime(m.createdAt)}</time
+									>
+								</p>
+							</div>
+						{:else}
+							<article
+								class={cn(
+									'flex min-w-0 gap-2',
+									own && 'flex-row-reverse',
+									item.first ? 'mt-3 first:mt-0' : 'mt-1'
+								)}
+								aria-label={`${m.kind === 'agent' ? 'Agent' : (m.author?.name ?? 'Unbekannt')}, ${absolute(m.createdAt)}`}
+							>
+								<!-- Avatar nur bei der ersten Nachricht der Gruppe, sonst Platzhalter für die Einrückung -->
+								{#if own}
+									<!-- eigene Nachrichten ohne Avatar -->
+								{:else if item.first}
 									<div
 										class={cn(
-											'mb-1 flex flex-wrap items-baseline gap-x-2 px-1 text-xs text-muted-foreground',
-											own && 'justify-end'
+											'flex size-8 shrink-0 items-center justify-center rounded-full text-xs font-medium',
+											m.kind === 'agent'
+												? 'bg-info-muted text-info'
+												: 'bg-muted text-muted-foreground'
 										)}
+										aria-hidden="true"
 									>
-										{#if !own}
-											<span class="font-medium text-foreground"
-												>{m.kind === 'agent' ? 'Agent' : (m.author?.name ?? 'Unbekannt')}</span
-											>
-										{/if}
-										<time datetime={m.createdAt} title={absolute(m.createdAt)}
-											>{clockTime(m.createdAt)}</time
-										>
+										{#if m.kind === 'agent'}<Bot class="size-4" />{:else}{(m.author?.name ?? '?')
+												.slice(0, 1)
+												.toUpperCase()}{/if}
 									</div>
+								{:else}
+									<div class="w-8 shrink-0" aria-hidden="true"></div>
 								{/if}
 								<div
 									class={cn(
-										'max-w-full min-w-0 rounded-2xl px-3 py-2 break-words',
-										own
-											? 'border border-primary/25 bg-primary/10 text-foreground'
-											: m.kind === 'agent'
-												? 'border bg-card lg:bg-background'
-												: 'bg-muted',
-										own ? !item.first && 'rounded-tr-md' : !item.first && 'rounded-tl-md',
-										own ? !item.last && 'rounded-br-md' : !item.last && 'rounded-bl-md'
+										'flex max-w-[88%] min-w-0 flex-col sm:max-w-[80%] lg:max-w-[min(80%,52rem)]',
+										own && 'items-end'
 									)}
-									title={item.first ? undefined : absolute(m.createdAt)}
 								>
-									<Markdown text={m.body} />
-									{#if m.taskId}
-										<a
-											href={taskPath(store.id, m.taskId)}
+									{#if item.first}
+										<div
 											class={cn(
-												'mt-2 inline-flex max-w-full min-h-8 items-center gap-1.5 rounded-full border bg-background px-2.5 py-1 text-xs hover:bg-muted max-lg:min-h-10',
-												FOCUS
+												'mb-1 flex flex-wrap items-baseline gap-x-2 px-1 text-xs text-muted-foreground',
+												own && 'justify-end'
 											)}
 										>
-											<ExternalLink class="size-3.5 shrink-0" aria-hidden="true" />
-											<span class="truncate">{task ? taskTitle(task) : 'Zum Auftrag'}</span>
-											{#if task}<StatusBadge status={task.status} />{/if}
-										</a>
+											{#if !own}
+												<span class="font-medium text-foreground"
+													>{m.kind === 'agent' ? 'Agent' : (m.author?.name ?? 'Unbekannt')}</span
+												>
+											{/if}
+											<time datetime={m.createdAt} title={absolute(m.createdAt)}
+												>{clockTime(m.createdAt)}</time
+											>
+										</div>
 									{/if}
+									<div
+										class={cn(
+											'max-w-full min-w-0 rounded-2xl px-3 py-2 break-words',
+											own
+												? 'border border-primary/25 bg-primary/10 text-foreground'
+												: m.kind === 'agent'
+													? 'border bg-card lg:bg-background'
+													: 'bg-muted',
+											own ? !item.first && 'rounded-tr-md' : !item.first && 'rounded-tl-md',
+											own ? !item.last && 'rounded-br-md' : !item.last && 'rounded-bl-md'
+										)}
+										title={item.first ? undefined : absolute(m.createdAt)}
+									>
+										<Markdown text={m.body} />
+										{#if m.taskId}
+											<a
+												href={taskPath(store.id, m.taskId)}
+												class={cn(
+													'mt-2 inline-flex max-w-full min-h-8 items-center gap-1.5 rounded-full border bg-background px-2.5 py-1 text-xs hover:bg-muted max-lg:min-h-10',
+													FOCUS
+												)}
+											>
+												<ExternalLink class="size-3.5 shrink-0" aria-hidden="true" />
+												<span class="truncate">{task ? taskTitle(task) : 'Zum Auftrag'}</span>
+												{#if task}<StatusBadge status={task.status} />{/if}
+											</a>
+										{/if}
+									</div>
 								</div>
-							</div>
-						</article>
-					{/if}
-				{/each}
+							</article>
+						{/if}
+					{/each}
+				</div>
 
 				{#if activity}
 					{#if activity.kind === 'needs-input'}

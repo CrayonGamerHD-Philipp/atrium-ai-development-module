@@ -1,6 +1,6 @@
 <script lang="ts">
 	// Projektseite: Reiter Board · Chat · Pull Requests · Einstellungen (per `?tab=`), live über `/projects/:id/live`
-	import { goto } from '$app/navigation';
+	import { afterNavigate, goto } from '$app/navigation';
 	import { page } from '$app/state';
 	import { onDestroy, untrack } from 'svelte';
 	import ArrowLeft from '@lucide/svelte/icons/arrow-left';
@@ -47,12 +47,41 @@
 		return (TABS as readonly string[]).includes(t ?? '') ? (t as Tab) : 'board';
 	});
 
+	/** Mobil-Vollbild-Chat wurde mit eigenem Verlaufseintrag geöffnet (Zurück-Geste schließt nur den Chat) */
+	let chatPushed = false;
+	/** Nach dem Schließen des Vollbild-Chats den Fokus auf den Reiter „Chat“ legen */
+	let focusChatTab = false;
+	let chatTrigger = $state<HTMLElement | null>(null);
+
 	function setTab(next: string) {
 		const url = new URL(page.url);
 		if (next === 'board') url.searchParams.delete('tab');
 		else url.searchParams.set('tab', next);
-		void goto(url, { replaceState: true, noScroll: true, keepFocus: true });
+		// Mobil ist der Chat ein Vollbild → eigener Verlaufseintrag, damit „Zurück“ (Browser/Android) ihn schließt
+		const push =
+			next === 'chat' && tab !== 'chat' && !window.matchMedia('(min-width: 1024px)').matches;
+		chatPushed = push;
+		void goto(url, { replaceState: !push, noScroll: true, keepFocus: true });
 	}
+
+	function closeChat() {
+		focusChatTab = true;
+		if (chatPushed) {
+			chatPushed = false;
+			history.back();
+		} else setTab('board');
+	}
+
+	// Chat verlassen (auch per Zurück-Geste) → Verlaufseintrag ist verbraucht
+	$effect(() => {
+		if (tab !== 'chat') chatPushed = false;
+	});
+	// nach der Navigation (also nach SvelteKits Fokus-Reset) den Fokus auf den Reiter „Chat“ legen
+	afterNavigate(() => {
+		if (!focusChatTab || tab === 'chat') return;
+		focusChatTab = false;
+		chatTrigger?.focus();
+	});
 
 	/** Reiter mobil nicht stauchen und mit 40-px-Touch-Ziel */
 	const TRIGGER = 'flex-none max-sm:min-h-10 max-sm:px-2.5';
@@ -163,7 +192,7 @@
 						></span>
 					{/if}
 				</Tabs.Trigger>
-				<Tabs.Trigger value="chat" class={TRIGGER}>Chat</Tabs.Trigger>
+				<Tabs.Trigger value="chat" class={TRIGGER} bind:ref={chatTrigger}>Chat</Tabs.Trigger>
 				<Tabs.Trigger value="pulls" class={TRIGGER}>
 					Pull Requests
 					{#if openPulls}<span class="text-xs text-muted-foreground tabular-nums">{openPulls}</span
@@ -177,8 +206,8 @@
 				{#if tab === 'board'}
 					<BoardTab {store} />
 				{:else if tab === 'chat'}
-					<!-- Mobil Vollbild: „Zurück“ führt zum Board -->
-					<ChatTab {store} onclose={() => setTab('board')} />
+					<!-- Mobil Vollbild: „Zurück“ führt zum Board (bzw. zum vorherigen Verlaufseintrag) -->
+					<ChatTab {store} onclose={closeChat} />
 				{:else if tab === 'pulls'}
 					<PullsTab {store} />
 				{:else}
