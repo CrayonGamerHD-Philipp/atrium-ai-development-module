@@ -102,7 +102,13 @@ export const registerInput = z.object({
 		pty: z.boolean(),
 		os: shortText(40).default('')
 	}),
-	accounts: z.array(runnerAccountSchema).max(50)
+	accounts: z.array(runnerAccountSchema).max(50),
+	/**
+	 * Läufe, die der Runner bei der Anmeldung ausführt (nach einem Neustart: keine). Laufende Läufe dieses Runners,
+	 * die hier fehlen, gibt Atrium sofort frei, statt auf das Ende der Lease zu warten. Fehlt das Feld (ältere
+	 * Runner), bleibt es beim Lease-Ablauf.
+	 */
+	runIds: z.array(id).max(64).optional()
 });
 export type RegisterInput = z.infer<typeof registerInput>;
 
@@ -117,6 +123,11 @@ export const heartbeatInput = z.object({
 	slotsUsed: z.number().int().min(0),
 	/** Läufe, die der Runner gerade ausführt (verlängert deren Lease) */
 	runIds: z.array(id).max(64),
+	/**
+	 * Runner wird beendet und lässt laufende Läufe noch fertig werden (`DRAIN_SEC`): keine neuen Angebote.
+	 * Fehlt das Feld (ältere Runner), gilt `false`.
+	 */
+	draining: z.boolean().optional(),
 	accounts: z
 		.array(
 			z.object({
