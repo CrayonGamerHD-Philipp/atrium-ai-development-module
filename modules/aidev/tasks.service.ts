@@ -161,6 +161,13 @@ function agentText(task: Row, status: TaskStatus): string {
 			parts.push(`Auftrag ${title}: ${status}`);
 	}
 	if (prLine) parts.push(prLine);
+	if (
+		(status === 'done' || status === 'review') &&
+		task.target_pr !== null &&
+		task.target_pr !== undefined
+	) {
+		parts.push(`PR #${num(task.target_pr)} aktualisiert.`);
+	}
 	if (status === 'done' && task.branch_pushed === true && task.branch) {
 		parts.push(`Branch bereitgestellt: ${String(task.branch)} (ohne Pull Request).`);
 	}
@@ -312,15 +319,35 @@ export async function createTask(
 			]);
 		}
 	}
+	// Bestehenden PR bearbeiten: Branch = Head-Branch des PR, Basis = Haupt-Branch des Projekts
+	let target: { number: number; branch: string; baseRef: string; url: string | null } | null = null;
+	if (input.targetPr !== null) {
+		const main = String(project.default_branch);
+		const pr = await oneOf(
+			tx,
+			sql`SELECT number, branch, state, url FROM pull_request
+				WHERE project_id = ${project.id} AND number = ${input.targetPr}`
+		);
+		const fail = (message: string) => errors.validation([{ path: ['targetPr'], message }]);
+		if (!pr) throw fail('PR nicht gefunden – Pull Requests zuerst synchronisieren');
+		if (pr.state !== 'open') throw fail('Nur offene PRs können bearbeitet werden');
+		const branch = str(pr.branch);
+		if (!branch || branch === main) {
+			throw fail('Der PR hat keinen bearbeitbaren Branch (fehlt oder ist der Haupt-Branch)');
+		}
+		target = { number: num(pr.number), branch, baseRef: main, url: str(pr.url) };
+	}
 	const id = crypto.randomUUID();
 	const title = clip(input.title?.trim() || titleFromPrompt(input.prompt) || 'Auftrag', 200);
 	const role: Role = input.decompose ? 'orchestrate' : input.role;
 	await tx.execute(
 		sql`INSERT INTO task (id, project_id, title, prompt, role, status, priority, max_attempts,
-				provider_hint, created_by, delivery)
+				provider_hint, created_by, delivery, target_pr, branch, base_ref, pr_number, pr_url)
 			VALUES (${id}, ${project.id}, ${title}, ${input.prompt}, ${role},
 				${input.draft ? 'draft' : 'queued'}, ${input.priority}, ${input.maxAttempts},
-				${input.providerHint}, ${ctx.userId}, ${input.delivery})`
+				${input.providerHint}, ${ctx.userId}, ${input.delivery}, ${target?.number ?? null},
+				${target?.branch ?? null}, ${target?.baseRef ?? null}, ${target?.number ?? null},
+				${target?.url ?? null})`
 	);
 	for (const dep of deps) {
 		await tx.execute(sql`INSERT INTO task_dep (task_id, depends_on_id) VALUES (${id}, ${dep})`);

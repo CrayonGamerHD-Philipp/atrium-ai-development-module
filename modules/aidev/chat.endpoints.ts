@@ -90,6 +90,7 @@ export const chatEndpoints: AnyApiEndpoint[] = [
 						taskInput.parse({
 							prompt: body.body,
 							delivery: body.delivery,
+							targetPr: body.targetPr,
 							role: body.mode === 'question' ? 'research' : body.role,
 							decompose: body.mode === 'question' ? false : body.decompose,
 							providerHint: body.providerHint

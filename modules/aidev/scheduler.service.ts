@@ -10,6 +10,9 @@
  *   Beim ersten Teilauftrag existiert `origin/<Integrations-Branch>` evtl. noch nicht – der Runner legt ihn dann
  *   aus dem Haupt-Branch an und pusht ihn (gleiche Regel gilt für jede fehlende Basis).
  * - Konfliktlösung und Ausliefern: vorhandener Branch des (ursprünglichen) Auftrags.
+ * - Auftrag mit `target_pr` (bestehenden PR bearbeiten): `createTask` setzt `branch` = Head-Branch des PR und
+ *   `base_ref` = Haupt-Branch; `branchPlan` übernimmt beides. Bei `orchestrate` wird der PR-Branch so zum
+ *   Integrations-Branch (Teilaufträge zweigen von ihm ab und werden hineingemergt), das Ausliefern pusht in den PR.
  */
 import { sql } from 'drizzle-orm';
 import { inList, logBestEffort, num, rowsOf, str, toIso, type Row } from '$lib/sdk/server';
@@ -71,7 +74,11 @@ export async function branchPlan(
 	return { branch: str(task.branch) ?? topBranchOf(task), baseRef: str(task.base_ref) ?? main };
 }
 
-/** Auslieferung: Nur-Lesen → none; Teilauftrag → integrate; Konfliktlösung → wie der ursprüngliche Auftrag */
+/**
+ * Auslieferung: Nur-Lesen → none; Teilauftrag → integrate; Konfliktlösung → wie der ursprüngliche Auftrag;
+ * Auftrag mit `target_pr` → pr-update (Vorrang vor `delivery`). Konfliktlösungen erben pr-update über den
+ * Elternauftrag, eine Orchestrierung liefert am Ende in den PR.
+ */
 export async function deliveryOf(tx: Tx, task: Row, project: Row, depth = 0): Promise<Delivery> {
 	if (READ_ONLY_ROLES.includes(effectiveRole(task))) return { mode: 'none' };
 	const parent = task.parent_id ? await getTask(tx, String(task.parent_id)) : null;
@@ -81,6 +88,7 @@ export async function deliveryOf(tx: Tx, task: Row, project: Row, depth = 0): Pr
 	if (parent && parent.role === 'orchestrate') {
 		return { mode: 'integrate', integrationBranch: str(parent.branch) ?? topBranchOf(parent) };
 	}
+	if (task.target_pr) return { mode: 'pr-update', number: num(task.target_pr) };
 	if (task.delivery === 'branch') return { mode: 'branch' };
 	const policy = String(project.commit_policy);
 	if (policy === 'direct') return { mode: 'direct' };
@@ -274,34 +282,44 @@ async function dispatchIn(tx: Tx, fx: Effects, settings: AidevSettings): Promise
 	const runnerCaps = await rowsOf(
 		tx,
 		sql`SELECT id, capabilities->>'question' = 'true' AS question,
-				capabilities->>'branchDelivery' = 'true' AS branch FROM runner`
+				capabilities->>'branchDelivery' = 'true' AS branch,
+				capabilities->>'prUpdate' = 'true' AS pr_update FROM runner`
 	);
-	const questionRunners = new Set(
-		runnerCaps.filter((r) => r.question === true).map((r) => String(r.id))
+	const runnersWith = (key: string) =>
+		new Set(runnerCaps.filter((r) => r[key] === true).map((r) => String(r.id)));
+	const questionRunners = runnersWith('question');
+	// Auslieferungsarten, die nicht jeder Runner kennt (gemischte Runner-Versionen beim Upgrade)
+	const modeRunners: Partial<Record<Delivery['mode'], Set<string>>> = {
+		branch: runnersWith('branch'),
+		'pr-update': runnersWith('pr_update')
+	};
+	const restricted = new Map<string, Set<string>>();
+	// Nur diese Zeilen können eine solche Auslieferung haben (Konfliktlösungen erben sie vom Elternauftrag).
+	// Teilaufträge liefern immer `integrate` (Merge ohne Force-Push, auch in einen PR-Branch) und entfallen.
+	const maybeRestricted = rows.filter(
+		(r) =>
+			r.role === 'resolve' ||
+			(!r.parent_id &&
+				(r.delivery === 'branch' || (r.target_pr !== null && r.target_pr !== undefined)))
 	);
-	const branchRunners = new Set(
-		runnerCaps.filter((r) => r.branch === true).map((r) => String(r.id))
-	);
-	// Branch-Auslieferung nur an Runner, die den Modus kennen (gemischte Runner-Versionen beim Upgrade)
-	const branchTasks = new Set<string>();
-	const maybeBranch = rows.filter((r) => r.delivery === 'branch' || r.role === 'resolve');
-	if (maybeBranch.length) {
+	if (maybeRestricted.length) {
 		const projects = new Map(
 			(
 				await rowsOf(
 					tx,
-					sql`SELECT * FROM project WHERE id IN (${inList([...new Set(maybeBranch.map((r) => String(r.project_id)))])})`
+					sql`SELECT * FROM project WHERE id IN (${inList([...new Set(maybeRestricted.map((r) => String(r.project_id)))])})`
 				)
 			).map((p) => [String(p.id), p])
 		);
-		for (const r of maybeBranch) {
+		for (const r of maybeRestricted) {
 			const project = projects.get(String(r.project_id));
-			if (project && (await deliveryOf(tx, r, project)).mode === 'branch')
-				branchTasks.add(String(r.id));
+			if (!project) continue;
+			const caps = modeRunners[(await deliveryOf(tx, r, project)).mode];
+			if (caps) restricted.set(String(r.id), caps);
 		}
 	}
-	const without = (caps: Set<string>) =>
-		accounts.filter((a) => !caps.has(a.state.runnerId)).map((a) => a.state.id);
+	const without = (caps: Set<string> | null) =>
+		caps ? accounts.filter((a) => !caps.has(a.state.runnerId)).map((a) => a.state.id) : [];
 	const byId = new Map(rows.map((r) => [String(r.id), r]));
 	const tasks: TaskCandidate[] = rows.map((r) => ({
 		id: String(r.id),
@@ -314,7 +332,7 @@ async function dispatchIn(tx: Tx, fx: Effects, settings: AidevSettings): Promise
 		excludedAccountIds: [
 			...stringList(r.excluded_account_ids),
 			...(r.chat_question === true ? without(questionRunners) : []),
-			...(branchTasks.has(String(r.id)) ? without(branchRunners) : [])
+			...without(restricted.get(String(r.id)) ?? null)
 		],
 		sessionAccountId: str(r.session_account_id),
 		estimatedUnits: settings.limits.estimatedUnitsPerRun
