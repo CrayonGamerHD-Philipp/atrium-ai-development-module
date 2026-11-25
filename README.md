@@ -91,7 +91,9 @@ dem Integrations-Branch zusammengeführt; die Wahl gilt für die abschließende 
 Leseaufträge liefern keine Änderungen aus. Die Auftragsansicht zeigt, ob ein Branch tatsächlich
 bereitgestellt wurde; ohne Änderungen wird kein Branch gepusht. API-Aufrufe können optional
 `delivery: "branch"` setzen; ohne Angabe gilt `delivery: "project"`, auch für bestehende Aufträge.
-Runner müssen für die neue Option aktualisiert werden.
+Runner müssen für die neue Option aktualisiert werden: Der Scheduler vergibt Branch-Auslieferungen
+nur an Runner, die sich mit der Capability `branchDelivery` anmelden; bei gemischten Runner-Versionen
+bleiben solche Aufträge in der Warteschlange, bis ein aktueller Runner frei ist.
 
 Im Projekt-Chat beantwortet der Modus „Frage“ freie Fragen durch einen lesenden Agenten. Der
 Anbieter kann gewählt werden; frühere Fragen und Antworten werden begrenzt als Kontext übergeben,

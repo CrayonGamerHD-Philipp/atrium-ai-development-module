@@ -87,7 +87,14 @@ const register = (who: string, accounts: string[]) =>
 			name: `Runner ${who}`,
 			version: '0.1.0',
 			maxSlots: 4,
-			capabilities: { question: true, git: true, gh: true, pty: true, os: 'linux' },
+			capabilities: {
+				question: true,
+				branchDelivery: true,
+				git: true,
+				gh: true,
+				pty: true,
+				os: 'linux'
+			},
 			accounts: accounts.map((key) => ({
 				key,
 				provider: 'fake',
@@ -770,6 +777,41 @@ describe('aidev', () => {
 			branchPushed: true,
 			prNumber: null
 		});
+	});
+
+	it('Branch-Auslieferung geht nur an Runner, die den Modus kennen', async () => {
+		// alter Runner ohne Capability `branchDelivery` (gestaffeltes Upgrade)
+		const old = ok<{ runnerId: string }>(
+			await call('runner2', 'POST', '/runner/register', {
+				protocol: 1,
+				name: 'Runner alt',
+				version: '0.0.9',
+				maxSlots: 4,
+				capabilities: { git: true, gh: true, pty: true, os: 'linux' },
+				accounts: [{ key: 'fake-x', provider: 'fake', label: 'fake-x', loggedIn: true, models: [] }]
+			}),
+			201
+		);
+		ok(await call('admin', 'PATCH', `/runners/${old.runnerId}`, { status: 'approved' }));
+		ok(await heartbeat('runner2'), 201);
+		ok(await call('admin', 'PATCH', `/runners/${runnerId}`, { maxSlots: 0 }));
+		try {
+			const branch = await createTask({ prompt: 'Nur Branch', delivery: 'branch' });
+			const pr = await createTask({ prompt: 'Mit PR' });
+			const oldOffers = await offers('runner2');
+			expect(oldOffers.map((o) => o.taskId)).toContain(pr.id);
+			expect(oldOffers.map((o) => o.taskId)).not.toContain(branch.id);
+			expect((await task(branch.id)).task.status).toBe('queued');
+			ok(await call('admin', 'POST', `/tasks/${pr.id}/cancel`), 201);
+
+			ok(await call('admin', 'PATCH', `/runners/${runnerId}`, { maxSlots: 4 }));
+			const o = await offerFor(branch.id);
+			expect(o.delivery).toEqual({ mode: 'branch' });
+			ok(await call('admin', 'POST', `/tasks/${branch.id}/cancel`), 201);
+		} finally {
+			ok(await call('admin', 'PATCH', `/runners/${runnerId}`, { maxSlots: 4 }));
+			ok(await call('admin', 'PATCH', `/runners/${old.runnerId}`, { maxSlots: 0 }));
+		}
 	});
 
 	it('SSE: Projekt-Stream und Runner-Stream mit RPC (Repo prüfen)', async () => {

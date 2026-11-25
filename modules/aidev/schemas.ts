@@ -447,7 +447,14 @@ export interface RunnerDto {
 	lastSeenAt: string | null;
 	maxSlots: number;
 	slotsUsed: number;
-	capabilities: { git?: boolean; gh?: boolean; pty?: boolean; os?: string };
+	capabilities: {
+		question?: boolean;
+		branchDelivery?: boolean;
+		git?: boolean;
+		gh?: boolean;
+		pty?: boolean;
+		os?: string;
+	};
 	createdAt: string;
 	accounts: AccountDto[];
 }
