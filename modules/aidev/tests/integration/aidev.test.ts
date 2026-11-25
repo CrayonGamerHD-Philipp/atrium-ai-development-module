@@ -3,7 +3,8 @@
  * Anmelden → Freigabe → Projekt + Auftrag → Angebot (pending) → Annahme → Ereignisse (doppelte seq ignoriert) →
  * Verbrauch → Abschluss mit PR (Auftrag `review`, pull_request); Lease-Ablauf → Job → neu eingeplant;
  * Limit → Wartezeit → zweites Konto übernimmt; Orchestrierung → Teilaufträge mit Abhängigkeiten → Ausliefern;
- * Zyklus im Plan abgelehnt; Konflikt → Konfliktlösung; Rechte; SSE (Projekt, Runner) inkl. RPC über den Stream.
+ * Zyklus im Plan abgelehnt; Konflikt → Konfliktlösung; Rechte; bestehenden PR bearbeiten (`targetPr`, pr-update);
+ * SSE (Projekt, Runner) inkl. RPC über den Stream.
  */
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { sql } from 'drizzle-orm';
@@ -90,6 +91,7 @@ const register = (who: string, accounts: string[]) =>
 			capabilities: {
 				question: true,
 				branchDelivery: true,
+				prUpdate: true,
 				git: true,
 				gh: true,
 				pty: true,
@@ -821,6 +823,123 @@ describe('aidev', () => {
 		} finally {
 			ok(await call('admin', 'PATCH', `/runners/${runnerId}`, { maxSlots: 4 }));
 			ok(await call('admin', 'PATCH', `/runners/${old.runnerId}`, { maxSlots: 0 }));
+		}
+	});
+
+	it('Bestehenden PR bearbeiten: Prüfung, Branch des PR, pr-update, Konfliktlösung erbt den Modus', async () => {
+		await q(
+			sql`INSERT INTO pull_request (project_id, number, title, branch, state, url) VALUES
+				(${projectId}, 101, 'Offen', 'feature/x', 'open', 'https://github.com/acme/widgets/pull/101'),
+				(${projectId}, 102, 'Zu', 'feature/y', 'closed', 'https://github.com/acme/widgets/pull/102'),
+				(${projectId}, 103, 'Haupt', 'main', 'open', 'https://github.com/acme/widgets/pull/103')`
+		);
+		for (const [targetPr, message] of [
+			[999, 'nicht gefunden'],
+			[102, 'Nur offene PRs'],
+			[103, 'Haupt-Branch']
+		] as const) {
+			const res = await call('admin', 'POST', `/projects/${projectId}/tasks`, {
+				prompt: 'PR bearbeiten',
+				targetPr
+			});
+			expect(res.status).toBe(422);
+			expect(JSON.stringify(res.body)).toContain('targetPr');
+			expect(JSON.stringify(res.body)).toContain(message);
+		}
+
+		const t = await createTask({ prompt: 'Review-Kommentare in PR 101 umsetzen', targetPr: 101 });
+		expect(t).toMatchObject({
+			targetPr: 101,
+			delivery: 'project',
+			branch: 'feature/x',
+			prNumber: 101,
+			prUrl: 'https://github.com/acme/widgets/pull/101'
+		});
+		const [row] = await q<{ base_ref: string }>(sql`SELECT base_ref FROM task WHERE id = ${t.id}`);
+		expect(row!.base_ref).toBe('main');
+		const o = await offerFor(t.id);
+		expect(o).toMatchObject({ branch: 'feature/x', baseRef: 'main', readOnly: false });
+		expect(o.delivery).toEqual({ mode: 'pr-update', number: 101 });
+
+		// Konflikt → Konfliktlösung liefert ebenfalls in den PR
+		ok(await call('runner', 'POST', `/runner/runs/${o.runId}/accept`), 201);
+		ok(
+			await finish(o.runId, {
+				status: 'failed',
+				errorKind: 'conflict',
+				errorMessage: 'Merge-Konflikt',
+				conflictFiles: ['src/a.ts'],
+				branch: o.branch
+			}),
+			201
+		);
+		const resolve = (await task(t.id)).children.find((c) => c.role === 'resolve')!;
+		const ro = await offerFor(resolve.id);
+		expect(ro).toMatchObject({ role: 'resolve', branch: 'feature/x' });
+		expect(ro.delivery).toEqual({ mode: 'pr-update', number: 101 });
+		ok(await call('runner', 'POST', `/runner/runs/${ro.runId}/accept`), 201);
+		ok(
+			await finish(ro.runId, {
+				status: 'succeeded',
+				branch: 'feature/x',
+				branchPushed: true,
+				pr: { number: 101, url: 'https://github.com/acme/widgets/pull/101' }
+			}),
+			201
+		);
+		const d = await task(t.id);
+		expect(d.task).toMatchObject({
+			status: 'review',
+			prNumber: 101,
+			branch: 'feature/x',
+			branchPushed: true
+		});
+		expect(d.pullRequest).toMatchObject({ number: 101, branch: 'feature/x', state: 'open' });
+		const chat = ok<ChatMessageDto[]>(await call('admin', 'GET', `/projects/${projectId}/chat`));
+		expect(chat.find((m) => m.taskId === t.id && m.kind === 'agent')!.body).toContain(
+			'PR #101 aktualisiert.'
+		);
+
+		// Chat reicht `targetPr` durch; Fragen zum PR lesen nur (Branch = PR-Branch)
+		const question = ok<{ task: TaskDto }>(
+			await call('admin', 'POST', `/projects/${projectId}/chat`, {
+				body: 'Was ändert PR 101?',
+				mode: 'question',
+				targetPr: 101
+			}),
+			201
+		);
+		expect(question.task).toMatchObject({ targetPr: 101, branch: 'feature/x' });
+		const qo = await offerFor(question.task.id);
+		expect(qo).toMatchObject({ readOnly: true, question: true, branch: 'feature/x' });
+		expect(qo.delivery.mode).toBe('none');
+		ok(await call('admin', 'POST', `/tasks/${question.task.id}/cancel`), 201);
+	});
+
+	it('PR-Aktualisierung geht nur an Runner mit `prUpdate`', async () => {
+		// runner2 ist der alte Runner ohne `prUpdate` (aus dem Test zur Branch-Auslieferung)
+		const runners = ok<RunnerDto[]>(await call('admin', 'GET', '/runners'));
+		const old = runners.find((r) => r.id !== runnerId && !r.capabilities.prUpdate)!;
+		expect(old).toBeTruthy();
+		ok(await call('admin', 'PATCH', `/runners/${old.id}`, { maxSlots: 4 }));
+		ok(await heartbeat('runner2'), 201);
+		ok(await call('admin', 'PATCH', `/runners/${runnerId}`, { maxSlots: 0 }));
+		try {
+			const update = await createTask({ prompt: 'PR 101 nachbessern', targetPr: 101 });
+			const pr = await createTask({ prompt: 'Neuer PR' });
+			const oldOffers = await offers('runner2');
+			expect(oldOffers.map((o) => o.taskId)).toContain(pr.id);
+			expect(oldOffers.map((o) => o.taskId)).not.toContain(update.id);
+			expect((await task(update.id)).task.status).toBe('queued');
+			ok(await call('admin', 'POST', `/tasks/${pr.id}/cancel`), 201);
+
+			ok(await call('admin', 'PATCH', `/runners/${runnerId}`, { maxSlots: 4 }));
+			const o = await offerFor(update.id);
+			expect(o.delivery).toEqual({ mode: 'pr-update', number: 101 });
+			ok(await call('admin', 'POST', `/tasks/${update.id}/cancel`), 201);
+		} finally {
+			ok(await call('admin', 'PATCH', `/runners/${runnerId}`, { maxSlots: 4 }));
+			ok(await call('admin', 'PATCH', `/runners/${old.id}`, { maxSlots: 0 }));
 		}
 	});
 
