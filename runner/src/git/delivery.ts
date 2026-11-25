@@ -25,10 +25,22 @@ export async function isDirty(ws: Workspace, dir: string): Promise<boolean> {
 	return r.stdout.trim().length > 0;
 }
 
-/** Alle Änderungen committen (`git add -A`), falls vorhanden; liefert true bei neuem Commit */
-export async function commitAll(ws: Workspace, dir: string, title: string, taskId: string): Promise<boolean> {
+/**
+ * Alle Änderungen committen (`git add -A`), falls vorhanden; liefert true bei neuem Commit. `exclude` (Pfade relativ
+ * zum Worktree, z. B. die Anhangsablage) wird ausdrücklich nicht aufgenommen – auch nicht, wenn der Agent die
+ * Dateien selbst (etwa mit `git add -f`) vorgemerkt hat.
+ */
+export async function commitAll(
+	ws: Workspace,
+	dir: string,
+	title: string,
+	taskId: string,
+	exclude: readonly string[] = []
+): Promise<boolean> {
 	if (!(await isDirty(ws, dir))) return false;
 	await ws.run(dir, ['add', '-A']);
+	// danach aus dem Index nehmen (Pathspec-Ausschluss scheitert bei ignorierten Pfaden)
+	if (exclude.length) await ws.run(dir, ['reset', '--quiet', '--', ...exclude]);
 	const staged = await ws.run(dir, ['diff', '--cached', '--quiet'], { allowFail: true });
 	if (staged.code === 0) return false;
 	const subject = title.replace(/\s+/g, ' ').trim().slice(0, 200) || 'Änderungen des Agents';

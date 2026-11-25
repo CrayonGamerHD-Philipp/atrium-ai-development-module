@@ -205,6 +205,73 @@ export const attachmentOfferSchema = z.object({
 });
 export type AttachmentOffer = z.infer<typeof attachmentOfferSchema>;
 
+/** Höchstlänge eines Anhangsnamens (Zeichen) */
+export const ATTACHMENT_NAME_MAX = 120;
+const ATTACHMENT_FALLBACK = 'datei';
+/** Unter Windows reservierte Gerätenamen (auch mit Endung) */
+const RESERVED_NAME = /^(con|prn|aux|nul|com[0-9]|lpt[0-9])(\..*)?$/i;
+
+/**
+ * Gemeinsame Namensregel für Anhänge (Atrium für Prompt und Angebot, Runner für die Ablage unter
+ * `.aidev/attachments/`): nur der letzte Pfadteil, keine Steuer-/Sonderzeichen, kein führender Punkt (kein `..`,
+ * keine versteckten Dateien), keine reservierten Gerätenamen, höchstens 120 Zeichen unter Erhalt der Endung;
+ * leer → `datei`. Idempotent – ein bereits bereinigter Name bleibt unverändert.
+ */
+export function safeAttachmentName(raw: string): string {
+	let name = String(raw ?? '')
+		.normalize('NFC')
+		.split(/[/\\]/)
+		.pop()!;
+	// eslint-disable-next-line no-control-regex
+	name = name.replace(/[\u0000-\u001f\u007f<>:"|?*]/g, '_');
+	name = name.replace(/\s+/g, ' ').trim();
+	name = name.replace(/^[.\s]+/, '').replace(/[.\s]+$/, '');
+	if (!name) return ATTACHMENT_FALLBACK;
+	if (RESERVED_NAME.test(name)) name = `_${name}`;
+	return clipAttachmentName(name, ATTACHMENT_NAME_MAX);
+}
+
+/** Auf `max` Zeichen kürzen, Endung (bis 16 Zeichen) möglichst erhalten */
+function clipAttachmentName(name: string, max: number): string {
+	const chars = [...name];
+	if (chars.length <= max) return name;
+	const dot = name.lastIndexOf('.');
+	const ext = dot > 0 ? name.slice(dot) : '';
+	if (ext && [...ext].length <= 16) {
+		const stem = [...name.slice(0, dot)].slice(0, max - [...ext].length).join('');
+		return `${stem.replace(/[.\s]+$/, '') || ATTACHMENT_FALLBACK}${ext}`;
+	}
+	return (
+		chars
+			.slice(0, max)
+			.join('')
+			.replace(/[.\s]+$/, '') || ATTACHMENT_FALLBACK
+	);
+}
+
+/**
+ * Bereinigte, eindeutige Namen eines Laufs (Groß-/Kleinschreibung egal): Duplikate werden zu `name-2.ext` usw.
+ * Atrium nennt im Prompt genau diese Namen, der Runner legt die Dateien unter genau diesen Namen ab. Für bereits
+ * eindeutige, bereinigte Namen ist das Ergebnis unverändert.
+ */
+export function uniqueAttachmentNames(names: readonly string[]): string[] {
+	const used = new Set<string>();
+	return names.map((raw) => {
+		const safe = safeAttachmentName(raw);
+		const dot = safe.lastIndexOf('.');
+		const stem = dot > 0 ? safe.slice(0, dot) : safe;
+		const ext = dot > 0 ? safe.slice(dot) : '';
+		let candidate = safe;
+		for (let n = 2; used.has(candidate.toLowerCase()); n++) {
+			const suffix = `-${n}`;
+			const room = ATTACHMENT_NAME_MAX - suffix.length - [...ext].length;
+			candidate = `${clipAttachmentName(stem, Math.max(1, room))}${suffix}${ext}`;
+		}
+		used.add(candidate.toLowerCase());
+		return candidate;
+	});
+}
+
 export const runOfferSchema = z.object({
 	runId: id,
 	taskId: id,

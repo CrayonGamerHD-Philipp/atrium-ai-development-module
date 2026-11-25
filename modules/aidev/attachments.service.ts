@@ -23,10 +23,15 @@ import {
 } from '$lib/sdk/server';
 import { oneOf, type Tx } from './db';
 import { attachmentDto } from './mappers';
+import {
+	ATTACHMENT_NAME_MAX,
+	safeAttachmentName,
+	uniqueAttachmentNames as uniqueFileNames
+} from './protocol';
 import { ATTACHMENT_MAX_BYTES, ATTACHMENT_MAX_FILES, type AttachmentDto } from './schemas';
 
-/** Höchstlänge eines gespeicherten Dateinamens */
-export const ATTACHMENT_NAME_MAX = 120;
+/** Höchstlänge eines gespeicherten Dateinamens (gemeinsam mit dem Runner) */
+export { ATTACHMENT_NAME_MAX };
 /** Unverknüpfte Uploads werden nach dieser Zeit gelöscht */
 export const ATTACHMENT_ORPHAN_HOURS = 24;
 /** Höchstzahl unverknüpfter Uploads je Person und Projekt (Schutz vor vollgelaufener Datenbank) */
@@ -41,13 +46,17 @@ const OCTET = 'application/octet-stream';
  * Sicherer Dateiname (auch Name der Datei beim Runner): nur der letzte Pfadteil, Steuerzeichen entfernt, über
  * `safeFileName` auf `A–Z a–z 0–9 . _ -` reduziert (Umlaute ausgeschrieben), höchstens 120 Zeichen unter Erhalt der
  * Endung; leere oder problematische Namen (`.`, `..`) → `datei`.
+ * Danach gilt `safeAttachmentName` (`protocol.ts`), z. B. `con.txt` → `_con.txt`.
  */
 export function sanitizeAttachmentName(raw: string): string {
 	const base = String(raw ?? '')
 		.replace(/\p{Cc}/gu, '')
 		.split(/[/\\]/)
 		.pop()!;
-	return safeFileName(base, { maxLength: ATTACHMENT_NAME_MAX, german: true, fallback: 'datei' });
+	// zusätzlich die gemeinsame Regel (z. B. reservierte Gerätenamen), damit der Runner den Namen unverändert übernimmt
+	return safeAttachmentName(
+		safeFileName(base, { maxLength: ATTACHMENT_NAME_MAX, german: true, fallback: 'datei' })
+	);
 }
 
 /**
@@ -371,21 +380,11 @@ export async function deleteOrphanAttachments(tx: Tx): Promise<number> {
 }
 
 /**
- * Eindeutige Dateinamen je Lauf (gleiche Namen, z. B. mehrere eingefügte `image.png`, → `image-2.png`), damit der
- * Runner jede Datei unter ihrem Namen in `.aidev/attachments/` ablegen kann. Angebot und Prompt nutzen dieselben.
+ * Eindeutige Dateinamen je Lauf (gleiche Namen, z. B. mehrere eingefügte `image.png`, → `image-2.png`) nach der
+ * gemeinsamen Regel aus `protocol.ts`: Der Runner bildet aus den angebotenen Namen dieselben Namen für die Ablage in
+ * `.aidev/attachments/`, Angebot und Prompt nutzen sie unverändert.
  */
 export function uniqueAttachmentNames(rows: Row[]): Row[] {
-	const used = new Set<string>();
-	return rows.map((r) => {
-		const name = String(r.name);
-		let candidate = name;
-		const dot = name.lastIndexOf('.');
-		const [stem, ext] = dot > 0 ? [name.slice(0, dot), name.slice(dot)] : [name, ''];
-		for (let n = 2; used.has(candidate.toLowerCase()); n++) {
-			const suffix = `-${n}${ext}`;
-			candidate = stem.slice(0, ATTACHMENT_NAME_MAX - suffix.length) + suffix;
-		}
-		used.add(candidate.toLowerCase());
-		return { ...r, name: candidate };
-	});
+	const names = uniqueFileNames(rows.map((r) => String(r.name)));
+	return rows.map((r, i) => ({ ...r, name: names[i] }));
 }
