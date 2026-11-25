@@ -124,6 +124,8 @@ export class Executor {
 			return reject(`Unbekanntes Konto „${offer.account.key}“`);
 		if (!acct.ok) return reject(`CLI für Konto „${offer.account.key}“ nicht verfügbar`);
 		if (!acct.loggedIn) return reject(`Konto „${offer.account.key}“ ist nicht angemeldet`);
+		if (offer.delivery.mode === 'branch' && offer.branch === offer.project.defaultBranch)
+			return reject('Der Ergebnis-Branch darf nicht der Haupt-Branch sein');
 		try {
 			assertRefName(offer.branch);
 			assertRefName(offer.baseRef, 'Basis');
@@ -211,6 +213,7 @@ export class Executor {
 			commits: [],
 			pr: null,
 			merged: false,
+			branchPushed: false,
 			summary: null,
 			errorKind: null,
 			errorMessage: null,
@@ -336,7 +339,9 @@ export class Executor {
 			const newCommits = await countCommits(ws, wtDir, prepared.startSha);
 			finish.branch = offer.branch;
 			finish.headSha = await headSha(ws, wtDir);
-			if (newCommits === 0) {
+			// Ein wiederaufgenommener oder zusammengeführter Branch kann bereits auszuliefernde Commits enthalten.
+			const pendingCommits = newCommits || await countCommits(ws, wtDir, `origin/${offer.baseRef}`);
+			if (pendingCommits === 0) {
 				emit('status', { text: NO_CHANGES });
 				finish.status = 'succeeded';
 				finish.summary = summary ? `${summary}\n\n(${NO_CHANGES})` : NO_CHANGES;
@@ -359,7 +364,10 @@ export class Executor {
 			let commitBase = prepared.startSha;
 			const d = offer.delivery;
 			const gitEmit = (k: RunEventKind, p: Record<string, unknown>) => emit(k, p);
-			if (d.mode === 'pr') {
+			if (d.mode === 'branch') {
+				await pushBranch(ws, repo, wtDir, offer.branch, prepared.remoteSha, gitEmit);
+				finish.branchPushed = true;
+			} else if (d.mode === 'pr') {
 				await pushBranch(ws, repo, wtDir, offer.branch, prepared.remoteSha, gitEmit);
 				const pr = await ensurePullRequest(
 					ws,

@@ -81,6 +81,7 @@ export async function deliveryOf(tx: Tx, task: Row, project: Row, depth = 0): Pr
 	if (parent && parent.role === 'orchestrate') {
 		return { mode: 'integrate', integrationBranch: str(parent.branch) ?? topBranchOf(parent) };
 	}
+	if (task.delivery === 'branch') return { mode: 'branch' };
 	const policy = String(project.commit_policy);
 	if (policy === 'direct') return { mode: 'direct' };
 	return {
@@ -167,6 +168,7 @@ export async function buildOffer(
 	const role = effectiveRole(task);
 	const ctx = await promptContext(tx, task, project, role);
 	const plan = await branchPlan(tx, task, project);
+	ctx.delivery = await deliveryOf(tx, task, project);
 	const sessionAccount = str(task.session_account_id);
 	return {
 		runId: String(run.id),
@@ -193,7 +195,7 @@ export async function buildOffer(
 		expectPlan: ctx.expectPlan,
 		resumeSessionId:
 			sessionAccount && sessionAccount === str(run.account_id) ? str(task.session_id) : null,
-		delivery: await deliveryOf(tx, task, project),
+		delivery: ctx.delivery,
 		leaseSec: LEASE_SEC,
 		timeoutSec: settings.limits.runTimeoutMin * 60
 	};
