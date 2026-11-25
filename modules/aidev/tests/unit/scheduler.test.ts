@@ -4,6 +4,7 @@ import {
 	HARD_LIMIT_WEEK,
 	WEEK_MS,
 	accountAvailable,
+	limitUtilization,
 	backoffMs,
 	calibrateBudget,
 	findCycle,
@@ -475,5 +476,30 @@ describe('findCycle', () => {
 	});
 	it('unbekannte Vorgänger werden ignoriert', () => {
 		expect(findCycle(new Map([['a', ['gibt-es-nicht']]]))).toBeNull();
+	});
+});
+
+describe('gemeldete Limits', () => {
+	it('Ausschluss nach max(Schätzung, Meldung)', () => {
+		// eigene Schätzung 50 %, Meldung 97 % → ausgeschlossen
+		const a = account({ budget5h: 100, used5h: 50, reported: { u5h: 0.97, uWeek: null } });
+		expect(limitUtilization(a)).toEqual({ u5h: 0.97, uWeek: 0 });
+		expect(accountAvailable(a, NOW)).toBe(false);
+		// Meldung niedriger als Schätzung → Schätzung zählt
+		const b = account({ budget5h: 100, used5h: 96, reported: { u5h: 0.2, uWeek: null } });
+		expect(accountAvailable(b, NOW)).toBe(false);
+		// Woche ohne bekanntes Budget, Meldung 99 %
+		expect(accountAvailable(account({ reported: { u5h: null, uWeek: 0.99 } }), NOW)).toBe(false);
+		expect(accountAvailable(account({ reported: { u5h: 0.5, uWeek: 0.9 } }), NOW)).toBe(true);
+		// ohne Meldung (ältere Runner) unverändert
+		expect(accountAvailable(account({ reported: { u5h: null, uWeek: null } }), NOW)).toBe(true);
+	});
+
+	it('abgelehntes Fenster wirkt wie eine Wartezeit', () => {
+		expect(accountAvailable(account({ rejectedUntil: NOW + 1000 }), NOW)).toBe(false);
+		expect(accountAvailable(account({ rejectedUntil: NOW }), NOW)).toBe(true);
+		expect(accountAvailable(account({ rejectedUntil: null }), NOW)).toBe(true);
+		const t = task();
+		expect(scoreAccount(t, account({ rejectedUntil: NOW + 1000 }), ROUTING, NOW)).toBeNull();
 	});
 });

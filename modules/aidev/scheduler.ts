@@ -30,6 +30,13 @@ export interface AccountState {
 	weekStart: number;
 	contextK: number;
 	defaultModel: string;
+	/**
+	 * Vom Anbieter gemeldete Auslastung (0..1, über 1 bei Overage) aus einem aktuellen Limit-Stand; fehlend/`null`
+	 * = keine aktuelle Meldung (z. B. ältere Runner) → nur die eigene Schätzung zählt. Siehe `reportedUtil`.
+	 */
+	reported?: { u5h: number | null; uWeek: number | null };
+	/** Ein Limit-Fenster meldet `rejected` bis zu dieser Zeit (ms) – wirkt wie eine Wartezeit */
+	rejectedUntil?: number | null;
 }
 
 export interface TaskCandidate {
@@ -101,10 +108,19 @@ export function accountAvailable(a: AccountState, now: number): boolean {
 	if (!(a.runnerFreeSlots > 0)) return false;
 	if (!(a.running < a.maxConcurrency)) return false;
 	if (a.cooldownUntil != null && now < a.cooldownUntil) return false;
+	if (a.rejectedUntil != null && now < a.rejectedUntil) return false;
 	// Hart ausgeschöpft? Unbekanntes Budget (0) ergibt Auslastung 0 und schließt daher nie aus.
-	const { u5h, uWeek } = utilization(a);
+	const { u5h, uWeek } = limitUtilization(a);
 	if (u5h > HARD_LIMIT_5H || uWeek > HARD_LIMIT_WEEK) return false;
 	return true;
+}
+
+/** Auslastung für die Ausschluss-Prüfung: Maximum aus eigener Schätzung und aktueller Meldung des Anbieters */
+export function limitUtilization(a: AccountState): { u5h: number; uWeek: number } {
+	const own = utilization(a);
+	const pick = (estimate: number, reported: number | null | undefined) =>
+		reported != null && Number.isFinite(reported) ? Math.max(estimate, reported) : estimate;
+	return { u5h: pick(own.u5h, a.reported?.u5h), uWeek: pick(own.uWeek, a.reported?.uWeek) };
 }
 
 function ratio(used: number, budget: number): number {

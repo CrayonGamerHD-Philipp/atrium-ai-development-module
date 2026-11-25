@@ -1154,4 +1154,97 @@ describe('aidev', () => {
 		// ohne Runner-Verbindung keine Projekt-Operationen
 		expect((await call('admin', 'POST', `/projects/${projectId}/check`)).status).toBe(503);
 	});
+
+	it('Heartbeat mit Limit-Stand füllt `AccountDto.limits`, ältere Runner ändern nichts', async () => {
+		const fakeA = async () =>
+			ok<AccountDto[]>(await call('admin', 'GET', '/accounts')).find(
+				(a) => a.runnerId === runnerId && a.key === 'fake-a'
+			)!;
+		const samples = async () =>
+			(
+				await q<{ n: number }>(
+					sql`SELECT count(*)::int AS n FROM account_limit_sample s
+						JOIN provider_account a ON a.id = s.account_id
+						WHERE a.runner_id = ${runnerId} AND a.key = 'fake-a'`
+				)
+			)[0]!.n;
+		const beat = (accounts: unknown[]) =>
+			call<{ status: string }>('runner', 'POST', '/runner/heartbeat', {
+				slotsUsed: 0,
+				runIds: [],
+				accounts
+			});
+		expect((await fakeA()).limits).toBeNull();
+
+		const resetsAt = new Date(Date.now() + 2 * 3600_000).toISOString();
+		const observedAt = new Date(Date.now() - 60_000).toISOString();
+		const limits = {
+			observedAt,
+			source: 'probe',
+			windows: [
+				{ window: '5h', label: 'five_hour', usedPercent: 20, resetsAt, status: 'allowed' },
+				{ window: 'week', usedPercent: 35, resetsAt: null }
+			]
+		};
+		ok(await beat([{ key: 'fake-a', loggedIn: true, limits }]), 201);
+		const account = await fakeA();
+		const first = account.limits!;
+		// eigene Schätzung nur bei bekanntem Budget
+		const est5h = account.effective5hUnits > 0 ? account.usage.util5h : null;
+		const estWeek = account.effectiveWeekUnits > 0 ? account.usage.utilWeek : null;
+		expect(first).toMatchObject({
+			observedAt,
+			source: 'probe',
+			stale: false
+		});
+		// Budgetvorschlag = Verbrauch im Fenster / gemeldete Auslastung (frühere Tests haben Verbrauch gebucht)
+		const [ledger] = await q<{ units: number }>(
+			sql`SELECT COALESCE(sum(units), 0)::int AS units FROM usage_ledger
+				WHERE account_id = ${account.id} AND source <> 'reserved'`
+		);
+		const units = ledger!.units;
+		expect(first.suggestedBudget5hUnits).toBe(units > 0 ? Math.round(units / 0.2) : null);
+		expect(first.suggestedBudgetWeekUnits).toBe(units > 0 ? Math.round(units / 0.35) : null);
+		expect(first.windows).toEqual([
+			{
+				window: '5h',
+				label: 'five_hour',
+				usedPercent: 20,
+				resetsAt,
+				status: 'allowed',
+				estimatedUtil: est5h,
+				exhaustsAt: null
+			},
+			{
+				window: 'week',
+				label: '',
+				usedPercent: 35,
+				resetsAt: null,
+				status: 'unknown',
+				estimatedUtil: estWeek,
+				exhaustsAt: null
+			}
+		]);
+		expect(await samples()).toBe(2);
+
+		// älterer Runner ohne `limits` und ein älterer Stand ändern nichts
+		ok(await beat([{ key: 'fake-a', loggedIn: true }]), 201);
+		ok(await heartbeat('runner'), 201);
+		const older = { ...limits, observedAt: new Date(Date.now() - 600_000).toISOString() };
+		ok(await beat([{ key: 'fake-a', loggedIn: true, limits: older }]), 201);
+		expect((await fakeA()).limits).toEqual(first);
+
+		// neuerer Stand ersetzt den Schnappschuss, Proben höchstens alle 5 Minuten
+		const newer = {
+			...limits,
+			observedAt: new Date().toISOString(),
+			windows: [{ window: '5h', usedPercent: 30, resetsAt, status: 'warning' }]
+		};
+		ok(await beat([{ key: 'fake-a', loggedIn: true, limits: newer }]), 201);
+		const second = (await fakeA()).limits!;
+		expect(second.observedAt).toBe(newer.observedAt);
+		expect(second.windows).toHaveLength(1);
+		expect(second.windows[0]).toMatchObject({ usedPercent: 30, status: 'warning' });
+		expect(await samples()).toBe(2);
+	});
 });
