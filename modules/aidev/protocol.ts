@@ -295,7 +295,8 @@ export const rpcCommandSchema = z.object({
 	target: workspaceTargetSchema.default('main'),
 	/** Je `op`: `fs.*` → `{ path, content? }`, `git.diff` → `{ base?, head? }`, `gh.pr-merge` → `{ number, method }`,
 	 *  `git.branch-delete` → `{ branches: string[], expect?: Record<Branch, SHA> }` (höchstens `MAX_BRANCH_DELETE`,
-	 *  Antwort `branchDeleteResult`; `expect` = erwarteter Remote-Stand, abweichend → `kept` mit `changed`) */
+	 *  Antwort `branchDeleteResult`; `expect` = erwarteter Remote-Stand, abweichend → `kept` mit `changed`),
+	 *  `repo.check` → `{}` (Antwort `repoCheckResult` inkl. optionaler Branch-Liste `branches`) */
 	args: z.record(z.string(), z.unknown()).default({})
 });
 export type RpcCommand = z.infer<typeof rpcCommandSchema>;
@@ -512,11 +513,19 @@ export const prInfoSchema = z.object({
 });
 export type PrInfo = z.infer<typeof prInfoSchema>;
 export const prListResult = z.object({ pulls: z.array(prInfoSchema) });
+/** Höchstzahl an Branch-Namen in der Antwort auf `repo.check` (weitere werden abgeschnitten) */
+export const MAX_REPO_BRANCHES = 500;
+/**
+ * Antwort auf `repo.check`. `branches` = Branch-Namen des Remotes (aus `git ls-remote --heads`), duplikatfrei,
+ * Default-Branch zuerst, Rest alphabetisch, höchstens `MAX_REPO_BRANCHES`; nur bei `ok: true` gefüllt.
+ * `branches` fehlt bei älteren Runnern.
+ */
 export const repoCheckResult = z.object({
 	ok: z.boolean(),
 	defaultBranch: z.string().nullable(),
 	canPush: z.boolean(),
-	message: z.string()
+	message: z.string(),
+	branches: z.array(z.string().max(255)).max(MAX_REPO_BRANCHES).optional()
 });
 
 /**
