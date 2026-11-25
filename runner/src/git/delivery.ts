@@ -401,22 +401,23 @@ export async function pullUrl(ws: Workspace, repo: RepoRef, number: number): Pro
 
 /**
  * Vor dem Push auf den Head-Branch eines PR: Remote aktualisieren; hat jemand parallel gepusht, die eigenen
- * Commits (`expectedRemote..HEAD`) auf den neuen Stand rebasen. Liefert den Remote-Stand, auf dem HEAD jetzt aufsetzt.
+ * Commits (`expectedRemote..HEAD`) auf den neuen Stand rebasen. Liefert den Remote-Stand, auf dem HEAD jetzt aufsetzt,
+ * und ob rebased wurde (dann ist der getestete Stand nicht mehr der auszuliefernde).
  */
 export async function syncPullBranch(
 	ws: Workspace,
 	repo: RepoRef,
 	o: { dir: string; branch: string; number: number; expectedRemote: string | null },
 	emit: Emit
-): Promise<string> {
+): Promise<{ base: string; rebased: boolean }> {
 	assertRefName(o.branch);
 	await fetchRepo(ws, repo);
 	const current = await ws.revParse(o.dir, `refs/remotes/origin/${o.branch}`);
 	if (!current) throw new DeliveryError('git', `Branch des PR #${o.number} existiert nicht mehr`);
-	if (current === o.expectedRemote) return current;
+	if (current === o.expectedRemote) return { base: current, rebased: false };
 	// Bereits enthalten (z. B. eigener Stand) → nichts zu tun
 	const contained = await ws.run(o.dir, ['merge-base', '--is-ancestor', current, 'HEAD'], { allowFail: true });
-	if (contained.code === 0) return current;
+	if (contained.code === 0) return { base: current, rebased: false };
 	const args = o.expectedRemote
 		? ['rebase', '--quiet', '--onto', current, o.expectedRemote]
 		: ['rebase', '--quiet', current];
@@ -428,15 +429,22 @@ export async function syncPullBranch(
 		throw new DeliveryError('git', `Rebase auf origin/${o.branch} fehlgeschlagen:\n${(rb.stderr || rb.stdout).trim().slice(-2000)}`);
 	}
 	emit('git', { action: 'rebase', detail: `Auf neuen Stand von origin/${o.branch} rebased (parallel gepusht)` });
-	return current;
+	return { base: current, rebased: true };
 }
 
 /** Text des Ergebnis-Kommentars für einen aktualisierten PR */
-export function pullCommentBody(o: { summary: string | null; commits: CommitInfo[]; taskId: string }): string {
+export function pullCommentBody(o: {
+	summary: string | null;
+	commits: CommitInfo[];
+	taskId: string;
+	/** Hinweis über der Commit-Liste (z. B. bereits gemergte Teilaufträge) */
+	note?: string;
+}): string {
 	const shown = o.commits.slice(-50);
 	const lines = shown.map((c) => `- \`${c.sha.slice(0, 7)}\` ${(c.message.split('\n')[0] ?? '').trim().slice(0, 150)}`);
 	if (o.commits.length > shown.length) lines.unshift(`- … ${o.commits.length - shown.length} ältere Commits`);
-	const tail = `\n\n### Neue Commits\n\n${lines.join('\n') || '(keine)'}\n\nAidev-Task: ${o.taskId}\n`;
+	const note = o.note ? `${o.note}\n\n` : '';
+	const tail = `\n\n### Neue Commits\n\n${note}${lines.join('\n') || '(keine)'}\n\nAidev-Task: ${o.taskId}\n`;
 	const head = '### Ergebnis des Agents\n\n';
 	const summary = (o.summary ?? '').trim() || '(keine Zusammenfassung)';
 	// Liste und Aufgaben-Hinweis bleiben vollständig, gekürzt wird die Zusammenfassung
@@ -502,12 +510,21 @@ export async function deliverDirect(
 
 /**
  * Teilauftrag in den Integrations-Branch mergen (`git merge --no-ff`) und pushen; bei Wettlauf bis zu 3 Versuche.
- * Der Merge läuft in einem eigenen temporären Worktree.
+ * Der Merge läuft in einem eigenen temporären Worktree. Ein fehlender Integrations-Branch wird aus dem Haupt-Branch
+ * angelegt – außer bei `pullNumber` (Head-Branch eines PR): dann Abbruch.
  */
 export async function deliverIntegrate(
 	ws: Workspace,
 	repo: RepoRef,
-	o: { dir: string; branch: string; integrationBranch: string; defaultBranch: string; runId: string; taskId: string },
+	o: {
+		dir: string;
+		branch: string;
+		integrationBranch: string;
+		defaultBranch: string;
+		runId: string;
+		taskId: string;
+		pullNumber?: number;
+	},
 	emit: Emit
 ): Promise<void> {
 	assertRefName(o.integrationBranch);
@@ -518,6 +535,8 @@ export async function deliverIntegrate(
 		for (let attempt = 1; attempt <= 3; attempt++) {
 			const cache = await ws.ensureCache(repo);
 			let target = await ws.revParse(cache, `refs/remotes/origin/${o.integrationBranch}`);
+			if (!target && o.pullNumber !== undefined)
+				throw new DeliveryError('git', `Branch des PR #${o.pullNumber} existiert nicht mehr`);
 			if (!target) {
 				emit('git', { action: 'branch', detail: `Integrations-Branch ${o.integrationBranch} wird aus ${o.defaultBranch} angelegt` });
 				target = await ws.withRepo(repo, () => ws.createRemoteBranch(repo, cache, o.integrationBranch, o.defaultBranch));

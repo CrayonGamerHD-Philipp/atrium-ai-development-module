@@ -256,8 +256,12 @@ export class Executor {
 		let pull: PullContext | null = null;
 		try {
 			emit('status', { text: 'Repository wird vorbereitet' });
-			// 0. Bestehender PR (pr-update): prüfen, bevor etwas geändert wird; Kontext für den Agent
-			if (offer.delivery.mode === 'pr-update') pull = await this.loadPull(offer, offer.delivery.number, emit);
+			// 0. Bestehender PR (pr-update): prüfen, bevor etwas geändert wird; Kontext für den Agent.
+			// Teilauftrag einer PR-Orchestrierung: nur prüfen (Integrations-Branch = Head-Branch des PR).
+			if (offer.delivery.mode === 'pr-update')
+				pull = await this.loadPull(offer, offer.delivery.number, offer.branch, emit);
+			else if (offer.delivery.mode === 'integrate' && offer.delivery.pullNumber !== undefined)
+				await this.loadPull(offer, offer.delivery.pullNumber, offer.delivery.integrationBranch, emit);
 			// 1. Worktree
 			const prepared = await this.prepareWorktree(offer, emit);
 			wtDir = prepared.dir;
@@ -355,7 +359,10 @@ export class Executor {
 			const pendingCommits =
 				newCommits ||
 				(offer.delivery.mode === 'pr-update' ? 0 : await countCommits(ws, wtDir, `origin/${offer.baseRef}`));
-			if (pendingCommits === 0) {
+			// Abschluss einer PR-Orchestrierung: Die Teilaufträge haben schon in den PR-Branch gemergt
+			const integratedOnly =
+				pendingCommits === 0 && offer.delivery.mode === 'pr-update' && offer.delivery.integrated === true;
+			if (pendingCommits === 0 && !integratedOnly) {
 				emit('status', { text: NO_CHANGES });
 				finish.status = 'succeeded';
 				finish.summary = summary ? `${summary}\n\n(${NO_CHANGES})` : NO_CHANGES;
@@ -364,15 +371,18 @@ export class Executor {
 			checkAbort();
 
 			// Tests vor dem Push
-			if (offer.project.testCmd.trim()) {
-				emit('status', { text: 'Tests laufen (testCmd)' });
-				const r = await this.shell(offer.project.testCmd, wtDir, publicEnv(baseEnv), signal, timeoutMs, emit);
+			const dir = wtDir;
+			const runTests = async (label: string, failure: string) => {
+				if (!offer.project.testCmd.trim()) return;
+				emit('status', { text: label });
+				const r = await this.shell(offer.project.testCmd, dir, publicEnv(baseEnv), signal, timeoutMs, emit);
 				checkAbort();
 				if (r !== 0) {
-					finish.commits = await commitInfos(ws, wtDir, prepared.startSha);
-					throw new RunError('tests', `Tests fehlgeschlagen (Exit-Code ${r ?? 'unbekannt'}) – nichts gepusht`);
+					finish.commits = await commitInfos(ws, dir, prepared.startSha);
+					throw new RunError('tests', `${failure} (Exit-Code ${r ?? 'unbekannt'}) – nichts gepusht`);
 				}
-			}
+			};
+			await runTests('Tests laufen (testCmd)', 'Tests fehlgeschlagen');
 
 			// Auslieferung
 			let commitBase = prepared.startSha;
@@ -392,14 +402,24 @@ export class Executor {
 				finish.pr = pr;
 				if (d.autoMerge) await enableAutoMerge(ws, repo, pr.number, gitEmit);
 			} else if (d.mode === 'pr-update') {
-				// Kein Force-Push: parallel gepushte Commits werden per Rebase übernommen
-				commitBase = await syncPullBranch(
-					ws,
-					repo,
-					{ dir: wtDir, branch: offer.branch, number: d.number, expectedRemote: prepared.remoteSha },
-					gitEmit
-				);
-				await pushBranch(ws, repo, wtDir, offer.branch, commitBase, gitEmit, { allowForce: false });
+				if (!integratedOnly) {
+					// Kein Force-Push: parallel gepushte Commits werden per Rebase übernommen
+					const synced = await syncPullBranch(
+						ws,
+						repo,
+						{ dir: wtDir, branch: offer.branch, number: d.number, expectedRemote: prepared.remoteSha },
+						gitEmit
+					);
+					commitBase = synced.base;
+					// Der getestete Stand ist nach dem Rebase nicht mehr der auszuliefernde → erneut testen
+					if (synced.rebased)
+						await runTests(
+							'Tests laufen erneut (testCmd, nach Rebase auf parallel gepushte Commits)',
+							'Tests nach Rebase auf parallel gepushte Commits fehlgeschlagen'
+						);
+					await pushBranch(ws, repo, wtDir, offer.branch, commitBase, gitEmit, { allowForce: false });
+				}
+				// Bei `integratedOnly` liegen die Änderungen der Teilaufträge bereits auf dem PR-Branch
 				finish.branchPushed = true;
 				const url =
 					pull?.url || (await pullUrl(ws, repo, d.number)) ||
@@ -410,7 +430,10 @@ export class Executor {
 				const body = pullCommentBody({
 					summary: summary ? redactor.redact(summary) : null,
 					commits,
-					taskId: offer.taskId
+					taskId: offer.taskId,
+					note: d.integrated
+						? 'Die Änderungen der Teilaufträge wurden bereits einzeln in den PR-Branch gemergt.'
+						: undefined
 				});
 				await commentOnPull(ws, repo, d.number, redactor.redact(body), gitEmit);
 			} else if (d.mode === 'direct') {
@@ -428,7 +451,8 @@ export class Executor {
 						integrationBranch: d.integrationBranch,
 						defaultBranch: offer.project.defaultBranch,
 						runId: offer.runId,
-						taskId: offer.taskId
+						taskId: offer.taskId,
+						pullNumber: d.pullNumber
 					},
 					gitEmit
 				);
@@ -494,6 +518,10 @@ export class Executor {
 				// Der Head-Branch eines bestehenden PR wird nie neu angelegt
 				if (!remoteSha && !offer.question && offer.delivery.mode === 'pr-update')
 					throw new RunError('git', `Branch des PR #${offer.delivery.number} existiert nicht mehr`);
+				const basePull =
+					offer.delivery.mode === 'integrate' && offer.delivery.pullNumber !== undefined
+						? offer.delivery.pullNumber
+						: null;
 				let start: string;
 				if (remoteSha) {
 					start = remoteSha;
@@ -501,6 +529,9 @@ export class Executor {
 				} else {
 					let base = await ws.revParse(cache, `refs/remotes/origin/${offer.baseRef}`);
 					if (!base && offer.question) throw new RunError('git', `Basis ${offer.baseRef} fehlt`);
+					// Basis = Head-Branch eines PR (Teilauftrag einer PR-Orchestrierung): nie neu anlegen
+					if (!base && basePull !== null)
+						throw new RunError('git', `Branch des PR #${basePull} existiert nicht mehr`);
 					if (!base) {
 						emit('git', {
 							action: 'branch',
@@ -523,24 +554,21 @@ export class Executor {
 	}
 
 	/**
-	 * PR-Kontext für pr-update laden und prüfen. Ungeeignete PRs (geschlossen, Fork, anderer Branch) brechen den Lauf
-	 * ab; lässt sich der PR nicht laden, läuft der Lauf ohne Kontext weiter (Fehler als Ereignis).
+	 * PR-Kontext laden und prüfen, bevor in den Head-Branch `branch` des PR gepusht wird. Ungeeignete PRs
+	 * (geschlossen, Fork, anderer Branch) brechen den Lauf ab – ebenso ein PR, der sich nicht laden lässt: ohne
+	 * geprüfte Metadaten wird nicht gepusht. Nur die Inline-Kommentare sind optional (`fetchPullContext`).
 	 */
 	private async loadPull(
 		offer: RunOffer,
 		number: number,
+		branch: string,
 		emit: (k: RunEventKind, p: Record<string, unknown>) => void
-	): Promise<PullContext | null> {
+	): Promise<PullContext> {
 		const repo = { repoOwner: offer.project.repoOwner, repoName: offer.project.repoName };
 		let ctx: PullContext;
 		try {
 			ctx = await fetchPullContext(this.o.workspace, repo, number);
-		} catch (e) {
-			emit('error', { text: `PR-Kontext nicht verfügbar – Lauf ohne Kontext: ${errorMessage(e)}` });
-			return null;
-		}
-		try {
-			assertPullUpdatable(ctx, offer.branch);
+			assertPullUpdatable(ctx, branch);
 		} catch (e) {
 			throw new RunError('git', errorMessage(e));
 		}
