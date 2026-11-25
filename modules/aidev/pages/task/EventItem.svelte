@@ -8,7 +8,7 @@
 	import { cn } from '$lib/utils';
 	import type { RunEvent } from '../../protocol';
 	import { asText, clock, shorten, toolSummary } from '../format';
-	import AgentText from './AgentText.svelte';
+	import Markdown from '../components/Markdown.svelte';
 
 	let { event }: { event: RunEvent } = $props();
 
@@ -27,7 +27,7 @@
 {#if event.kind === 'text'}
 	<div class="flex gap-3 py-1.5">
 		{@render stamp()}
-		<AgentText {text} class="min-w-0 flex-1" />
+		<Markdown {text} class="min-w-0 flex-1" />
 	</div>
 {:else if event.kind === 'thinking'}
 	<details class="group py-1">
