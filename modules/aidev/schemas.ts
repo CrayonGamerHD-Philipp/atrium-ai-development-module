@@ -214,6 +214,18 @@ export const projectPatch = z
 	.partial();
 export type ProjectPatch = z.infer<typeof projectPatch>;
 
+/** Höchstzahl und maximale Größe der Anhänge je Auftrag oder Nachricht. */
+export const ATTACHMENT_MAX_FILES = 10;
+export const ATTACHMENT_MAX_BYTES = 10 * 1024 * 1024;
+
+/** Metadaten der einzelnen Multipart-Datei nach dem Einlesen; kein JSON-Body. */
+export const attachmentUploadInput = z.object({
+	name: z.string().min(1).max(120),
+	mime: z.string().min(1),
+	size: z.number().int().positive().max(ATTACHMENT_MAX_BYTES)
+});
+export type AttachmentUploadInput = z.infer<typeof attachmentUploadInput>;
+
 export const taskInput = z.object({
 	delivery: taskDeliverySchema.default('project'),
 	/** Bestehenden PR bearbeiten statt neuen Branch/PR anzulegen (Nummer des Pull Requests) */
@@ -226,6 +238,7 @@ export const taskInput = z.object({
 	priority: z.number().int().min(-10).max(10).default(0),
 	providerHint: providerSchema.nullable().default(null),
 	dependsOn: z.array(z.string().uuid()).max(20).default([]),
+	attachmentIds: z.array(z.string().uuid()).max(ATTACHMENT_MAX_FILES).default([]),
 	/** Als Entwurf anlegen statt sofort einzuplanen */
 	draft: z.boolean().default(false),
 	maxAttempts: z.number().int().min(1).max(10).default(3)
@@ -255,6 +268,7 @@ export const chatInput = z.object({
 	/** Bestehenden PR bearbeiten statt neuen Branch/PR anzulegen (Nummer des Pull Requests) */
 	targetPr: z.number().int().positive().nullable().default(null),
 	body: z.string().trim().min(1).max(20_000),
+	attachmentIds: z.array(z.string().uuid()).max(ATTACHMENT_MAX_FILES).default([]),
 	/**
 	 * `task` = Nachricht wird ein Auftrag, `question` = Frage an einen lesenden Agenten, `note` = nur Notiz im Verlauf,
 	 * `auto` = Frage/Auftrag regelbasiert erkennen (`classifyChatIntent` in `intent.ts`). Ohne Angabe bleibt es `task`.
@@ -380,6 +394,14 @@ export interface RepoProbeDto {
 	existingProjectId: string | null;
 }
 
+export interface AttachmentDto {
+	id: string;
+	name: string;
+	mime: string;
+	size: number;
+	createdAt: string;
+}
+
 export interface TaskDto {
 	delivery: 'project' | 'branch';
 	/** Bearbeiteter bestehender Pull Request (sonst `null`) */
@@ -403,6 +425,7 @@ export interface TaskDto {
 	prNumber: number | null;
 	prUrl: string | null;
 	dependsOn: string[];
+	attachments?: AttachmentDto[];
 	createdBy: string | null;
 	createdAt: string;
 	updatedAt: string;
@@ -470,6 +493,7 @@ export interface ChatMessageDto {
 	body: string;
 	author: { id: string; name: string } | null;
 	createdAt: string;
+	attachments?: AttachmentDto[];
 	/** Aktionsvorschläge des Agents (nur `agent`-Nachrichten, sonst leer) */
 	actions: ChatActionDto[];
 }
@@ -508,6 +532,7 @@ export interface RunnerDto {
 	draining: boolean;
 	capabilities: {
 		question?: boolean;
+		attachments?: boolean;
 		branchDelivery?: boolean;
 		prUpdate?: boolean;
 		git?: boolean;
@@ -651,6 +676,7 @@ export type TerminalLiveEvent =
  * | POST | /projects/probe | project.manage | repoProbeInput | RepoProbeDto (über Runner) |
  * | POST | /projects/:id/check | project.manage | – | { ok, message, defaultBranch, canPush, branches } (über Runner) |
  * | GET | /projects/:id/live | project.view | liveQuery | SSE ProjectLiveEvent |
+ * | POST | /projects/:id/attachments | task.create | Multipart: eine Datei `file` | AttachmentDto (201) |
  * | GET | /projects/:id/tasks | project.view | tasksQuery | TaskDto[] |
  * | POST | /projects/:id/tasks | task.create | taskInput | TaskDto |
  * | GET | /tasks/:id | project.view | – | TaskDetailDto |
