@@ -1,11 +1,14 @@
 /**
  * Verbrauch und Zustand der Anbieter-Konten: Summen aus `usage_ledger` (gleitendes 5-h-Fenster, Woche ab
  * `weekStartOf(week_anchor)`, inkl. Reservierungen), wirksame Budgets, Auslastung, laufende Läufe. Liefert die
- * `AccountState`s für den Scheduler und die `AccountDto`s/`RunnerDto`s/`OverviewDto` für die Oberfläche.
+ * `AccountState`s für den Scheduler (inkl. gemeldeter Limits) und die `AccountDto`s/`RunnerDto`s/`OverviewDto`
+ * (inkl. Limit-Analyse aus `limits.ts`) für die Oberfläche.
  */
 import { sql, type SQL } from 'drizzle-orm';
 import { num, rowsOf, toIso, type Row } from '$lib/sdk/server';
 import type { Tx } from './db';
+import { analyzeLimits, parseSnapshot, reportedUtil, rejectedUntil } from './limits';
+import { loadLimitSamples } from './limits.service';
 import { accountDto, runnerDto, runSummaryDto } from './mappers';
 import type { Provider } from './protocol';
 import { utilization, weekStartOf, type AccountState } from './scheduler';
@@ -66,8 +69,18 @@ export async function loadAccountViews(
 			GROUP BY w.id`
 	);
 	const usedWeek = new Map(weekRows.map((r) => [String(r.account_id), num(r.used)]));
+	// Limit-Proben aller Konten mit Schnappschuss (eine Abfrage)
+	const snapshots = new Map(
+		rows.map((r) => [String(r.id), parseSnapshot(r.limit_snapshot)] as const)
+	);
+	const samples = await loadLimitSamples(
+		tx,
+		rows.filter((r) => snapshots.get(String(r.id))).map((r) => String(r.id)),
+		now
+	);
 	return rows.map((r) => {
 		const id = String(r.id);
+		const snapshot = snapshots.get(id) ?? null;
 		const state: AccountState = {
 			id,
 			runnerId: String(r.runner_id),
@@ -85,7 +98,9 @@ export async function loadAccountViews(
 			usedWeek: usedWeek.get(id) ?? 0,
 			weekStart: weekStarts.get(id)!,
 			contextK: num(r.context_k),
-			defaultModel: String(r.default_model ?? '')
+			defaultModel: String(r.default_model ?? ''),
+			reported: reportedUtil(snapshot, now),
+			rejectedUntil: rejectedUntil(snapshot, now)
 		};
 		const u = utilization(state);
 		const dto = accountDto(
@@ -97,7 +112,8 @@ export async function loadAccountViews(
 				utilWeek: u.uWeek,
 				running: state.running
 			},
-			{ fiveHours: state.budget5h, week: state.budgetWeek }
+			{ fiveHours: state.budget5h, week: state.budgetWeek },
+			snapshot ? analyzeLimits(snapshot, state, samples.get(id) ?? [], now) : null
 		);
 		return { row: r, state, dto };
 	});

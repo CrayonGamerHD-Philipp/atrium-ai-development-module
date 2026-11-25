@@ -6,6 +6,7 @@ import { sql } from 'drizzle-orm';
 import { errors, num, rowsOf, str, toIso, type Row } from '$lib/sdk/server';
 import { clip, jsonb, LEASE_SEC, oneOf, type Tx } from './db';
 import { sendCommand, type Effects } from './effects';
+import { storeLimitSnapshot } from './limits.service';
 import { extractPlan } from './prompts';
 import {
 	MAX_EVENT_TEXT,
@@ -288,6 +289,15 @@ export async function recordLimit(
 			VALUES (${crypto.randomUUID()}, ${account.id}, ${run.id}, ${input.kind},
 				${input.resetsAt}::timestamptz, ${input.kind === 'week' ? usedWeek : used5h}, ${clip(input.raw, 2000)})`
 	);
+	// Limit-Fenster zum Zeitpunkt des Treffers als neuer Schnappschuss (nur neuere Runner melden sie)
+	if (input.windows) {
+		await storeLimitSnapshot(
+			tx,
+			String(account.id),
+			{ observedAt: new Date(now).toISOString(), source: 'error', windows: input.windows },
+			now
+		);
+	}
 	fx.overview = true;
 	fx.dispatch = true;
 	return { cooldownUntil: until };

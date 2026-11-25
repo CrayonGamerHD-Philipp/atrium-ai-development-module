@@ -4,6 +4,7 @@ import { jsonOf, stringList } from './db';
 import type { CommitPolicy, Provider, Role } from './protocol';
 import type {
 	AccountDto,
+	AccountLimitsDto,
 	ChatMessageDto,
 	CommitDto,
 	ProjectDto,
@@ -129,7 +130,8 @@ export function taskDto(r: Row, dependsOn: string[], lastRun: RunSummaryDto | nu
 export function accountDto(
 	r: Row,
 	usage: AccountDto['usage'],
-	effective: { fiveHours: number; week: number }
+	effective: { fiveHours: number; week: number },
+	limits: AccountLimitsDto | null = null
 ): AccountDto {
 	return {
 		id: String(r.id),
@@ -152,8 +154,8 @@ export function accountDto(
 		cooldownUntil: toIsoOrNull(r.cooldown_until),
 		cooldownReason: str(r.cooldown_reason),
 		usage,
-		// Limit-Stand: wird vom Backend (Limit-Analyse) befüllt
-		limits: null
+		// Limit-Stand mit Analyse (`limits.ts`), `null` = nie gemeldet
+		limits
 	};
 }
 
