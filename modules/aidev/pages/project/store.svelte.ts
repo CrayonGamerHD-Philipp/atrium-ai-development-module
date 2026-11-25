@@ -12,7 +12,7 @@ import type {
 	RunSummaryDto,
 	TaskDto
 } from '../../schemas';
-import { getProject, listChat, listPulls, listTasks } from '../api';
+import { decideChatAction, getProject, listChat, listPulls, listTasks } from '../api';
 import { errMsg } from '../format';
 import { LiveStream } from '../live.svelte';
 
@@ -146,6 +146,17 @@ export class ProjectStore {
 			return;
 		}
 		this.chat = [...this.chat, message].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+	}
+
+	/**
+	 * Aktionsvorschlag übernehmen oder verwerfen: ersetzt die Nachricht im Verlauf und fügt den angelegten bzw.
+	 * betroffenen Auftrag ein. Erwartete Fehler kommen als Zustand `failed` zurück; Netz-/Rechtefehler werfen.
+	 */
+	async decideChatAction(messageId: string, index: number, decision: 'apply' | 'reject') {
+		const res = await decideChatAction(messageId, index, decision);
+		this.addChat(res.message);
+		if (res.task) this.upsertTask(res.task);
+		return res;
 	}
 
 	async loadPulls() {
