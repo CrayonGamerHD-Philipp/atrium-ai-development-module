@@ -3,7 +3,7 @@
  * Anmelden → Freigabe → Projekt + Auftrag → Angebot (pending) → Annahme → Ereignisse (doppelte seq ignoriert) →
  * Verbrauch → Abschluss mit PR (Auftrag `review`, pull_request); Lease-Ablauf → Job → neu eingeplant;
  * Limit → Wartezeit → zweites Konto übernimmt; Orchestrierung → Teilaufträge mit Abhängigkeiten → Ausliefern;
- * Zyklus im Plan abgelehnt; Konflikt → Konfliktlösung; Rechte; bestehenden PR bearbeiten (`targetPr`, pr-update);
+ * Zyklus im Plan abgelehnt; Konflikt → Konfliktlösung; Rechte; Aktionsvorschläge im Chat (übernehmen/verwerfen, replyTo); bestehenden PR bearbeiten (`targetPr`, pr-update);
  * PR-Sync löscht Branches gemergter `aidev/`-PRs (nur Runner mit `branchCleanup`; keine Forks, nichts Genutztes,
  * unter der Sperre der Branch-Vergabe, mit Rotation); SSE (Projekt, Runner) inkl.
  * RPC über den Stream.
@@ -973,6 +973,182 @@ describe('aidev', () => {
 			branchPushed: true,
 			prNumber: null
 		});
+	});
+
+	it('Aktionsvorschläge: Abschluss speichert sie, Übernehmen/Verwerfen mit Rechten, replyTo', async () => {
+		const other = ok<ProjectDto>(
+			await call('admin', 'POST', '/projects', { name: 'Andere', repo: 'acme/andere' }),
+			201
+		);
+		const foreignProjectTask = ok<TaskDto>(
+			await call('admin', 'POST', `/projects/${other.id}/tasks`, {
+				prompt: 'Anderes Projekt',
+				draft: true
+			}),
+			201
+		);
+		const own = ok<TaskDto>(
+			await call('creator', 'POST', `/projects/${projectId}/tasks`, {
+				prompt: 'Eigener Entwurf',
+				draft: true
+			}),
+			201
+		);
+		const adminDraft = await createTask({ prompt: 'Entwurf der Verwaltung', draft: true });
+		const toCancel = await createTask({ prompt: 'Wird abgebrochen', draft: true });
+
+		const asked = ok<{ task: TaskDto }>(
+			await call('admin', 'POST', `/projects/${projectId}/chat`, {
+				body: 'Was fehlt noch für den Dark Mode?',
+				mode: 'question'
+			}),
+			201
+		);
+		const block = {
+			actions: [
+				{ type: 'create', title: 'Dark Mode', prompt: 'Baue einen Dark Mode', role: 'implement' },
+				{ type: 'update', taskId: own.id, priority: 5 },
+				{ type: 'update', taskId: adminDraft.id, title: 'Neuer Titel' },
+				{ type: 'cancel', taskId: toCancel.id, reason: 'Erledigt sich' },
+				{ type: 'update', taskId: foreignProjectTask.id, priority: 1 },
+				{ type: 'create', title: 'Verworfen', prompt: 'Nicht nötig' },
+				{ type: 'delete', taskId: own.id }
+			]
+		};
+		const answer = 'Es fehlen Farben und ein Umschalter.';
+		const summary = `${answer}\n\n\`\`\`aidev-actions\n${JSON.stringify(block)}\n\`\`\`\n`;
+		const offer = await offerFor(asked.task.id);
+		ok(await call('runner', 'POST', `/runner/runs/${offer.runId}/accept`), 201);
+		ok(await finish(offer.runId, { status: 'succeeded', summary }), 201);
+
+		const chat = ok<ChatMessageDto[]>(await call('admin', 'GET', `/projects/${projectId}/chat`));
+		const agent = chat.find((m) => m.taskId === asked.task.id && m.kind === 'agent')!;
+		expect(agent.body).not.toContain('aidev-actions');
+		expect(agent.body).toContain(answer);
+		expect(agent.body).toContain('Hinweis: 1 ungültiger Vorschlag wurde ignoriert.');
+		expect(agent.actions.map((a) => [a.index, a.action.type, a.state])).toEqual([
+			[0, 'create', 'pending'],
+			[1, 'update', 'pending'],
+			[2, 'update', 'pending'],
+			[3, 'cancel', 'pending'],
+			[4, 'update', 'pending'],
+			[5, 'create', 'pending']
+		]);
+		expect((await task(asked.task.id)).task.resultSummary).toBe(answer);
+		// Nutzernachrichten haben keine Vorschläge
+		expect(chat.find((m) => m.taskId === asked.task.id && m.kind === 'user')!.actions).toEqual([]);
+
+		type Decision = { message: ChatMessageDto; task: TaskDto | null };
+		const decide = (who: string, index: number, decision: 'apply' | 'reject') =>
+			call<Decision>(who, 'POST', `/chat/${agent.id}/actions/${index}`, { decision });
+
+		// Anlegen: neuer Auftrag mit Verlauf und der Antwort als Kontext
+		const created = ok<Decision>(await decide('admin', 0, 'apply'), 201);
+		expect(created.task).toMatchObject({ title: 'Dark Mode', role: 'implement', status: 'queued' });
+		expect(created.message.actions[0]).toMatchObject({
+			state: 'applied',
+			taskId: created.task!.id,
+			error: null
+		});
+		expect(created.message.actions[0]!.decidedBy).toBeTruthy();
+		expect(created.message.actions[0]!.decidedAt).toBeTruthy();
+		const [ctxRow] = await q<{ chat_context: string; prompt: string }>(
+			sql`SELECT chat_context, prompt FROM task WHERE id = ${created.task!.id}`
+		);
+		expect(ctxRow!.prompt).toBe('Baue einen Dark Mode');
+		expect(ctxRow!.chat_context).toContain('Referenced answer (the user refers to this):');
+		expect(ctxRow!.chat_context).toContain('Question: Was fehlt noch für den Dark Mode?');
+		expect(ctxRow!.chat_context).toContain(`Answer: ${answer}`);
+		const after = ok<ChatMessageDto[]>(await call('admin', 'GET', `/projects/${projectId}/chat`));
+		expect(after.find((m) => m.kind === 'system' && m.taskId === created.task!.id)?.body).toBe(
+			'Vorschlag übernommen: Neuer Auftrag „Dark Mode“'
+		);
+
+		// Zweite Entscheidung → 409, unbekannter Index → 409, keine Agent-Nachricht → 404
+		expect((await decide('admin', 0, 'reject')).status).toBe(409);
+		expect((await decide('admin', 99, 'apply')).status).toBe(409);
+		const userMsg = after.find((m) => m.kind === 'user')!;
+		expect(
+			(await call('admin', 'POST', `/chat/${userMsg.id}/actions/0`, { decision: 'apply' })).status
+		).toBe(404);
+		expect(
+			(await call('admin', 'POST', `/chat/${agent.id}/actions/1`, { decision: 'x' })).status
+		).toBe(422);
+		expect(
+			(await call('viewer', 'POST', `/chat/${agent.id}/actions/1`, { decision: 'apply' })).status
+		).toBe(403);
+
+		// Ändern: eigener Auftrag ja, fremder nur mit task.manage → failed, kein 500
+		const updated = ok<Decision>(await decide('creator', 1, 'apply'), 201);
+		expect(updated.message.actions[1]).toMatchObject({ state: 'applied', taskId: own.id });
+		expect((await task(own.id)).task.priority).toBe(5);
+		const denied = ok<Decision>(await decide('creator', 2, 'apply'), 201);
+		expect(denied.message.actions[2]).toMatchObject({ state: 'failed', taskId: adminDraft.id });
+		expect(denied.message.actions[2]!.error).toContain('Fremde Aufträge');
+		expect((await task(adminDraft.id)).task.title).not.toBe('Neuer Titel');
+		expect((await decide('admin', 2, 'apply')).status).toBe(409);
+
+		// Abbrechen
+		const cancelled = ok<Decision>(await decide('admin', 3, 'apply'), 201);
+		expect(cancelled.message.actions[3]).toMatchObject({ state: 'applied', taskId: toCancel.id });
+		expect((await task(toCancel.id)).task.status).toBe('cancelled');
+		const sys = ok<ChatMessageDto[]>(await call('admin', 'GET', `/projects/${projectId}/chat`));
+		expect(sys.find((m) => m.kind === 'system' && m.taskId === toCancel.id)?.body).toBe(
+			'Vorschlag übernommen: Auftrag abbrechen (Erledigt sich)'
+		);
+
+		// Auftrag eines anderen Projekts → failed, nicht verlinkt, unverändert
+		const foreign = ok<Decision>(await decide('admin', 4, 'apply'), 201);
+		expect(foreign.message.actions[4]).toMatchObject({
+			state: 'failed',
+			taskId: null,
+			error: 'Auftrag nicht gefunden'
+		});
+		expect(foreign.task).toBeNull();
+		expect((await task(foreignProjectTask.id)).task.priority).toBe(0);
+
+		// Verwerfen
+		const rejected = ok<Decision>(await decide('admin', 5, 'reject'), 201);
+		expect(rejected.message.actions[5]).toMatchObject({ state: 'rejected', taskId: null });
+		expect(rejected.task).toBeNull();
+		expect((await decide('admin', 5, 'apply')).status).toBe(409);
+
+		// replyTo („Umsetzen“): Frage und Antwort als Kontext; nur Agent-Nachrichten dieses Projekts
+		const impl = ok<{ task: TaskDto }>(
+			await call('admin', 'POST', `/projects/${projectId}/chat`, {
+				body: 'Setze das um',
+				mode: 'task',
+				replyTo: agent.id
+			}),
+			201
+		);
+		const [implRow] = await q<{ chat_context: string }>(
+			sql`SELECT chat_context FROM task WHERE id = ${impl.task.id}`
+		);
+		expect(implRow!.chat_context).toContain('Referenced answer (the user refers to this):');
+		expect(implRow!.chat_context).toContain('Question: Was fehlt noch für den Dark Mode?');
+		expect(implRow!.chat_context).toContain(`Answer: ${answer}`);
+		expect(implRow!.chat_context.length).toBeLessThanOrEqual(12000 + 8000 + 2);
+		expect(
+			(
+				await call('admin', 'POST', `/projects/${projectId}/chat`, {
+					body: 'Setze das um',
+					replyTo: userMsg.id
+				})
+			).status
+		).toBe(404);
+		expect(
+			(
+				await call('admin', 'POST', `/projects/${other.id}/chat`, {
+					body: 'Setze das um',
+					replyTo: agent.id
+				})
+			).status
+		).toBe(404);
+
+		for (const id of [created.task!.id, impl.task.id, own.id, adminDraft.id]) {
+			ok(await call('admin', 'POST', `/tasks/${id}/cancel`), 201);
+		}
 	});
 
 	it('Branch-Auslieferung geht nur an Runner, die den Modus kennen', async () => {
