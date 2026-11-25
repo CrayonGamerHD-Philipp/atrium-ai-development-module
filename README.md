@@ -59,12 +59,14 @@ Ablauf:
 1. Atrium prüft den PR anhand der synchronisierten PR-Liste. Der Auftrag übernimmt den Head-Branch des PR als
    Arbeits-Branch, Basis ist der Haupt-Branch. Die Auslieferung ist `pr-update`.
 2. Der Runner checkt den Head-Branch aus und prüft vor dem Agent-Start, dass der PR offen ist, aus demselben Repo
-   stammt und zu diesem Branch gehört.
+   stammt und zu diesem Branch gehört. Lässt sich der PR nicht laden, bricht der Lauf ab (nur fehlende
+   Inline-Kommentare werden toleriert).
 3. Der Agent bekommt PR-Beschreibung, Reviews, Kommentare und Inline-Kommentare angehängt, als **nicht
    vertrauenswürdigen Kontext** (Zitat, gekürzt). Er behandelt ihn als Daten, nicht als Anweisungen.
 4. Nach dem Agent laufen Commit und **testCmd**. Schlägt der Test fehl, wird nichts gepusht.
 5. Der Runner pusht **ohne Force** auf denselben Branch. Hat jemand parallel gepusht, werden nur die eigenen Commits
-   darauf übernommen. Es entsteht kein neuer PR.
+   darauf übernommen und **testCmd** läuft auf dem kombinierten Stand erneut, erst dann wird gepusht. Es entsteht kein
+   neuer PR.
 6. Die Zusammenfassung landet als Kommentar im PR (mit den neuen Commits und `Aidev-Task: <id>`). Der Auftrag geht auf
    **Prüfung**.
 
@@ -86,7 +88,10 @@ Grenzen:
 - Fehlt der Branch auf dem Remote, bricht der Lauf ab. Er wird nicht neu angelegt.
 
 Mit **Planen & Aufteilen** wird der PR-Branch zum Integrations-Branch: Die Teilaufträge zweigen von ihm ab und werden
-hineingemergt, keiner öffnet einen neuen PR. Die abschließende Auslieferung pusht in den PR.
+hineingemergt, keiner öffnet einen neuen PR. Auch jeder Teilauftrag prüft den PR vorher (offen, kein Fork, passender
+Branch) und legt einen fehlenden PR-Branch nie neu an; solche Teilaufträge gehen nur an Runner mit `prUpdate`. Die
+abschließende Auslieferung pusht in den PR und meldet ihn auch dann als aktualisiert (mit Kommentar), wenn sie selbst
+keinen Commit mehr beiträgt. Ein PR-Sync überträgt Merge oder Schließen auf alle Aufträge desselben PR.
 
 ### Parallelisierung und Modellwahl
 

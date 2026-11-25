@@ -95,7 +95,8 @@ der Runner Aufträge. Konten, deren CLI fehlt oder die nicht angemeldet sind, me
 
 1. **Worktree** `WORK_DIR/wt/<runId>` aus dem Bare-Cache `WORK_DIR/cache/<owner>/<repo>.git` (vorher `fetch --prune`):
    existiert `origin/<branch>`, wird darauf fortgesetzt; sonst neuer Branch von `origin/<baseRef>`. Fehlt die Basis
-   (Integrations-Branch beim ersten Teilauftrag), wird sie aus dem Haupt-Branch angelegt und gepusht.
+   (Integrations-Branch beim ersten Teilauftrag), wird sie aus dem Haupt-Branch angelegt und gepusht – außer beim
+   Head-Branch eines PR (`pr-update`, `integrate` mit `pullNumber`): dann bricht der Lauf ab.
 2. **setupCmd** in der Shell im Worktree (Ausgabe als Ereignisse; Fehlschlag → `setup`).
 3. **Agent** mit Auftrag, Systemanweisung, Modell, ggf. Fortsetzung der Sitzung. Limit erkannt → `/limit`, Abbruch,
    `limited`. Zeitlimit → `timeout`. Abbruch durch Atrium → `cancelled`.
@@ -104,7 +105,8 @@ der Runner Aufträge. Konten, deren CLI fehlt oder die nicht angemeldet sind, me
 5. **Schreibend**: offene Änderungen committen (Trailer `Aidev-Task: <id>`), **testCmd** (Fehlschlag → nichts
    pushen), dann Auslieferung: `pr` (Push + `gh pr create`, optional Auto-Merge), `direct` (Rebase + Push auf den
    Haupt-Branch, bis zu 3 Versuche), `integrate` (Merge `--no-ff` in den Integrations-Branch, bis zu 3 Versuche),
-   `pr-update` (Push ohne Force auf den Head-Branch eines bestehenden PR, Zusammenfassung als PR-Kommentar) oder
+   `pr-update` (Push ohne Force auf den Head-Branch eines bestehenden PR, nach einem Rebase auf parallel gepushte
+   Commits erneut **testCmd**, Zusammenfassung als PR-Kommentar) oder
    `none`. Konflikte → `conflict` mit Dateiliste.
 
 Worktrees bleiben nach dem Lauf erhalten (Editor/Terminal „Lauf“), aufgeräumt wird beim Start und stündlich
