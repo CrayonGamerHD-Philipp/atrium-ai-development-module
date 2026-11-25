@@ -2,7 +2,7 @@
  * Git-Ablauf end-to-end: lokales Bare-Remote, Fake-Agent, gh-Shim, Mini-Atrium. Prüft Auslieferung pr/direct/
  * integrate/pr-update inkl. Konflikten sowie Nur-Lese-Läufe, Tests, Setup, Limits, Abbruch und Zeitlimit.
  */
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { chmodSync, existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -597,6 +597,139 @@ describe('Sonderfälle', () => {
 		const removed = await workspace.cleanup(new Set(), Date.now() + 49 * 3_600_000);
 		expect(removed).toBe(n);
 		expect(readFileSync).toBeDefined();
+	});
+});
+
+describe('Anhänge', () => {
+	const png = Buffer.from('89504e470d0a1a0a0000000d49484452', 'hex');
+	const txt = Buffer.from('Fehlerprotokoll\nZeile 2\n', 'utf8');
+
+	/** Anhänge im Mini-Atrium bereitstellen; liefert die Metadaten für das Angebot */
+	function attach(...files: { name: string; bytes: Buffer; mime?: string }[]): NonNullable<RunOffer['attachments']> {
+		return files.map((f) => {
+			const id = randomUUID();
+			atrium.attachments.set(id, f.bytes);
+			return {
+				id,
+				name: f.name,
+				mime: f.mime ?? 'application/octet-stream',
+				size: f.bytes.length,
+				sha256: createHash('sha256').update(f.bytes).digest('hex')
+			};
+		});
+	}
+	const wtOf = (o: RunOffer) => path.join(env.workDir, 'wt', o.runId);
+
+	/** Anhänge liegen im Worktree, sind ignoriert und in keinem Commit des Laufs enthalten */
+	function expectNotCommitted(o: RunOffer, fin: FinishInput, ref: string): void {
+		const wt = wtOf(o);
+		expect(readFileSync(path.join(wt, '.aidev', 'attachments', 'bild.png'))).toEqual(png);
+		expect(git(wt, 'status', '--porcelain', '--untracked-files=all')).toBe('');
+		expect(git(wt, 'check-ignore', '.aidev/attachments/bild.png')).toBe('.aidev/attachments/bild.png');
+		for (const c of fin.commits) expect(c.files.some((f) => f.startsWith('.aidev/'))).toBe(false);
+		expect(git(remote.bare, 'ls-tree', '-r', '--name-only', ref).split('\n').some((f) => f.startsWith('.aidev'))).toBe(false);
+	}
+
+	it('pr: legt Anhänge ab, ergänzt den Prompt-Hinweis und committet sie nicht', async () => {
+		const attachments = attach({ name: 'bild.png', bytes: png, mime: 'image/png' }, { name: '../../log.txt', bytes: txt });
+		const o = offer({ prompt: 'Siehe Anhang', attachments });
+		const fin = await runOffer(o);
+		expect(fin.status).toBe('succeeded');
+		expectNotCommitted(o, fin, o.branch);
+		// Pfad-Traversal entschärft: nur der Dateiname im Ablageordner
+		expect(readFileSync(path.join(wtOf(o), '.aidev', 'attachments', 'log.txt'))).toEqual(txt);
+		const written = remote.read(o.branch, 'AIDEV_FAKE.md') ?? '';
+		expect(written).toContain('## Anhänge');
+		expect(written).toContain('`.aidev/attachments/bild.png` (image/png, 16 B)');
+		expect(written).toContain('`.aidev/attachments/log.txt`');
+		// Exclude im gemeinsamen git-dir (Cache), nicht im Worktree
+		const exclude = path.resolve(wtOf(o), git(wtOf(o), 'rev-parse', '--git-path', 'info/exclude'));
+		expect(exclude.startsWith(path.join(env.workDir, 'cache'))).toBe(true);
+		expect(readFileSync(exclude, 'utf8').split('\n').filter((l) => l === '/.aidev/')).toHaveLength(1);
+		const status = eventsOf(o.runId).map((e) => e.payload.text);
+		expect(status).toContain('Anhänge werden geladen (2)');
+	});
+
+	it('kein doppelter Hinweis, wenn das Backend ihn schon liefert; Agent committet selbst mit git add -A', async () => {
+		const attachments = attach({ name: 'bild.png', bytes: png, mime: 'image/png' });
+		const o = offer({ prompt: 'Siehe .aidev/attachments/bild.png [fake:commit]', attachments });
+		const fin = await runOffer(o);
+		expect(fin.status).toBe('succeeded');
+		expect(fin.commits.map((c) => c.message)).toEqual(['Fake-Agent: eigener Commit']);
+		expectNotCommitted(o, fin, o.branch);
+		expect(remote.read(o.branch, 'AIDEV_FAKE.md')).not.toContain('## Anhänge');
+	});
+
+	it('branch, direct und integrate: Anhänge werden nicht ausgeliefert', async () => {
+		const b = offer({ delivery: { mode: 'branch' }, attachments: attach({ name: 'bild.png', bytes: png }) });
+		expectNotCommitted(b, await runOffer(b), b.branch);
+
+		const d = offer({ delivery: { mode: 'direct' }, prompt: 'Direkt mit Anhang', attachments: attach({ name: 'bild.png', bytes: png }) });
+		const finD = await runOffer(d);
+		expect(finD.status).toBe('succeeded');
+		expectNotCommitted(d, finD, 'main');
+
+		const parent = `aidev/${randomUUID().slice(0, 8)}-anhang`;
+		const i = offer({
+			branch: `${parent.replace('-anhang', '')}/1-teil`,
+			baseRef: parent,
+			delivery: { mode: 'integrate', integrationBranch: parent },
+			attachments: attach({ name: 'bild.png', bytes: png })
+		});
+		const finI = await runOffer(i);
+		expect(finI.status).toBe('succeeded');
+		expectNotCommitted(i, finI, parent);
+	});
+
+	it('pr-update: Anhänge werden nicht in den PR-Branch gepusht', async () => {
+		const branch = `aidev/${randomUUID().slice(0, 8)}-pr`;
+		remote.commitFile(branch, 'PR.md', 'vom PR\n', 'Vorhandener PR-Commit');
+		const pr = env.addGhPr({ repo: 'acme/shop', head: branch });
+		const o = offer({
+			branch,
+			prompt: 'PR mit Anhang bearbeiten',
+			delivery: { mode: 'pr-update', number: pr.number },
+			attachments: attach({ name: 'bild.png', bytes: png })
+		});
+		const fin = await runOffer(o);
+		expect(fin.status).toBe('succeeded');
+		expectNotCommitted(o, fin, branch);
+	});
+
+	it('Nur-Lese-Lauf: Anhänge sind lesbar, nichts wird committet', async () => {
+		const o = offer({ role: 'research', readOnly: true, delivery: { mode: 'branch' }, attachments: attach({ name: 'bild.png', bytes: png }) });
+		const fin = await runOffer(o);
+		expect(fin.status).toBe('succeeded');
+		expect(existsSync(path.join(wtOf(o), '.aidev', 'attachments', 'bild.png'))).toBe(true);
+	});
+
+	it('vorübergehender Fehler beim Laden wird wiederholt', async () => {
+		atrium.failAttachments = 1;
+		const o = offer({ attachments: attach({ name: 'bild.png', bytes: png }) });
+		const fin = await runOffer(o);
+		expect(fin.status).toBe('succeeded');
+		expect(atrium.byPath(new RegExp(`/runs/${o.runId}/attachments/`))).toHaveLength(2);
+	});
+
+	it('fehlender Anhang → failed setup mit verständlicher Meldung, Agent startet nicht', async () => {
+		const [a] = attach({ name: 'fehlt.png', bytes: png });
+		atrium.attachments.delete(a!.id);
+		const o = offer({ attachments: [a!] });
+		const fin = await runOffer(o);
+		expect(fin).toMatchObject({ status: 'failed', errorKind: 'setup', pr: null });
+		expect(fin.errorMessage).toContain('Anhänge konnten nicht geladen werden');
+		expect(fin.errorMessage).toContain('„fehlt.png“');
+		expect(fin.errorMessage).toContain('404');
+		expect(remote.sha(o.branch)).toBeNull();
+		expect(eventsOf(o.runId).some((e) => (e.payload.text ?? '').startsWith('Agent startet'))).toBe(false);
+	});
+
+	it('falsche Prüfsumme → failed setup', async () => {
+		const [a] = attach({ name: 'bild.png', bytes: png });
+		const o = offer({ attachments: [{ ...a!, sha256: 'a'.repeat(64) }] });
+		const fin = await runOffer(o);
+		expect(fin).toMatchObject({ status: 'failed', errorKind: 'setup' });
+		expect(fin.errorMessage).toContain('Prüfsumme');
 	});
 });
 

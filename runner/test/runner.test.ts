@@ -99,7 +99,7 @@ describe('Runner', () => {
 			protocol: 1,
 			name: 'test-runner',
 			maxSlots: 2,
-			capabilities: { git: true, gh: true, limitReport: true },
+			capabilities: { git: true, gh: true, limitReport: true, attachments: true },
 			accounts: [{ key: 'fake-1', provider: 'fake', loggedIn: true, models: ['fake-large'] }],
 			// frisch gestartet: keine laufenden Läufe → Atrium gibt verwaiste sofort frei
 			runIds: []
