@@ -164,6 +164,19 @@ describe('Auslieferung', () => {
 		expect(existsSync(path.join(env.workDir, 'wt', first.runId))).toBe(true);
 	});
 
+	it('branch: bestehende Integrationsänderungen ohne PR bereitstellen', async () => {
+		const first = offer({ delivery: { mode: 'branch' }, prompt: 'Branch-Inhalt' });
+		const mainBefore = remote.sha('main');
+		const fin = await runOffer(first);
+		expect(fin).toMatchObject({ status: 'succeeded', branchPushed: true, pr: null, merged: false });
+		expect(remote.read(first.branch, 'AIDEV_FAKE.md')).toContain('Branch-Inhalt');
+		expect(remote.sha('main')).toBe(mainBefore);
+		expect(env.ghPrs().filter((p) => p.head === first.branch)).toHaveLength(0);
+		const again = offer({ taskId: first.taskId, branch: first.branch, delivery: { mode: 'branch' }, prompt: '[fake:noop]' });
+		const resumed = await runOffer(again);
+		expect(resumed).toMatchObject({ status: 'succeeded', branchPushed: true, pr: null });
+	});
+
 	it('direct: rebase und Push auf main', async () => {
 		const o = offer({ delivery: { mode: 'direct' }, prompt: 'Direkt ändern' });
 		const before = remote.sha('main');
@@ -210,6 +223,14 @@ describe('Auslieferung', () => {
 		expect(remote.log(parent)[0]).toContain(`Merge ${a.branch} in ${parent}`);
 		expect(remote.sha(a.branch)).not.toBeNull();
 
+		// Der abschließende Lauf liefert auch ohne eigene Commits den Integrations-Branch aus.
+		const mainBefore = remote.sha('main');
+		const delivery = offer({ branch: parent, baseRef: 'main', prompt: '[fake:noop]', delivery: { mode: 'branch' } });
+		const delivered = await runOffer(delivery);
+		expect(delivered).toMatchObject({ status: 'succeeded', branchPushed: true, pr: null });
+		expect(remote.sha('main')).toBe(mainBefore);
+		expect(env.ghPrs().filter((p) => p.head === parent)).toHaveLength(0);
+
 		// Teil B startet von `old` (ohne die Datei) → add/add-Konflikt beim Mergen
 		const b = offer({
 			branch: `aidev/${short}/2-b`,
@@ -245,12 +266,13 @@ describe('Sonderfälle', () => {
 	});
 
 	it('keine Änderungen → succeeded ohne PR', async () => {
-		const o = offer({ prompt: 'Nichts tun [fake:noop]' });
+		const o = offer({ prompt: 'Nichts tun [fake:noop]', delivery: { mode: 'branch' } });
 		const fin = await runOffer(o);
 		expect(fin.status).toBe('succeeded');
 		expect(fin.pr).toBeNull();
 		expect(fin.commits).toEqual([]);
 		expect(fin.summary).toContain('Keine Änderungen');
+		expect(fin.branchPushed).toBe(false);
 		expect(remote.sha(o.branch)).toBeNull();
 	});
 

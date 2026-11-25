@@ -26,6 +26,9 @@ export const COMMIT_POLICIES = ['pr', 'pr-automerge', 'direct'] as const;
 export const commitPolicySchema = z.enum(COMMIT_POLICIES);
 export type CommitPolicy = z.infer<typeof commitPolicySchema>;
 
+export const taskDeliverySchema = z.enum(['project', 'branch']);
+export type TaskDelivery = z.infer<typeof taskDeliverySchema>;
+
 const id = z.string().uuid();
 const shortText = (max: number) => z.string().max(max);
 
@@ -99,6 +102,8 @@ export const deliverySchema = z.discriminatedUnion('mode', [
 	}),
 	/** Direkt auf den Haupt-Branch (rebase + push, wenige Wiederholungen) */
 	z.object({ mode: z.literal('direct') }),
+	/** Eigenen Branch pushen, ohne PR oder Push auf den Haupt-Branch */
+	z.object({ mode: z.literal('branch') }),
 	/** Teilauftrag: eigenen Branch in den Integrations-Branch des Elternauftrags mergen und pushen */
 	z.object({ mode: z.literal('integrate'), integrationBranch: shortText(200) })
 ]);
@@ -322,6 +327,8 @@ export const finishInput = z.object({
 		.default(null),
 	/** Direkt gepusht (`direct`) bzw. sofort gemergt */
 	merged: z.boolean().default(false),
+	/** Der Ergebnis-Branch wurde erfolgreich gepusht. */
+	branchPushed: z.boolean().default(false),
 	/** Letzte Antwort des Agents (Zusammenfassung, bei Recherche das Ergebnis) */
 	summary: shortText(40_000).nullable().default(null),
 	/** Nur bei `expectPlan`: geparster Plan (Atrium prüft erneut gegen `planSchema`) */

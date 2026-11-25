@@ -420,11 +420,17 @@ async function succeed(
 		const original = await getTask(tx, String(task.parent_id), true);
 		await transition(tx, fx, String(task.id), 'done', { error: null, summary });
 		if (original && original.status === 'blocked') {
+			await tx.execute(
+				sql`UPDATE task SET branch_pushed = ${input.branchPushed}, branch = COALESCE(${input.branch}, branch) WHERE id = ${original.id}`
+			);
 			await markDelivered(tx, original);
 			await applyOutcome(tx, fx, original, { pr, summary: null });
 		}
 		return;
 	}
+	await tx.execute(
+		sql`UPDATE task SET branch_pushed = ${input.branchPushed} WHERE id = ${task.id}`
+	);
 	await markDelivered(tx, task);
 	await applyOutcome(tx, fx, task, { pr, summary });
 }

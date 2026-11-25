@@ -1,5 +1,6 @@
 <script lang="ts">
-	// Projekt-Chat: Verlauf (neueste unten), Eingabe als Auftrag oder Notiz, Agent-Nachrichten verlinken den Auftrag
+	// Projekt-Chat: Verlauf (neueste unten, Nachrichten als Markdown), Eingabe als Auftrag oder Notiz, Agent-Nachrichten
+	// verlinken den Auftrag
 	import { onMount, tick } from 'svelte';
 	import { toast } from 'svelte-sonner';
 	import Bot from '@lucide/svelte/icons/bot';
@@ -18,6 +19,7 @@
 	import { postChat, taskPath } from '../api';
 	import { errMsg, taskTitle } from '../format';
 	import { has, PERM } from '../perms';
+	import Markdown from '../components/Markdown.svelte';
 	import TimeAgo from '../components/TimeAgo.svelte';
 	import StatusBadge from '../components/StatusBadge.svelte';
 	import type { ProjectStore } from './store.svelte';
@@ -30,11 +32,16 @@
 	let mode = $state<'task' | 'note'>('task');
 	let role = $state<Role>('implement');
 	let decompose = $state(false);
+	let delivery = $state<'project' | 'branch'>('project');
 	let providerHint = $state<Provider | null>(null);
 	let busy = $state(false);
 	let scroller = $state<HTMLElement | null>(null);
 	let stick = true;
 
+	const deliveryOptions = [
+		{ value: 'project', label: 'Projektvorgabe' },
+		{ value: 'branch', label: 'Branch bereitstellen (ohne PR)' }
+	];
 	const roleOptions = ROLES.filter((r) => r !== 'orchestrate').map((r) => ({
 		value: r,
 		label: ROLE_LABELS[r]
@@ -80,6 +87,7 @@
 			const res = await postChat(store.id, {
 				body: text,
 				mode,
+				delivery,
 				role,
 				decompose: mode === 'task' && decompose,
 				providerHint: mode === 'task' ? providerHint : null
@@ -194,7 +202,7 @@
 								>
 								<TimeAgo value={m.createdAt} />
 							</div>
-							<p class="text-sm break-words whitespace-pre-wrap">{m.body}</p>
+							<Markdown text={m.body} />
 							{#if m.taskId}
 								<a
 									href={taskPath(store.id, m.taskId)}
@@ -221,8 +229,8 @@
 				rows={2}
 				maxlength={20000}
 				placeholder={mode === 'task'
-					? 'Was soll gebaut werden? (Strg+Enter sendet)'
-					: 'Notiz für den Verlauf (Strg+Enter sendet)'}
+					? 'Was soll gebaut werden? Markdown möglich (Strg+Enter sendet)'
+					: 'Notiz für den Verlauf, Markdown möglich (Strg+Enter sendet)'}
 				{onkeydown}
 				disabled={busy}
 				class="max-h-48 min-h-14 resize-y"
@@ -253,6 +261,15 @@
 						class="w-36"
 						disabled={busy || decompose}
 					/>
+					<SelectField
+						label="Auslieferung"
+						options={deliveryOptions}
+						value={delivery}
+						onchange={(v) => v && (delivery = v as 'project' | 'branch')}
+						size="sm"
+						class="w-64"
+						disabled={busy}
+					/>
 					<label class="inline-flex items-center gap-2 text-sm">
 						<Switch bind:checked={decompose} size="sm" disabled={busy} />
 						Planen & aufteilen
@@ -273,6 +290,10 @@
 					{busy ? BUSY_SEND : 'Senden'}
 				</Button>
 			</div>
+			{#if mode === 'task'}<p class="text-xs text-muted-foreground">
+					Branch bereitstellen pusht einen eigenen Branch ohne PR; der Hauptbranch bleibt
+					unverändert. Leseaufträge liefern keine Änderungen aus.
+				</p>{/if}
 		</form>
 	{:else}
 		<p class="border-t p-3 text-center text-xs text-muted-foreground">

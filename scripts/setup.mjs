@@ -32,8 +32,11 @@ if (!existsSync(join(CORE, 'package.json'))) {
 
 const corePkg = JSON.parse(readFileSync(join(CORE, 'package.json'), 'utf8'));
 console.log(`== Core ${corePkg.name}@${corePkg.version}: Abhängigkeiten`);
-if (!existsSync(join(CORE, 'node_modules')) || process.argv.includes('--force'))
-	run(npm, ['ci'], CORE);
+// `--include=dev`: Check, Lint, Tests und Build brauchen die Dev-Abhängigkeiten des Core – auch wenn die Umgebung
+// `NODE_ENV=production` setzt (npm ließe sie sonst stillschweigend weg). Fehlt ein Dev-Werkzeug (Vitest) in einer
+// bestehenden Installation, wird ebenfalls neu installiert.
+if (!existsSync(join(CORE, 'node_modules', 'vitest')) || process.argv.includes('--force'))
+	run(npm, ['ci', '--include=dev'], CORE);
 
 console.log('== node_modules → .core/node_modules');
 const link = join(ROOT, 'node_modules');
