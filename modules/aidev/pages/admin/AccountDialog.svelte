@@ -98,7 +98,12 @@
 				{providerLabel(account.provider)} · {account.key} auf {account.runnerName}
 			</Dialog.Description>
 		</Dialog.Header>
-		<form id="account-edit" class="grid gap-4 sm:grid-cols-2" onsubmit={save} novalidate>
+		<form
+			id="account-edit"
+			class="grid grid-cols-1 gap-4 sm:grid-cols-2"
+			onsubmit={save}
+			novalidate
+		>
 			<div class="sm:col-span-2">
 				<FormField
 					label="Bezeichnung"
@@ -115,7 +120,9 @@
 					/>
 				</FormField>
 			</div>
-			<div class="flex items-center justify-between gap-3 rounded-lg border p-3 sm:col-span-2">
+			<div
+				class="flex min-w-0 items-center justify-between gap-3 rounded-lg border p-3 sm:col-span-2"
+			>
 				<div>
 					<label for="acc-enabled" class="text-sm font-medium">Aktiv</label>
 					<p class="text-xs text-muted-foreground">
@@ -199,7 +206,13 @@
 				hint="Beginn der Abo-Woche (leer = rollierend 7 Tage)"
 				error={errors.weekAnchor}
 			>
-				<Input id="acc-anchor" type="datetime-local" bind:value={weekAnchor} disabled={busy} />
+				<Input
+					id="acc-anchor"
+					type="datetime-local"
+					bind:value={weekAnchor}
+					disabled={busy}
+					class="w-full min-w-0"
+				/>
 			</FormField>
 			<FormField label="Standardmodell" id="acc-model" error={errors.defaultModel}>
 				<SelectField
