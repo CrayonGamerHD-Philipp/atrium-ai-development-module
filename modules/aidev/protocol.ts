@@ -89,6 +89,8 @@ export const registerInput = z.object({
 	maxSlots: z.number().int().min(0).max(64),
 	capabilities: z.object({
 		question: z.boolean().optional(),
+		/** Kann Anhänge für einen Lauf herunterladen und bereitstellen */
+		attachments: z.boolean().optional(),
 		/** Versteht `delivery.mode = 'branch'` (ältere Runner verwerfen solche Angebote) */
 		branchDelivery: z.boolean().optional(),
 		/** Versteht `delivery.mode = 'pr-update'` (ältere Runner verwerfen solche Angebote) */
@@ -189,6 +191,20 @@ export const deliverySchema = z.discriminatedUnion('mode', [
 ]);
 export type Delivery = z.infer<typeof deliverySchema>;
 
+/** Metadaten eines Anhangs; die Bytes werden für den Lauf binär heruntergeladen. */
+export const attachmentOfferSchema = z.object({
+	id,
+	name: z.string().min(1).max(120),
+	mime: z.string().min(1),
+	size: z
+		.number()
+		.int()
+		.positive()
+		.max(10 * 1024 * 1024),
+	sha256: z.string().regex(/^[0-9a-f]{64}$/)
+});
+export type AttachmentOffer = z.infer<typeof attachmentOfferSchema>;
+
 export const runOfferSchema = z.object({
 	runId: id,
 	taskId: id,
@@ -219,6 +235,8 @@ export const runOfferSchema = z.object({
 	/** Orchestrierung: Agent muss einen Plan als JSON (`planSchema`) ausgeben */
 	expectPlan: z.boolean(),
 	resumeSessionId: shortText(200).nullable(),
+	/** Anhänge dieses Laufs; ältere Angebote enthalten das Feld nicht. */
+	attachments: z.array(attachmentOfferSchema).max(10).optional(),
 	delivery: deliverySchema,
 	leaseSec: z.number().int(),
 	/** Harte Obergrenze für die Laufzeit des Agent-Prozesses */
