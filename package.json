@@ -1,7 +1,7 @@
 {
 	"name": "atrium-ai-development-module",
 	"private": true,
-	"version": "0.1.0",
+	"version": "0.2.0",
 	"description": "Kalypzo-Atrium-Modul „KI-Entwicklung“ (aidev): Vibe-Coding im Browser mit Claude Code, Codex, Gemini und OpenAI-kompatiblen Agents auf eigenen Runnern",
 	"type": "module",
 	"scripts": {
