@@ -232,7 +232,7 @@ export interface CodexStartExtras {
 }
 
 export function codexArgs(o: StartOptions, extra: CodexStartExtras): string[] {
-	const common = ['--json', '--dangerously-bypass-approvals-and-sandbox', '--skip-git-repo-check'];
+	const common = ['--json', ...(o.question ? ['--sandbox', 'read-only'] : ['--dangerously-bypass-approvals-and-sandbox']), '--skip-git-repo-check'];
 	if (extra.model) common.push('-m', extra.model);
 	if (o.account.reasoningEffort) common.push('-c', `model_reasoning_effort=${tomlString(o.account.reasoningEffort)}`);
 	for (const c of extra.configArgs) common.push('-c', c);
