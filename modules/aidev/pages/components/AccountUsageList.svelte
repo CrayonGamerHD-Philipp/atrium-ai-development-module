@@ -4,7 +4,7 @@
 	import ChevronRight from '@lucide/svelte/icons/chevron-right';
 	import Clock from '@lucide/svelte/icons/clock';
 	import type { AccountDto } from '../../schemas';
-	import { absolute, clock } from '../format';
+	import { absolute, dayClock } from '../format';
 	import AccountLimits from './AccountLimits.svelte';
 	import ProviderBadge from './ProviderBadge.svelte';
 	import UsageBar from './UsageBar.svelte';
@@ -81,7 +81,7 @@
 						title={`${a.cooldownReason ?? 'Limit erreicht'} – bis ${absolute(a.cooldownUntil)}`}
 					>
 						<Clock class="size-3.5" aria-hidden="true" />
-						Pause bis {clock(a.cooldownUntil)}
+						Pause bis {dayClock(a.cooldownUntil, now)}
 					</span>
 				{/if}
 			</div>

@@ -1,10 +1,10 @@
 <script lang="ts">
 	// Limit-Analyse je Konto: echte Auslastung der Anbieter-Fenster (5 h, Woche …) mit eigener Schätzung als Marker,
-	// Reset-/Erschöpfungszeit, Status (Text + Farbe), Stand/Quelle und optional der Budgetvorschlag
+	// Reset-/Erschöpfungszeitpunkt mit Tag (z. B. „morgen um 09:00“), Status (Text + Farbe), Stand/Quelle und optional der Budgetvorschlag
 	import TriangleAlert from '@lucide/svelte/icons/triangle-alert';
 	import { cn } from '$lib/utils';
 	import type { AccountLimitsDto, AccountLimitWindowDto } from '../../schemas';
-	import { absolute, clock, units } from '../format';
+	import { absolute, atDayClock, units } from '../format';
 	import TimeAgo from './TimeAgo.svelte';
 
 	let {
@@ -142,11 +142,11 @@
 								</span>
 							{/if}
 							{#if v.w.resetsAt}
-								<span title={absolute(v.w.resetsAt)}>zurückgesetzt um {clock(v.w.resetsAt)}</span>
+								<span title={absolute(v.w.resetsAt)}>zurückgesetzt {atDayClock(v.w.resetsAt)}</span>
 							{/if}
 							{#if v.w.exhaustsAt}
 								<span class="text-warning" title={absolute(v.w.exhaustsAt)}>
-									voraussichtlich erschöpft um {clock(v.w.exhaustsAt)}
+									voraussichtlich erschöpft {atDayClock(v.w.exhaustsAt)}
 								</span>
 							{/if}
 						</div>
