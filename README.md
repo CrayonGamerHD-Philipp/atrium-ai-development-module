@@ -161,13 +161,18 @@ dafür klar geeignet ist; sonst gilt die Verteilung.
 ### Aufträge neu starten
 
 Fehlgeschlagene, abgebrochene, wartende (Rückfrage) und erledigte Aufträge (auch im Review) startest du auf der
-Auftragsseite mit **Neu starten** neu. Das geht auch für eingeplante (**Wartet**) und blockierte Aufträge, etwa wenn
-sie hängen; ein hängender Lauf des Auftrags wird dabei abgebrochen. Nach einer Bestätigung wird der Auftrag mit
+Auftragsseite mit **Neu starten** neu. Das geht auch für eingeplante (**Wartet**), blockierte und laufende Aufträge,
+etwa wenn sie hängen; ein hängender Lauf des Auftrags wird dabei abgebrochen. Nach einer Bestätigung wird der Auftrag mit
 zurückgesetzten Versuchen neu eingeplant; bei erledigten Aufträgen arbeitet der Agent erneut auf dem bestehenden Branch.
 Bei Orchestrierungen werden
 standardmäßig nur fehlgeschlagene und abgebrochene Teilaufträge neu gestartet, mit **Auch erledigte Teilaufträge neu
 starten** zusätzlich die erledigten. Einzelne Teilaufträge startest du im Reiter **Teilaufträge** über das Symbol in
 ihrer Zeile neu. Der übergeordnete Auftrag wartet dann wieder auf seine Teilaufträge.
+
+Verliert ein Lauf die Verbindung zum Runner (Lease abgelaufen, Runner-Neustart), startet Atrium den Auftrag
+**automatisch neu**. Der Lauf erscheint im Reiter **Verlauf** als **Verbindung verloren** und zählt nicht als Versuch.
+Der Auftrag wird wieder eingeplant und wechselt dabei bevorzugt auf einen anderen Agenten. Erst nach 20
+aufeinanderfolgenden Verbindungsverlusten gilt der Auftrag als **Fehlgeschlagen**.
 
 ### Limit-Analyse
 
