@@ -1,5 +1,6 @@
 # CI des Module-Repos: Modul `aidev` gegen den gepinnten Core (.core = Submodul auf festem Tag) – Pflicht.
 # Zusätzlich gegen den aktuellen Core-Stand (`main`) als Warnung (continue-on-error). Runner als eigener Job.
+# Wird auch von `release-runner.yml` aufgerufen (workflow_call).
 name: CI
 
 on:
@@ -7,6 +8,8 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  # Release-Pipeline des Runners (release-runner.yml) baut nur, wenn diese Prüfungen grün sind
+  workflow_call:
 
 permissions:
   contents: read

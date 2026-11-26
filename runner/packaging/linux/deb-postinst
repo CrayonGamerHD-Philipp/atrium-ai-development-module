@@ -1,0 +1,6 @@
+#!/bin/sh
+# .deb: Programm liegt unter /opt/atrium-runner. Der Autostart ist pro Benutzer (systemd-User-Unit).
+set -e
+ln -sf /opt/atrium-runner/atrium-runner /usr/bin/atrium-runner
+echo "Atrium-Runner installiert. Als normaler Benutzer einrichten: atrium-runner install"
+exit 0

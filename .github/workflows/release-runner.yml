@@ -1,0 +1,329 @@
+# Release des Runners als eigenständige Programme (ohne vorinstalliertes Node) für Windows, macOS und Linux.
+#
+# Auslöser: Tag `runner-v*` (z. B. `runner-v0.4.0`, `runner-v0.5.0-beta.1` → Pre-Release) oder manuell
+# (`workflow_dispatch`, optional mit Veröffentlichung). Gebaut wird nur, wenn CI (Lint, Typen, Tests von Modul und
+# Runner) grün ist und das Tag zur Version in `runner/package.json` bzw. `modules/aidev/runner-release.ts` passt.
+#
+# Technik: Node SEA (Single Executable Application) – die Node-Laufzeit des Build-Rechners plus das gebündelte
+# Runner-Skript; `node-pty` wird auf jedem nativen Runner gebaut und neben das Programm gelegt (kein Cross-Compile).
+#
+# Signierung (optional, ohne Secrets wird unsigniert gebaut):
+#   Windows Authenticode: WINDOWS_CERT_PFX_BASE64, WINDOWS_CERT_PASSWORD
+#   macOS Developer ID:   MACOS_CERT_P12_BASE64, MACOS_CERT_PASSWORD, MACOS_SIGN_IDENTITY (Application),
+#                         MACOS_INSTALLER_IDENTITY (Installer, für .pkg)
+#   macOS Notarisierung:  APPLE_ID, APPLE_TEAM_ID, APPLE_APP_PASSWORD (app-spezifisches Passwort)
+name: Release Runner
+
+on:
+  push:
+    tags: ['runner-v*']
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 'GitHub Release erstellen (sonst nur Artefakte)'
+        type: boolean
+        default: false
+      docker:
+        description: 'Docker-Image nach GHCR veröffentlichen'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-runner-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  NODE_VERSION: '24'
+
+jobs:
+  ci:
+    name: CI (Lint, Typen, Tests)
+    uses: ./.github/workflows/ci.yml
+    secrets: inherit
+
+  version:
+    name: Version prüfen
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      tag: ${{ steps.v.outputs.tag }}
+      prerelease: ${{ steps.v.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - id: v
+        name: Tag ↔ runner/package.json ↔ runner-release.ts
+        run: node runner/scripts/release-version.mjs "${{ github.ref_type == 'tag' && github.ref_name || '' }}"
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: [ci, version]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    continue-on-error: ${{ matrix.optional }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: linux-x64, os: ubuntu-24.04, optional: false }
+          - { target: linux-arm64, os: ubuntu-24.04-arm, optional: false }
+          - { target: macos-arm64, os: macos-15, optional: false }
+          - { target: macos-x64, os: macos-15-intel, optional: false }
+          - { target: windows-x64, os: windows-2025, optional: false }
+          - { target: windows-arm64, os: windows-11-arm, optional: true }
+    defaults:
+      run:
+        shell: bash
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      NAME: atrium-runner-${{ needs.version.outputs.version }}-${{ matrix.target }}
+      # nur „ist gesetzt“ – die Werte selbst bekommen ausschließlich die Schritte, die sie brauchen
+      HAS_MAC_CERT: ${{ secrets.MACOS_CERT_P12_BASE64 != '' && secrets.MACOS_SIGN_IDENTITY != '' }}
+      HAS_MAC_INSTALLER: ${{ secrets.MACOS_INSTALLER_IDENTITY != '' }}
+      HAS_NOTARY: ${{ secrets.APPLE_ID != '' && secrets.APPLE_TEAM_ID != '' && secrets.APPLE_APP_PASSWORD != '' }}
+      HAS_WIN_CERT: ${{ secrets.WINDOWS_CERT_PFX_BASE64 != '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: Linux – Build-Werkzeuge für node-pty
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends python3 make g++
+      - name: Abhängigkeiten (node-pty nativ für diese Plattform)
+        working-directory: runner
+        run: npm ci --include=dev --no-audit --no-fund
+      - name: node-pty prüfen
+        working-directory: runner
+        run: node -e "require('node-pty'); console.log('node-pty ok')"
+      - name: Einzel-Binary bauen (Node SEA)
+        working-directory: runner
+        run: node scripts/build-sea.mjs --out release
+
+      # ------------------------------------------------------------ Signieren (optional)
+      - name: macOS – Zertifikat importieren
+        if: runner.os == 'macOS' && env.HAS_MAC_CERT == 'true'
+        env:
+          MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/aidev.keychain-db"
+          KEYCHAIN_PW=$(openssl rand -hex 16)
+          echo "::add-mask::$KEYCHAIN_PW"
+          echo "$MACOS_CERT_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/cert.p12" -P "$MACOS_CERT_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PW" "$KEYCHAIN" > /dev/null
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          rm -f "$RUNNER_TEMP/cert.p12"
+      - name: macOS – mit Developer ID signieren (Hardened Runtime)
+        if: runner.os == 'macOS' && env.HAS_MAC_CERT == 'true'
+        env:
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+        run: |
+          DIR="runner/release/$NAME"
+          [ -d "$DIR/node_modules" ] && find "$DIR/node_modules" \( -name '*.node' -o -name 'spawn-helper' \) -type f | while read -r f; do
+            codesign --force --timestamp --options runtime --sign "$MACOS_SIGN_IDENTITY" "$f"
+          done
+          codesign --force --timestamp --options runtime --entitlements runner/packaging/macos/entitlements.plist \
+            --sign "$MACOS_SIGN_IDENTITY" "$DIR/atrium-runner"
+          codesign --verify --strict --verbose=2 "$DIR/atrium-runner"
+      - name: Windows – mit Authenticode signieren
+        if: runner.os == 'Windows' && env.HAS_WIN_CERT == 'true'
+        shell: pwsh
+        env:
+          WINDOWS_CERT_PFX_BASE64: ${{ secrets.WINDOWS_CERT_PFX_BASE64 }}
+          WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+        run: |
+          $pfx = Join-Path $env:RUNNER_TEMP 'cert.pfx'
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CERT_PFX_BASE64))
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" | Sort-Object FullName -Descending | Select-Object -First 1
+          & $signtool.FullName sign /f $pfx /p $env:WINDOWS_CERT_PASSWORD /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 "runner\release\$env:NAME\atrium-runner.exe"
+          if ($LASTEXITCODE -ne 0) { Remove-Item $pfx -Force; exit 1 }
+          Remove-Item $pfx -Force
+
+      # ------------------------------------------------------------ Smoke-Test (ohne Node im PATH)
+      - name: Smoke-Test (--version, probe mit fake-Provider)
+        run: |
+          DIR="runner/release/$NAME"
+          EXE="$DIR/atrium-runner"; [ "$RUNNER_OS" = "Windows" ] && EXE="$EXE.exe"
+          SMOKE_HOME="$RUNNER_TEMP/smoke-home"; mkdir -p "$SMOKE_HOME"
+          # das Programm bringt seine Laufzeit mit – Node aus setup-node wird nicht benutzt
+          GOT=$("$EXE" --version)
+          echo "Version: $GOT"
+          [ "$GOT" = "$VERSION" ] || { echo "::error::--version liefert $GOT statt $VERSION"; exit 1; }
+          HOME="$SMOKE_HOME" USERPROFILE="$SMOKE_HOME" ATRIUM_URL=http://127.0.0.1:9 ATRIUM_API_KEY=smoke-test-key \
+            RUNNER_ACCOUNTS='[{"key":"fake","provider":"fake"}]' WORK_DIR="$SMOKE_HOME/work" "$EXE" probe
+          "$EXE" help > /dev/null
+
+      # ------------------------------------------------------------ Pakete
+      - name: Linux – .tar.gz und .deb
+        if: runner.os == 'Linux'
+        working-directory: runner/release
+        run: |
+          tar -czf "$NAME.tar.gz" "$NAME"
+          ARCH=$([ "${{ matrix.target }}" = "linux-arm64" ] && echo arm64 || echo amd64)
+          PKG="deb-root"
+          mkdir -p "$PKG/DEBIAN" "$PKG/opt"
+          cp -R "$NAME" "$PKG/opt/atrium-runner"
+          cp ../packaging/linux/deb-postinst "$PKG/DEBIAN/postinst"
+          cp ../packaging/linux/deb-prerm "$PKG/DEBIAN/prerm"
+          chmod 0755 "$PKG/DEBIAN/postinst" "$PKG/DEBIAN/prerm"
+          cat > "$PKG/DEBIAN/control" <<EOF
+          Package: atrium-runner
+          Version: ${VERSION//-/\~}
+          Architecture: $ARCH
+          Maintainer: Kalypzo Atrium
+          Depends: git
+          Recommends: gh
+          Section: devel
+          Priority: optional
+          Description: Atrium aidev-Runner (PC-Betrieb)
+           Führt Agent-Läufe für das Atrium-Modul KI-Entwicklung aus und übergibt sie vor Standby an Server-Runner.
+          EOF
+          dpkg-deb --root-owner-group --build "$PKG" "$NAME.deb"
+          rm -rf "$PKG"
+      - name: macOS – .tar.gz und .pkg
+        if: runner.os == 'macOS'
+        working-directory: runner/release
+        env:
+          MACOS_INSTALLER_IDENTITY: ${{ secrets.MACOS_INSTALLER_IDENTITY }}
+        run: |
+          tar -czf "$NAME.tar.gz" "$NAME"
+          ROOT="pkg-root/usr/local/lib/atrium-runner"
+          mkdir -p "$ROOT" pkg-scripts
+          cp -R "$NAME/." "$ROOT/"
+          cp ../packaging/macos/postinstall pkg-scripts/postinstall
+          chmod 0755 pkg-scripts/postinstall
+          SIGN=()
+          [ -n "$MACOS_INSTALLER_IDENTITY" ] && SIGN=(--sign "$MACOS_INSTALLER_IDENTITY" --timestamp)
+          pkgbuild --root pkg-root --scripts pkg-scripts --identifier de.kalypzo.atrium-runner \
+            --version "$VERSION" --install-location / "${SIGN[@]}" "$NAME.pkg"
+          rm -rf pkg-root pkg-scripts
+      - name: macOS – notarisieren
+        if: runner.os == 'macOS' && env.HAS_NOTARY == 'true' && env.HAS_MAC_INSTALLER == 'true'
+        working-directory: runner/release
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          MACOS_INSTALLER_IDENTITY: ${{ secrets.MACOS_INSTALLER_IDENTITY }}
+        run: |
+          xcrun notarytool submit "$NAME.pkg" --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_PASSWORD" --wait
+          xcrun stapler staple "$NAME.pkg"
+      - name: Windows – .zip und Installer (Inno Setup)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        working-directory: runner/release
+        env:
+          WINDOWS_CERT_PFX_BASE64: ${{ secrets.WINDOWS_CERT_PFX_BASE64 }}
+          WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+        run: |
+          Compress-Archive -Path $env:NAME -DestinationPath "$env:NAME.zip"
+          $iscc = Get-Command iscc.exe -ErrorAction SilentlyContinue
+          if (-not $iscc) {
+            $default = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+            if (-not (Test-Path $default)) { choco install innosetup --no-progress -y | Out-Null }
+            $iscc = Get-Item $default
+          }
+          $arch = if ('${{ matrix.target }}' -eq 'windows-arm64') { 'arm64' } else { 'x64' }
+          & $iscc.Source "/DAppVersion=$env:VERSION" "/DArch=$arch" "/DSourceDir=$PWD\$env:NAME" "/DOutputDir=$PWD" ..\packaging\windows\atrium-runner.iss
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          if ($env:WINDOWS_CERT_PFX_BASE64) {
+            $pfx = Join-Path $env:RUNNER_TEMP 'cert.pfx'
+            [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CERT_PFX_BASE64))
+            $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" | Sort-Object FullName -Descending | Select-Object -First 1
+            & $signtool.FullName sign /f $pfx /p $env:WINDOWS_CERT_PASSWORD /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 "$env:NAME-setup.exe"
+            $code = $LASTEXITCODE
+            Remove-Item $pfx -Force
+            if ($code -ne 0) { exit 1 }
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.NAME }}
+          if-no-files-found: error
+          path: |
+            runner/release/*.tar.gz
+            runner/release/*.deb
+            runner/release/*.pkg
+            runner/release/*.zip
+            runner/release/*-setup.exe
+
+  release:
+    name: GitHub Release
+    needs: [version, build]
+    if: github.ref_type == 'tag' || inputs.publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ needs.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Prüfsummen
+        working-directory: dist
+        run: |
+          ls -la
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      - name: Release Notes
+        run: node runner/scripts/release-notes.mjs "${{ github.ref_type == 'tag' && env.TAG || 'HEAD' }}" > notes.md
+      - name: Release erstellen
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          FLAGS=(--title "Atrium-Runner ${{ needs.version.outputs.version }}" --notes-file notes.md)
+          [ "${{ needs.version.outputs.prerelease }}" = "true" ] && FLAGS+=(--prerelease)
+          # Tag-Push: Tag existiert; manuell: Tag am aktuellen Commit anlegen
+          if [ "${{ github.ref_type }}" = "tag" ]; then FLAGS+=(--verify-tag); else FLAGS+=(--target "$GITHUB_SHA"); fi
+          gh release create "$TAG" dist/* "${FLAGS[@]}"
+
+  docker:
+    name: Docker-Image (GHCR)
+    needs: [ci, version]
+    if: github.ref_type == 'tag' || inputs.docker
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Image-Name
+        id: img
+        run: |
+          OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          IMAGE="ghcr.io/$OWNER/atrium-aidev-runner"
+          TAGS="$IMAGE:${{ needs.version.outputs.version }}"
+          [ "${{ needs.version.outputs.prerelease }}" = "true" ] || TAGS="$TAGS,$IMAGE:latest"
+          echo "tags=$TAGS" >> "$GITHUB_OUTPUT"
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: runner/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.img.outputs.tags }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ needs.version.outputs.version }}

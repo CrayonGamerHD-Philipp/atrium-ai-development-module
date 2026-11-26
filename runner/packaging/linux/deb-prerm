@@ -1,0 +1,5 @@
+#!/bin/sh
+set -e
+if [ "$1" = "remove" ] || [ "$1" = "purge" ]; then rm -f /usr/bin/atrium-runner; fi
+echo "Autostart je Benutzer entfernen: atrium-runner uninstall (vor der Deinstallation)"
+exit 0

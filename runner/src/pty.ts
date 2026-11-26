@@ -4,6 +4,8 @@
  * Ausgabe wird ~16 ms gebündelt und als UTF-8-Text (TextDecoder im Stream-Modus) gesendet.
  */
 import { existsSync } from 'node:fs';
+import { createRequire } from 'node:module';
+import path from 'node:path';
 import type { RunnerApi } from './client.ts';
 import { publicEnv } from './config.ts';
 import type { Workspace } from './git/workspace.ts';
@@ -26,15 +28,28 @@ interface NodePtyModule {
 
 let ptyModule: NodePtyModule | null | undefined;
 
-/** node-pty laden (einmalig); `null` wenn nicht installiert bzw. nicht ladbar */
+/**
+ * node-pty laden (einmalig); `null` wenn nicht installiert bzw. nicht ladbar. Im Einzel-Binary (Node SEA) kann
+ * `import()` keine Pakete laden – dort liegt node-pty neben dem Programm (`node_modules/node-pty`) und wird über
+ * `createRequire` relativ zum Programm geladen.
+ */
 export async function loadNodePty(): Promise<NodePtyModule | null> {
 	if (ptyModule !== undefined) return ptyModule;
+	const pick = (mod: ({ default?: NodePtyModule } & NodePtyModule) | null) =>
+		mod && typeof mod.spawn === 'function' ? mod : (mod?.default ?? null);
 	try {
 		const name = 'node-pty';
-		const mod = (await import(name)) as { default?: NodePtyModule } & NodePtyModule;
-		ptyModule = typeof mod.spawn === 'function' ? mod : (mod.default ?? null);
+		ptyModule = pick((await import(name)) as { default?: NodePtyModule } & NodePtyModule);
 	} catch {
 		ptyModule = null;
+	}
+	if (!ptyModule) {
+		try {
+			const req = createRequire(path.join(path.dirname(process.execPath), 'package.json'));
+			ptyModule = pick(req('node-pty') as { default?: NodePtyModule } & NodePtyModule);
+		} catch {
+			ptyModule = null;
+		}
 	}
 	return ptyModule;
 }

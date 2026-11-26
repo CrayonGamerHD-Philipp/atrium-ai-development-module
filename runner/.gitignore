@@ -3,3 +3,4 @@ dist/
 .work/
 # enthält Geheimnisse (API-Keys)
 runner.config.json
+release/

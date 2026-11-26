@@ -1,0 +1,13 @@
+{
+  "atriumUrl": "https://atrium.example.org",
+  "apiKey": "API-KEY-EINTRAGEN",
+  "name": "mein-pc",
+  "kind": "desktop",
+  "maxSlots": 2,
+  "handoverSec": 20,
+  "wipCheckpointMin": 10,
+  "accounts": [
+    { "key": "claude-pc", "provider": "claude", "label": "Claude (PC)" },
+    { "key": "codex-pc", "provider": "codex", "label": "Codex (PC)" }
+  ]
+}

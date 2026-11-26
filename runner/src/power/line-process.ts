@@ -21,6 +21,9 @@ export class LineProcess {
 	private restartTimer: NodeJS.Timeout | null = null;
 	/** Wurde der Prozess mindestens einmal gestartet (Programm vorhanden)? */
 	spawned = false;
+	/** Schnell hintereinander beendete Starts (z. B. kein System-Bus) – ab 5 kein Neustart mehr */
+	private quickExits = 0;
+	private startedAt = 0;
 
 	constructor(private readonly o: LineProcessOptions) {}
 
@@ -41,6 +44,7 @@ export class LineProcess {
 			this.child = child;
 			child.once('spawn', () => {
 				this.spawned = true;
+				this.startedAt = Date.now();
 				done(true);
 			});
 			child.once('error', () => done(false));
@@ -59,7 +63,8 @@ export class LineProcess {
 				this.o.onExit?.(code);
 				done(false);
 				const wait = this.o.restartMs ?? 10_000;
-				if (!this.stopped && this.spawned && wait > 0) {
+				this.quickExits = Date.now() - this.startedAt < 5_000 ? this.quickExits + 1 : 0;
+				if (!this.stopped && this.spawned && wait > 0 && this.quickExits < 5) {
 					this.restartTimer = setTimeout(() => void this.start(), wait);
 					this.restartTimer.unref();
 				}

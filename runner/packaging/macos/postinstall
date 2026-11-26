@@ -1,0 +1,13 @@
+#!/bin/sh
+# .pkg-Nachinstallation (läuft als root): Befehl verlinken und den LaunchAgent für den angemeldeten Benutzer
+# einrichten (ohne Start – zuerst Konfiguration ausfüllen, dann `atrium-runner service-start`).
+set -e
+APP=/usr/local/lib/atrium-runner
+mkdir -p /usr/local/bin
+ln -sf "$APP/atrium-runner" /usr/local/bin/atrium-runner
+CONSOLE_USER=$(stat -f%Su /dev/console 2>/dev/null || true)
+if [ -n "$CONSOLE_USER" ] && [ "$CONSOLE_USER" != "root" ]; then
+	CONSOLE_UID=$(id -u "$CONSOLE_USER")
+	launchctl asuser "$CONSOLE_UID" sudo -u "$CONSOLE_USER" -H "$APP/atrium-runner" install --no-start || true
+fi
+exit 0

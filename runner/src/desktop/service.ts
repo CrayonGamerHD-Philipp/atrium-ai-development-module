@@ -166,8 +166,15 @@ class SystemdUserService implements ServiceManager {
 	async install(spec: ServiceSpec): Promise<void> {
 		await mkdir(path.dirname(this.location), { recursive: true });
 		await writeFile(this.location, systemdUnit(spec));
-		await run('systemctl', ['--user', 'daemon-reload']);
-		await run('systemctl', ['--user', 'enable', SERVICE_NAME]);
+		try {
+			await run('systemctl', ['--user', 'daemon-reload']);
+			await run('systemctl', ['--user', 'enable', SERVICE_NAME]);
+		} catch (e) {
+			throw new ServiceError(
+				`systemd-Benutzerdienst nicht verfügbar (${(e as Error).message}). Die Unit liegt unter ${this.location}; ` +
+					'ohne Autostart starten: atrium-runner start'
+			);
+		}
 	}
 	async uninstall(): Promise<void> {
 		await run('systemctl', ['--user', 'disable', '--now', SERVICE_NAME], true);
