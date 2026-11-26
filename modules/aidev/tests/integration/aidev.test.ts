@@ -2642,7 +2642,9 @@ describe('aidev', () => {
 			await q(
 				sql`UPDATE run SET lease_expires_at = now() - interval '1 second' WHERE id = ${third.runId}`
 			);
-			await q(sql`UPDATE runner SET last_seen_at = now() - interval '50 seconds' WHERE id = ${pcId}`);
+			await q(
+				sql`UPDATE runner SET last_seen_at = now() - interval '50 seconds' WHERE id = ${pcId}`
+			);
 			// Konto des Servers wieder zulassen (oben per Ablehnung ausgeschlossen); Server frisch melden
 			await q(sql`UPDATE task SET excluded_account_ids = '[]'::jsonb WHERE id = ${t.id}`);
 			ok(await heartbeat('runner'), 201);
