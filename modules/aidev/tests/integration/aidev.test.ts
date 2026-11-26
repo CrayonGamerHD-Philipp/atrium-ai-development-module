@@ -2638,10 +2638,24 @@ describe('aidev', () => {
 			const third = await offerFor(t.id, 'desktop');
 			ok(await call('desktop', 'POST', `/runner/runs/${third.runId}/accept`), 201);
 			const [n] = await q<{ attempts: number }>(sql`SELECT attempts FROM task WHERE id = ${t.id}`);
+			// PC schläft: letzter Heartbeat vor 50 s (zwischen Desktop-Lease 45 s und allgemeiner Frist 60 s)
 			await q(
 				sql`UPDATE run SET lease_expires_at = now() - interval '1 second' WHERE id = ${third.runId}`
 			);
+			await q(
+				sql`UPDATE runner SET last_seen_at = now() - interval '50 seconds' WHERE id = ${pcId}`
+			);
+			// Konto des Servers wieder zulassen (oben per Ablehnung ausgeschlossen); Server frisch melden
+			await q(sql`UPDATE task SET excluded_account_ids = '[]'::jsonb WHERE id = ${t.id}`);
+			ok(await heartbeat('runner'), 201);
 			await runJobNow(systemContext('test'), 'aidev.scheduler');
+			const [pc] = await q<{ online: boolean }>(sql`SELECT online FROM runner WHERE id = ${pcId}`);
+			expect(pc!.online).toBe(false);
+			// Der neu eingeplante Lauf geht an den Server, nicht erneut an den schlafenden PC
+			const reoffered = await q<{ runner_id: string }>(
+				sql`SELECT runner_id FROM run WHERE task_id = ${t.id} AND status = 'offered'`
+			);
+			expect(reoffered.map((r) => r.runner_id)).toEqual([runnerId]);
 			const lost = await q<{ status: string; error_message: string }>(
 				sql`SELECT status, error_message FROM run WHERE id = ${third.runId}`
 			);

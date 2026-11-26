@@ -130,6 +130,8 @@ export class Runner {
 	private power: PowerMonitorLike | null = null;
 	/** Energie-Ereignisse nacheinander verarbeiten */
 	private powerQueue: Promise<void> = Promise.resolve();
+	/** Löst aus, sobald ein neueres Energie-Ereignis eintrifft (beendet z. B. die Heartbeat-Wiederholung nach `resume`) */
+	private powerInterrupt = new AbortController();
 	private shutdownPromise: Promise<void> | null = null;
 
 	constructor(private readonly o: RunnerOptions) {
@@ -213,11 +215,11 @@ export class Runner {
 		};
 	}
 
-	/** Anmelden, bis es klappt (bzw. bis zum Beenden) */
-	private async register(): Promise<boolean> {
-		for (let attempt = 0; !this.stop.signal.aborted; attempt++) {
+	/** Anmelden, bis es klappt (bzw. bis zum Beenden oder bis `signal` auslöst) */
+	private async register(signal: AbortSignal = this.stop.signal): Promise<boolean> {
+		for (let attempt = 0; !signal.aborted; attempt++) {
 			try {
-				const r = await this.api.register(this.registerInput(), this.stop.signal);
+				const r = await this.api.register(this.registerInput(), signal);
 				this.status = r.status;
 				this.heartbeatSec = Math.min(300, Math.max(5, r.heartbeatSec || 15));
 				this.featureHandoff = r.features?.handoff === true;
@@ -238,7 +240,7 @@ export class Runner {
 						: 'Anmeldung bei Atrium fehlgeschlagen',
 					errorMessage(e)
 				);
-				await sleep(wait, this.stop.signal);
+				await sleep(wait, signal);
 			}
 		}
 		return false;
@@ -256,7 +258,8 @@ export class Runner {
 		}
 	}
 
-	private async sendHeartbeat(): Promise<void> {
+	/** Heartbeat senden; true, wenn Atrium geantwortet hat und dessen `cancel`-Liste verarbeitet ist */
+	private async sendHeartbeat(): Promise<boolean> {
 		try {
 			const r = await this.api.heartbeat({
 				slotsUsed: this.executor.slotsUsed,
@@ -269,11 +272,13 @@ export class Runner {
 			for (const id of r.cancel) {
 				if (this.executor.cancel(id, 'Von Atrium abgebrochen')) this.log.info(`Lauf ${id} wird abgebrochen (Heartbeat)`);
 			}
+			return true;
 		} catch (e) {
 			// Limit-Stand beim nächsten Heartbeat erneut senden
 			this.sentLimits.clear();
 			if (e instanceof ApiError && (e.status === 404 || e.status === 409)) this.needsRegister = true;
 			this.log.warn('Heartbeat fehlgeschlagen', errorMessage(e));
+			return false;
 		}
 	}
 
@@ -410,10 +415,13 @@ export class Runner {
 		if (this.stop.signal.aborted || this.shutdownPromise) return Promise.resolve();
 		// Nach dem Aufwachen gehören laufende Läufe womöglich schon einem anderen Runner: sofort sperren
 		if (e.kind === 'resume') this.executor.holdDelivery();
+		// Ein noch wartendes `resume` (Heartbeat-Wiederholung) gibt die Warteschlange für dieses Ereignis frei
+		this.powerInterrupt.abort();
+		const interrupt = (this.powerInterrupt = new AbortController()).signal;
 		const job = async () => {
 			try {
 				if (e.kind === 'suspend') await this.onSuspend();
-				else if (e.kind === 'resume') await this.onResume(e);
+				else if (e.kind === 'resume') await this.onResume(e, interrupt);
 				else await this.onPowerShutdown();
 			} catch (err) {
 				this.log.error(`Energie-Ereignis ${e.kind} fehlgeschlagen`, errorMessage(err));
@@ -440,21 +448,30 @@ export class Runner {
 
 	/**
 	 * Aufgewacht (bzw. Uhrsprung): Auslieferung gesperrt halten, sofort neu anmelden (Atrium gibt Läufe frei, die
-	 * hier fehlen) und einen Heartbeat senden (`cancel` bricht inzwischen übernommene Läufe ab). Danach wieder
-	 * ausliefern, Angebote annehmen und den Befehlsstrom neu verbinden.
+	 * hier fehlen), den Befehlsstrom neu verbinden und einen Heartbeat senden (`cancel` bricht inzwischen übernommene
+	 * Läufe ab). Erst nach einem erfolgreichen Heartbeat wieder ausliefern und Angebote annehmen; schlägt er fehl,
+	 * bleibt die Auslieferung gesperrt und der Heartbeat wird mit Backoff wiederholt – bis er klappt, der Runner
+	 * beendet wird oder ein neueres Energie-Ereignis eintrifft (`interrupt`, die Sperre bleibt dann bestehen).
 	 */
-	private async onResume(e: PowerEvent): Promise<void> {
+	private async onResume(e: PowerEvent, interrupt: AbortSignal): Promise<void> {
 		this.log.info(`Aufgewacht (${e.source}${e.detail ? `, ${e.detail}` : ''}) – melde mich neu an`);
 		this.executor.holdDelivery();
-		try {
-			await this.register();
-			if (this.stop.signal.aborted) return;
-			await this.sendHeartbeat();
-		} finally {
-			this.executor.releaseDelivery();
-			this.executor.resumeOffers();
-			this.draining = false;
-			this.stream?.reconnect();
+		const wait = AbortSignal.any([this.stop.signal, interrupt]);
+		if (!(await this.register(wait))) return;
+		this.stream?.reconnect();
+		for (let attempt = 0; !wait.aborted; attempt++) {
+			if (await this.sendHeartbeat()) {
+				this.executor.releaseDelivery();
+				this.executor.resumeOffers();
+				this.draining = false;
+				return;
+			}
+			this.log.warn('Heartbeat nach dem Aufwachen fehlgeschlagen – Auslieferung bleibt gesperrt, neuer Versuch');
+			await sleep(backoffMs(attempt, this.o.backoffBaseMs ?? 1000, 30_000), wait);
+			if (this.needsRegister && !wait.aborted) {
+				this.needsRegister = false;
+				await this.register(wait);
+			}
 		}
 	}
 

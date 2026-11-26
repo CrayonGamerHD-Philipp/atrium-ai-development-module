@@ -41,6 +41,8 @@ export class FakeAtrium {
 	cancel: string[] = [];
 	/** Nächste Antworten für events (Fehler simulieren) */
 	failEvents = 0;
+	/** Nächste Antworten für heartbeat mit 503 (je Heartbeat zwei Versuche des Clients) */
+	failHeartbeats = 0;
 	/** Anhänge für `GET /runner/runs/:id/attachments/:attachmentId` (binär); fehlende → 404 */
 	attachments = new Map<string, Buffer>();
 	/** Nächste Antworten für Anhänge mit 503 (Wiederholung prüfen) */
@@ -176,6 +178,11 @@ export class FakeAtrium {
 			};
 		} else if (p === '/runner/heartbeat') {
 			invalid = check(heartbeatInput);
+			if (this.failHeartbeats > 0) {
+				this.failHeartbeats--;
+				this.record({ method: req.method ?? '', path: p, body, invalid: 'simulierter Fehler' });
+				return this.json(res, 503, { error: { code: 'unavailable', message: 'kurz weg' } });
+			}
 			data = { status: 'approved', cancel: this.cancel.splice(0) };
 		} else if (p === '/runner/pending') {
 			data = this.pending.splice(0);
