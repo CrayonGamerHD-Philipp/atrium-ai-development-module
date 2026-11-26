@@ -1,4 +1,5 @@
 /** Commits und Auslieferung (Push, PR, direkt, Integrations-Branch) eines Laufs. */
+import { existsSync } from 'node:fs';
 import path from 'node:path';
 import type { CommitInfo } from '../protocol.ts';
 import { exec } from '../util/proc.ts';
@@ -37,18 +38,52 @@ export async function commitAll(
 	taskId: string,
 	exclude: readonly string[] = []
 ): Promise<boolean> {
-	if (!(await isDirty(ws, dir))) return false;
-	await ws.run(dir, ['add', '-A']);
-	// danach aus dem Index nehmen (Pathspec-Ausschluss scheitert bei ignorierten Pfaden)
-	if (exclude.length) await ws.run(dir, ['reset', '--quiet', '--', ...exclude]);
-	const staged = await ws.run(dir, ['diff', '--cached', '--quiet'], { allowFail: true });
-	if (staged.code === 0) return false;
 	const subject = title.replace(/\s+/g, ' ').trim().slice(0, 200) || 'Änderungen des Agents';
-	await ws.run(dir, ['commit', '--quiet', '--no-verify', '-F', '-'], {
-		input: `${subject}\n\nAidev-Task: ${taskId}\n`,
-		config: ws.noHooks
-	});
+	return commitWorktree(ws, dir, `${subject}\n\nAidev-Task: ${taskId}\n`, exclude);
+}
+
+/**
+ * Zwischenstand vor einer Übergabe (Standby/Herunterfahren) committen: alle Änderungen außer `exclude`, ohne Hooks
+ * und ohne testCmd. Liefert true bei neuem Commit. `signal` bricht die git-Aufrufe ab (Frist der Übergabe).
+ */
+export async function commitWip(
+	ws: Workspace,
+	dir: string,
+	o: { taskId: string; reason: string; exclude?: readonly string[]; signal?: AbortSignal }
+): Promise<boolean> {
+	const message = `wip(aidev): Zwischenstand vor Übergabe\n\nAidev-Task: ${o.taskId}\nAidev-Handoff: ${o.reason}\n`;
+	return commitWorktree(ws, dir, message, o.exclude ?? [], o.signal);
+}
+
+async function commitWorktree(
+	ws: Workspace,
+	dir: string,
+	message: string,
+	exclude: readonly string[],
+	signal?: AbortSignal
+): Promise<boolean> {
+	const status = await ws.run(dir, ['status', '--porcelain', '--untracked-files=all'], { signal });
+	if (!status.stdout.trim()) return false;
+	await ws.run(dir, ['add', '-A'], { signal });
+	// danach aus dem Index nehmen (Pathspec-Ausschluss scheitert bei ignorierten Pfaden)
+	if (exclude.length) await ws.run(dir, ['reset', '--quiet', '--', ...exclude], { signal });
+	const staged = await ws.run(dir, ['diff', '--cached', '--quiet'], { allowFail: true, signal });
+	if (staged.code === 0) return false;
+	await ws.run(dir, ['commit', '--quiet', '--no-verify', '-F', '-'], { input: message, config: ws.noHooks, signal });
 	return true;
+}
+
+/** Läuft im Worktree gerade ein Merge, Rebase oder Cherry-Pick? (Dann keinen Zwischenstand committen) */
+export async function operationInProgress(ws: Workspace, dir: string, signal?: AbortSignal): Promise<boolean> {
+	for (const ref of ['MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REVERT_HEAD']) {
+		const r = await ws.run(dir, ['rev-parse', '-q', '--verify', ref], { allowFail: true, signal });
+		if (r.code === 0) return true;
+	}
+	for (const p of ['rebase-merge', 'rebase-apply']) {
+		const r = await ws.run(dir, ['rev-parse', '--git-path', p], { signal });
+		if (existsSync(path.resolve(dir, r.stdout.trim()))) return true;
+	}
+	return false;
 }
 
 /** Änderungen verwerfen (Nur-Lese-Rollen) */
@@ -129,15 +164,17 @@ export async function pushBranch(
 	branch: string,
 	expectedRemote: string | null,
 	emit: Emit,
-	o: { allowForce?: boolean } = {}
+	o: { allowForce?: boolean; signal?: AbortSignal } = {}
 ): Promise<void> {
 	assertRefName(branch);
 	const allowForce = o.allowForce ?? true;
+	const signal = o.signal;
 	await ws.withRepo(repo, async () => {
 		const r = await ws.run(dir, ['push', '--porcelain', 'origin', `HEAD:refs/heads/${branch}`], {
 			allowFail: true,
 			config: [...ws.netConfig(repo), ...ws.noHooks],
-			timeoutMs: 600_000
+			timeoutMs: 600_000,
+			signal
 		});
 		if (r.code === 0) {
 			emit('git', { action: 'push', detail: `Branch ${branch} gepusht` });
@@ -151,7 +188,7 @@ export async function pushBranch(
 			const f = await ws.run(
 				dir,
 				['push', '--porcelain', `--force-with-lease=refs/heads/${branch}:${expectedRemote ?? ''}`, 'origin', `HEAD:refs/heads/${branch}`],
-				{ allowFail: true, config: [...ws.netConfig(repo), ...ws.noHooks], timeoutMs: 600_000 }
+				{ allowFail: true, config: [...ws.netConfig(repo), ...ws.noHooks], timeoutMs: 600_000, signal }
 			);
 			if (f.code === 0) {
 				emit('git', { action: 'push', detail: `Branch ${branch} gepusht (force-with-lease)` });
