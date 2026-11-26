@@ -3,7 +3,7 @@
  * `handoff`, Frist sowie Auslieferungssperre nach dem Aufwachen (`holdDelivery`/`releaseDelivery`).
  */
 import { randomUUID } from 'node:crypto';
-import { existsSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { AtriumClient, RunnerApi } from '../src/client.ts';
@@ -128,6 +128,39 @@ async function finishOf(runId: string): Promise<FinishInput> {
 }
 
 const finishCount = (runId: string) => atrium.byPath(new RegExp(`/runs/${runId}/finish$`)).length;
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * `pre-receive`-Hook im Test-Remote, der Pushes festhält, solange die Sperrdatei existiert (simuliert einen
+ * gerade laufenden Push). `started` wartet, bis ein Push im Hook hängt.
+ */
+function blockPushes(): { started(): Promise<void>; unblock(): void; remove(): void } {
+	const hook = path.join(remote.bare, 'hooks', 'pre-receive');
+	const marker = path.join(env.tmp, 'push-started');
+	const block = path.join(env.tmp, 'push-block');
+	rmSync(marker, { force: true });
+	writeFileSync(block, '');
+	writeFileSync(
+		hook,
+		`#!/bin/sh\ncat >/dev/null\ntouch "${marker}"\nwhile [ -f "${block}" ]; do sleep 0.05; done\nexit 0\n`
+	);
+	chmodSync(hook, 0o755);
+	return {
+		async started() {
+			const until = Date.now() + 30_000;
+			while (!existsSync(marker)) {
+				if (Date.now() > until) throw new Error('Push startet nicht');
+				await sleep(20);
+			}
+		},
+		unblock: () => rmSync(block, { force: true }),
+		remove() {
+			rmSync(block, { force: true });
+			rmSync(hook, { force: true });
+		}
+	};
+}
 
 describe('handoff', () => {
 	it('schreibender Lauf: WIP-Commit liegt auf origin/<branch>, finish mit handoff.wipPushed', async () => {
@@ -258,6 +291,93 @@ describe('handoff', () => {
 		expect(fin.handoff).toBeUndefined();
 		expect(remote.sha(o.branch)).toBeNull();
 		expect(git(wtDir(o.runId), 'log', '-1', '--format=%s')).toBe('Erster Commit');
+	});
+
+	// Prozessgruppen und Shell-Hook: nur POSIX
+	it.skipIf(process.platform === 'win32')('Besitzverlust während eines laufenden Pushes: Push wird abgebrochen, nichts ausgeliefert', async () => {
+		const blocker = blockPushes();
+		try {
+			const o = offer({ prompt: 'Bitte die README ergänzen.' });
+			expect(await executor.handleOffer(o)).toBe('accepted');
+			await blocker.started();
+			// Heartbeat-Antwort: Atrium hat den Lauf inzwischen einem anderen Runner gegeben
+			expect(executor.cancel(o.runId, 'Von Atrium abgebrochen')).toBe(true);
+			const fin = await finishOf(o.runId);
+			expect(fin).toMatchObject({ status: 'cancelled', errorKind: 'cancelled', branchPushed: false, pr: null });
+			blocker.unblock();
+			await sleep(300);
+			expect(remote.sha(o.branch)).toBeNull();
+			expect(env.ghCalls().some((c) => c[0] === 'pr' && c[1] === 'create' && c.includes(o.branch))).toBe(false);
+		} finally {
+			blocker.remove();
+		}
+	});
+
+	it.skipIf(process.platform === 'win32')('Besitzverlust während der direkten Auslieferung: kein Push auf main', async () => {
+		const mainBefore = remote.sha('main');
+		const blocker = blockPushes();
+		try {
+			const o = offer({ prompt: 'Direkt ändern', delivery: { mode: 'direct' } });
+			expect(await executor.handleOffer(o)).toBe('accepted');
+			await blocker.started();
+			expect(executor.cancel(o.runId, 'Von Atrium abgebrochen')).toBe(true);
+			const fin = await finishOf(o.runId);
+			expect(fin).toMatchObject({ status: 'cancelled', merged: false });
+			blocker.unblock();
+			await sleep(300);
+			expect(remote.sha('main')).toBe(mainBefore);
+		} finally {
+			blocker.remove();
+		}
+	});
+
+	it.skipIf(process.platform === 'win32')('Standby während eines laufenden Pushes: Übergabe bricht den Push ab', async () => {
+		const blocker = blockPushes();
+		try {
+			const o = offer({ prompt: 'Bitte die README ergänzen.' });
+			expect(await executor.handleOffer(o)).toBe('accepted');
+			await blocker.started();
+			const t0 = Date.now();
+			expect(await executor.handoff('suspend', { deadlineMs: 3000, pushWip: false })).toBe(1);
+			expect(Date.now() - t0).toBeLessThan(5000);
+			const fin = await finishOf(o.runId);
+			expect(fin).toMatchObject({ status: 'cancelled', errorMessage: 'Übergabe: PC geht in den Standby', pr: null });
+			blocker.unblock();
+			await sleep(300);
+			expect(remote.sha(o.branch)).toBeNull();
+		} finally {
+			blocker.remove();
+			executor.resumeOffers();
+		}
+	});
+
+	it.skipIf(process.platform === 'win32')('Sperre während eines laufenden Pushes: abgebrochen, nach der Freigabe wiederholt', async () => {
+		const blocker = blockPushes();
+		try {
+			const o = offer({ prompt: 'Bitte die README ergänzen.' });
+			expect(await executor.handleOffer(o)).toBe('accepted');
+			await blocker.started();
+			// Aufgewacht: Laufbesitz ungeklärt → laufender Push wird beendet
+			executor.holdDelivery();
+			const until = Date.now() + 30_000;
+			while (!events(o.runId).some((e) => e.payload.text?.startsWith('Auslieferung unterbrochen'))) {
+				if (Date.now() > until) throw new Error('Push wird nicht unterbrochen');
+				await sleep(20);
+			}
+			blocker.unblock();
+			await sleep(300);
+			expect(remote.sha(o.branch)).toBeNull();
+			expect(finishCount(o.runId)).toBe(0);
+			// Heartbeat ohne cancel: Lauf gehört weiter hierher → Push und PR nach der Freigabe
+			executor.releaseDelivery();
+			const fin = await finishOf(o.runId);
+			expect(fin.status).toBe('succeeded');
+			expect(fin.pr).not.toBeNull();
+			expect(remote.read(o.branch, 'AIDEV_FAKE.md')).toContain('Bitte die README ergänzen.');
+		} finally {
+			blocker.remove();
+			executor.releaseDelivery();
+		}
 	});
 
 	it('holdDelivery + releaseDelivery ohne Abbruch: Auslieferung läuft normal weiter', async () => {

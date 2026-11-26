@@ -20,6 +20,14 @@ export class DeliveryError extends Error {
 
 export type Emit = (kind: 'git' | 'system' | 'stderr' | 'error' | 'status', payload: Record<string, unknown>) => void;
 
+/**
+ * Vor jeder externen Schreibaktion (Push, PR, Merge): Ist `signal` ausgelöst (Übergabe, Besitzverlust, gesperrte
+ * Auslieferung), wird nichts mehr geschrieben. Laufende git-/gh-Prozesse beendet `signal` selbst.
+ */
+function assertWritable(signal?: AbortSignal): void {
+	if (signal?.aborted) throw new DeliveryError('git', 'Auslieferung abgebrochen');
+}
+
 /** Uncommittete Änderungen vorhanden? */
 export async function isDirty(ws: Workspace, dir: string): Promise<boolean> {
 	const r = await ws.run(dir, ['status', '--porcelain', '--untracked-files=all']);
@@ -170,6 +178,7 @@ export async function pushBranch(
 	const allowForce = o.allowForce ?? true;
 	const signal = o.signal;
 	await ws.withRepo(repo, async () => {
+		assertWritable(signal);
 		const r = await ws.run(dir, ['push', '--porcelain', 'origin', `HEAD:refs/heads/${branch}`], {
 			allowFail: true,
 			config: [...ws.netConfig(repo), ...ws.noHooks],
@@ -185,6 +194,7 @@ export async function pushBranch(
 			throw new DeliveryError('git', `Push von ${branch} abgelehnt (kein Force-Push erlaubt):\n${err.trim().slice(-2000)}`);
 		if (isRejected(err) && branch.startsWith('aidev/')) {
 			emit('git', { action: 'push', detail: `Push abgelehnt – erneut mit --force-with-lease auf ${branch}` });
+			assertWritable(signal);
 			const f = await ws.run(
 				dir,
 				['push', '--porcelain', `--force-with-lease=refs/heads/${branch}:${expectedRemote ?? ''}`, 'origin', `HEAD:refs/heads/${branch}`],
@@ -201,8 +211,8 @@ export async function pushBranch(
 }
 
 /** Remote-Refs im Cache aktualisieren */
-export async function fetchRepo(ws: Workspace, repo: RepoRef): Promise<void> {
-	await ws.ensureCache(repo);
+export async function fetchRepo(ws: Workspace, repo: RepoRef, signal?: AbortSignal): Promise<void> {
+	await ws.ensureCache(repo, signal);
 }
 
 export interface GhResult {
@@ -212,10 +222,15 @@ export interface GhResult {
 	spawnError: string | null;
 }
 
-export async function gh(ws: Workspace, args: string[], o: { cwd?: string; input?: string; timeoutMs?: number } = {}): Promise<GhResult> {
+export async function gh(
+	ws: Workspace,
+	args: string[],
+	o: { cwd?: string; input?: string; timeoutMs?: number; signal?: AbortSignal } = {}
+): Promise<GhResult> {
 	const r = await exec('gh', args, {
 		cwd: o.cwd,
 		input: o.input,
+		signal: o.signal,
 		env: { ...ws.env, GH_PROMPT_DISABLED: '1', GH_NO_UPDATE_NOTIFIER: '1', NO_COLOR: '1' },
 		timeoutMs: o.timeoutMs ?? 60_000
 	});
@@ -232,9 +247,11 @@ export async function ensurePullRequest(
 	ws: Workspace,
 	repo: RepoRef,
 	o: { branch: string; base: string; title: string; body: string },
-	emit: Emit
+	emit: Emit,
+	signal?: AbortSignal
 ): Promise<{ number: number; url: string }> {
 	const slug = `${repo.repoOwner}/${repo.repoName}`;
+	assertWritable(signal);
 	const create = await gh(ws, [
 		'pr',
 		'create',
@@ -248,7 +265,7 @@ export async function ensurePullRequest(
 		o.title.replace(/\s+/g, ' ').trim().slice(0, 200) || o.branch,
 		'--body-file',
 		'-'
-	], { input: o.body });
+	], { input: o.body, signal });
 	if (create.code === 0) {
 		const pr = prFromUrl(create.stdout) ?? prFromUrl(create.stderr);
 		if (pr) {
@@ -256,7 +273,8 @@ export async function ensurePullRequest(
 			return pr;
 		}
 	}
-	const view = await gh(ws, ['pr', 'view', o.branch, '--repo', slug, '--json', 'number,url']);
+	assertWritable(signal);
+	const view = await gh(ws, ['pr', 'view', o.branch, '--repo', slug, '--json', 'number,url'], { signal });
 	if (view.code === 0) {
 		try {
 			const j = JSON.parse(view.stdout) as { number?: unknown; url?: unknown };
@@ -272,14 +290,26 @@ export async function ensurePullRequest(
 	throw new DeliveryError('git', `PR konnte nicht erstellt werden: ${why.slice(-2000)}`);
 }
 
-/** Auto-Merge aktivieren (Fehler nur als Ereignis) */
-export async function enableAutoMerge(ws: Workspace, repo: RepoRef, number: number, emit: Emit): Promise<void> {
-	const r = await gh(ws, ['pr', 'merge', String(number), '--repo', `${repo.repoOwner}/${repo.repoName}`, '--auto', '--squash']);
-	if (r.code === 0) emit('git', { action: 'auto-merge', detail: `Auto-Merge für PR #${number} aktiviert` });
-	else
-		emit('error', {
-			text: `Auto-Merge für PR #${number} nicht möglich: ${(r.spawnError ?? (r.stderr.trim() || r.stdout.trim())).slice(-1000)}`
-		});
+/** Auto-Merge aktivieren (Fehler nur als Ereignis); true bei Erfolg */
+export async function enableAutoMerge(
+	ws: Workspace,
+	repo: RepoRef,
+	number: number,
+	emit: Emit,
+	signal?: AbortSignal
+): Promise<boolean> {
+	assertWritable(signal);
+	const r = await gh(ws, ['pr', 'merge', String(number), '--repo', `${repo.repoOwner}/${repo.repoName}`, '--auto', '--squash'], {
+		signal
+	});
+	if (r.code === 0) {
+		emit('git', { action: 'auto-merge', detail: `Auto-Merge für PR #${number} aktiviert` });
+		return true;
+	}
+	emit('error', {
+		text: `Auto-Merge für PR #${number} nicht möglich: ${(r.spawnError ?? (r.stderr.trim() || r.stdout.trim())).slice(-1000)}`
+	});
+	return false;
 }
 
 // ---------------------------------------------------------------- Bestehenden PR aktualisieren (pr-update)
@@ -457,10 +487,11 @@ export async function syncPullBranch(
 	ws: Workspace,
 	repo: RepoRef,
 	o: { dir: string; branch: string; number: number; expectedRemote: string | null },
-	emit: Emit
+	emit: Emit,
+	signal?: AbortSignal
 ): Promise<{ base: string; rebased: boolean }> {
 	assertRefName(o.branch);
-	await fetchRepo(ws, repo);
+	await fetchRepo(ws, repo, signal);
 	const current = await ws.revParse(o.dir, `refs/remotes/origin/${o.branch}`);
 	if (!current) throw new DeliveryError('git', `Branch des PR #${o.number} existiert nicht mehr`);
 	if (current === o.expectedRemote) return { base: current, rebased: false };
@@ -470,7 +501,7 @@ export async function syncPullBranch(
 	const args = o.expectedRemote
 		? ['rebase', '--quiet', '--onto', current, o.expectedRemote]
 		: ['rebase', '--quiet', current];
-	const rb = await ws.run(o.dir, args, { allowFail: true, config: ws.noHooks });
+	const rb = await ws.run(o.dir, args, { allowFail: true, config: ws.noHooks, signal });
 	if (rb.code !== 0) {
 		const files = await conflictFiles(ws, o.dir);
 		await ws.run(o.dir, ['rebase', '--abort'], { allowFail: true });
@@ -501,9 +532,18 @@ export function pullCommentBody(o: {
 }
 
 /** Kommentar an einen PR (`gh pr comment`); Fehler nur als Ereignis */
-export async function commentOnPull(ws: Workspace, repo: RepoRef, number: number, body: string, emit: Emit): Promise<boolean> {
+export async function commentOnPull(
+	ws: Workspace,
+	repo: RepoRef,
+	number: number,
+	body: string,
+	emit: Emit,
+	signal?: AbortSignal
+): Promise<boolean> {
+	assertWritable(signal);
 	const r = await gh(ws, ['pr', 'comment', String(number), '--repo', `${repo.repoOwner}/${repo.repoName}`, '--body-file', '-'], {
-		input: body
+		input: body,
+		signal
 	});
 	if (r.code === 0 && !r.spawnError) {
 		emit('git', { action: 'comment', detail: `Kommentar an PR #${number} gepostet` });
@@ -522,15 +562,17 @@ export async function deliverDirect(
 	repo: RepoRef,
 	dir: string,
 	defaultBranch: string,
-	emit: Emit
+	emit: Emit,
+	signal?: AbortSignal
 ): Promise<string> {
 	assertRefName(defaultBranch);
 	let lastErr = '';
 	for (let attempt = 1; attempt <= 3; attempt++) {
-		await fetchRepo(ws, repo);
+		assertWritable(signal);
+		await fetchRepo(ws, repo, signal);
 		const onto = await ws.revParse(dir, `refs/remotes/origin/${defaultBranch}`);
 		if (!onto) throw new DeliveryError('git', `Branch „${defaultBranch}“ existiert im Repository nicht`);
-		const rb = await ws.run(dir, ['rebase', '--quiet', onto], { allowFail: true, config: ws.noHooks });
+		const rb = await ws.run(dir, ['rebase', '--quiet', onto], { allowFail: true, config: ws.noHooks, signal });
 		if (rb.code !== 0) {
 			const files = await conflictFiles(ws, dir);
 			await ws.run(dir, ['rebase', '--abort'], { allowFail: true });
@@ -539,13 +581,15 @@ export async function deliverDirect(
 			throw new DeliveryError('git', `Rebase auf ${defaultBranch} fehlgeschlagen:\n${(rb.stderr || rb.stdout).trim().slice(-2000)}`);
 		}
 		emit('git', { action: 'rebase', detail: `Auf origin/${defaultBranch} rebased (Versuch ${attempt})` });
-		const pushed = await ws.withRepo(repo, () =>
-			ws.run(dir, ['push', '--porcelain', 'origin', `HEAD:refs/heads/${defaultBranch}`], {
+		const pushed = await ws.withRepo(repo, () => {
+			assertWritable(signal);
+			return ws.run(dir, ['push', '--porcelain', 'origin', `HEAD:refs/heads/${defaultBranch}`], {
 				allowFail: true,
 				config: [...ws.netConfig(repo), ...ws.noHooks],
-				timeoutMs: 600_000
-			})
-		);
+				timeoutMs: 600_000,
+				signal
+			});
+		});
 		if (pushed.code === 0) {
 			emit('git', { action: 'push', detail: `Direkt auf ${defaultBranch} gepusht` });
 			return onto;
@@ -574,7 +618,8 @@ export async function deliverIntegrate(
 		taskId: string;
 		pullNumber?: number;
 	},
-	emit: Emit
+	emit: Emit,
+	signal?: AbortSignal
 ): Promise<void> {
 	assertRefName(o.integrationBranch);
 	const head = await headSha(ws, o.dir);
@@ -582,19 +627,21 @@ export async function deliverIntegrate(
 	let lastErr = '';
 	try {
 		for (let attempt = 1; attempt <= 3; attempt++) {
-			const cache = await ws.ensureCache(repo);
+			assertWritable(signal);
+			const cache = await ws.ensureCache(repo, signal);
 			let target = await ws.revParse(cache, `refs/remotes/origin/${o.integrationBranch}`);
 			if (!target && o.pullNumber !== undefined)
 				throw new DeliveryError('git', `Branch des PR #${o.pullNumber} existiert nicht mehr`);
 			if (!target) {
 				emit('git', { action: 'branch', detail: `Integrations-Branch ${o.integrationBranch} wird aus ${o.defaultBranch} angelegt` });
+				assertWritable(signal);
 				target = await ws.withRepo(repo, () => ws.createRemoteBranch(repo, cache, o.integrationBranch, o.defaultBranch));
 			}
 			await ws.withRepo(repo, () => ws.addWorktree(cache, tmp, target, null));
 			const merge = await ws.run(
 				tmp,
 				['merge', '--no-ff', '--quiet', '-m', `Merge ${o.branch} in ${o.integrationBranch}\n\nAidev-Task: ${o.taskId}`, head],
-				{ allowFail: true, config: ws.noHooks }
+				{ allowFail: true, config: ws.noHooks, signal }
 			);
 			if (merge.code !== 0) {
 				const files = await conflictFiles(ws, tmp);
@@ -603,13 +650,15 @@ export async function deliverIntegrate(
 					throw new DeliveryError('conflict', `Konflikt beim Mergen in ${o.integrationBranch}`, files);
 				throw new DeliveryError('git', `Merge in ${o.integrationBranch} fehlgeschlagen:\n${(merge.stderr || merge.stdout).trim().slice(-2000)}`);
 			}
-			const pushed = await ws.withRepo(repo, () =>
-				ws.run(tmp, ['push', '--porcelain', 'origin', `HEAD:refs/heads/${o.integrationBranch}`], {
+			const pushed = await ws.withRepo(repo, () => {
+				assertWritable(signal);
+				return ws.run(tmp, ['push', '--porcelain', 'origin', `HEAD:refs/heads/${o.integrationBranch}`], {
 					allowFail: true,
 					config: [...ws.netConfig(repo), ...ws.noHooks],
-					timeoutMs: 600_000
-				})
-			);
+					timeoutMs: 600_000,
+					signal
+				});
+			});
 			if (pushed.code === 0) {
 				emit('git', { action: 'merge', detail: `${o.branch} in ${o.integrationBranch} gemergt und gepusht` });
 				return;

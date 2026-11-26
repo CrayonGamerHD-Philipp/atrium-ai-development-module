@@ -129,6 +129,8 @@ export class Executor {
 	private offersPaused = false;
 	/** Gesperrte Auslieferung (nach dem Aufwachen aus dem Standby) */
 	private hold: DeliveryHold | null = null;
+	/** Laufende externe Schreibaktionen (Push, PR, Merge) – `holdDelivery` bricht sie ab */
+	private readonly writes = new Set<AbortController>();
 	private readonly log: Logger;
 	/** Zuletzt beobachteter Limit-Stand je Konto und Fenster */
 	readonly limits: LimitStore;
@@ -306,13 +308,16 @@ export class Executor {
 
 	/**
 	 * Ab jetzt keine Commits, Tests, Pushes, PR-Aktionen, Merges und `finish` – die Läufe warten an einem gemeinsamen
-	 * Gate (nach dem Aufwachen gehören sie womöglich schon einem anderen Runner). Agent-Prozesse laufen weiter.
+	 * Gate (nach dem Aufwachen gehören sie womöglich schon einem anderen Runner). Bereits laufende Pushes, PR-Aktionen
+	 * und Merges werden abgebrochen und nach der Freigabe wiederholt (sofern der Lauf dann noch hierher gehört).
+	 * Agent-Prozesse laufen weiter.
 	 */
 	holdDelivery(): void {
 		if (this.hold) return;
 		let release: () => void = () => undefined;
 		const promise = new Promise<void>((resolve) => (release = resolve));
 		this.hold = { promise, release };
+		for (const w of this.writes) w.abort();
 	}
 
 	/** Auslieferung wieder erlauben; inzwischen abgebrochene Läufe enden ohne Push als `cancelled` */
@@ -497,6 +502,30 @@ export class Executor {
 			await this.waitForDelivery(signal);
 			checkAbort();
 		};
+		/**
+		 * Externe Schreibaktion (Push, PR, Merge) hinter dem Gate. Ihr Signal löst bei Abbruch des Laufs (Übergabe,
+		 * Besitzverlust, Zeitlimit) und bei `holdDelivery` aus und beendet laufende git-/gh-Prozesse. Wurde nur wegen
+		 * der Sperre abgebrochen, wird die (wiederholbare) Aktion nach der Freigabe erneut ausgeführt.
+		 */
+		const write = async <T>(fn: (s: AbortSignal) => Promise<T>): Promise<T> => {
+			for (;;) {
+				await gate();
+				if (this.hold) continue;
+				const wc = new AbortController();
+				const onAbort = () => wc.abort();
+				signal.addEventListener('abort', onAbort, { once: true });
+				this.writes.add(wc);
+				try {
+					return await fn(wc.signal);
+				} catch (e) {
+					if (signal.aborted || !wc.signal.aborted) throw e;
+				} finally {
+					signal.removeEventListener('abort', onAbort);
+					this.writes.delete(wc);
+				}
+				emit('status', { text: 'Auslieferung unterbrochen (Laufbesitz wird geprüft) – wird danach wiederholt' });
+			}
+		};
 		try {
 			emit('status', { text: 'Repository wird vorbereitet' });
 			// 0. Bestehender PR (pr-update): prüfen, bevor etwas geändert wird; Kontext für den Agent.
@@ -650,22 +679,36 @@ export class Executor {
 			let commitBase = startSha;
 			const d = offer.delivery;
 			const gitEmit = (k: RunEventKind, p: Record<string, unknown>) => emit(k, p);
+			const dirW = wtDir;
+			const push = (opts: { allowForce?: boolean; base?: string | null } = {}) =>
+				write((s) =>
+					pushBranch(ws, repo, dirW, offer.branch, opts.base === undefined ? remoteSha : opts.base, gitEmit, {
+						allowForce: opts.allowForce,
+						signal: s
+					})
+				);
+			/** gh-Aktionen mit Fehler nur als Ereignis: bei Abbruch als Fehler behandeln (Wiederholung bzw. Abbruch) */
+			const ghWrite = (fn: (s: AbortSignal) => Promise<boolean>) =>
+				write(async (s) => {
+					if (!(await fn(s)) && s.aborted) throw new DeliveryError('git', 'Auslieferung abgebrochen');
+				});
 			await gate();
 			if (d.mode === 'branch') {
-				await pushBranch(ws, repo, wtDir, offer.branch, remoteSha, gitEmit);
+				await push();
 				finish.branchPushed = true;
 			} else if (d.mode === 'pr') {
-				await pushBranch(ws, repo, wtDir, offer.branch, remoteSha, gitEmit);
-				await gate();
-				const pr = await ensurePullRequest(
-					ws,
-					repo,
-					{ branch: offer.branch, base: offer.project.defaultBranch, title: d.title || offer.title, body: d.body },
-					gitEmit
+				await push();
+				const pr = await write((s) =>
+					ensurePullRequest(
+						ws,
+						repo,
+						{ branch: offer.branch, base: offer.project.defaultBranch, title: d.title || offer.title, body: d.body },
+						gitEmit,
+						s
+					)
 				);
 				finish.pr = pr;
-				if (d.autoMerge) await gate();
-				if (d.autoMerge) await enableAutoMerge(ws, repo, pr.number, gitEmit);
+				if (d.autoMerge) await ghWrite((s) => enableAutoMerge(ws, repo, pr.number, gitEmit, s));
 			} else if (d.mode === 'pr-update') {
 				if (!integratedOnly) {
 					// Kein Force-Push: parallel gepushte Commits werden per Rebase übernommen
@@ -673,7 +716,8 @@ export class Executor {
 						ws,
 						repo,
 						{ dir: wtDir, branch: offer.branch, number: d.number, expectedRemote: remoteSha },
-						gitEmit
+						gitEmit,
+						signal
 					);
 					commitBase = synced.base;
 					// Der getestete Stand ist nach dem Rebase nicht mehr der auszuliefernde → erneut testen
@@ -682,8 +726,7 @@ export class Executor {
 							'Tests laufen erneut (testCmd, nach Rebase auf parallel gepushte Commits)',
 							'Tests nach Rebase auf parallel gepushte Commits fehlgeschlagen'
 						);
-					await gate();
-					await pushBranch(ws, repo, wtDir, offer.branch, commitBase, gitEmit, { allowForce: false });
+					await push({ allowForce: false, base: commitBase });
 				}
 				// Bei `integratedOnly` liegen die Änderungen der Teilaufträge bereits auf dem PR-Branch
 				finish.branchPushed = true;
@@ -701,28 +744,29 @@ export class Executor {
 						? 'Die Änderungen der Teilaufträge wurden bereits einzeln in den PR-Branch gemergt.'
 						: undefined
 				});
-				await gate();
-				await commentOnPull(ws, repo, d.number, redactor.redact(body), gitEmit);
+				await ghWrite((s) => commentOnPull(ws, repo, d.number, redactor.redact(body), gitEmit, s));
 			} else if (d.mode === 'direct') {
-				commitBase = await deliverDirect(ws, repo, wtDir, offer.project.defaultBranch, gitEmit);
+				commitBase = await write((s) => deliverDirect(ws, repo, dirW, offer.project.defaultBranch, gitEmit, s));
 				finish.merged = true;
 				finish.branch = offer.project.defaultBranch;
 			} else if (d.mode === 'integrate') {
-				await pushBranch(ws, repo, wtDir, offer.branch, remoteSha, gitEmit);
-				await gate();
-				await deliverIntegrate(
-					ws,
-					repo,
-					{
-						dir: wtDir,
-						branch: offer.branch,
-						integrationBranch: d.integrationBranch,
-						defaultBranch: offer.project.defaultBranch,
-						runId: offer.runId,
-						taskId: offer.taskId,
-						pullNumber: d.pullNumber
-					},
-					gitEmit
+				await push();
+				await write((s) =>
+					deliverIntegrate(
+						ws,
+						repo,
+						{
+							dir: dirW,
+							branch: offer.branch,
+							integrationBranch: d.integrationBranch,
+							defaultBranch: offer.project.defaultBranch,
+							runId: offer.runId,
+							taskId: offer.taskId,
+							pullNumber: d.pullNumber
+						},
+						gitEmit,
+						s
+					)
 				);
 				finish.merged = true;
 			}
