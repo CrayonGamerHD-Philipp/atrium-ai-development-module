@@ -13,6 +13,7 @@
 	import { Badge } from '$lib/components/ui/badge';
 	import { Button } from '$lib/components/ui/button';
 	import * as Card from '$lib/components/ui/card';
+	import { SelectField } from '$lib/components/ui/select-field';
 	import * as Table from '$lib/components/ui/table';
 	import { cn } from '$lib/utils';
 	import type { AccountDto, RunnerDto } from '../schemas';
@@ -73,6 +74,19 @@
 		}
 	}
 
+	async function setPriority(r: RunnerDto, value: string | null) {
+		busy = r.id;
+		try {
+			const updated = await updateRunner(r.id, { priority: value === null ? null : Number(value) });
+			runners = runners.map((x) => (x.id === r.id ? updated : x));
+			toast.success('Vorrang gespeichert');
+		} catch (e) {
+			toast.error(errMsg(e, 'Änderung fehlgeschlagen'));
+		} finally {
+			busy = null;
+		}
+	}
+
 	async function remove() {
 		const r = removeTarget;
 		if (!r) return;
@@ -108,6 +122,11 @@
 		approved: { label: 'Freigegeben', tone: 'success' },
 		disabled: { label: 'Gesperrt', tone: 'outline' }
 	} as const;
+	const priorityOptions = [
+		{ value: '10', label: 'Bevorzugt' },
+		{ value: '0', label: 'Normal' },
+		{ value: '-10', label: 'Nur als Ausweich' }
+	];
 
 	const coolingDown = (a: AccountDto) => !!a.cooldownUntil && Date.parse(a.cooldownUntil) > now;
 	const caps = (r: RunnerDto) =>
@@ -136,6 +155,10 @@
 </PageHeader>
 
 <div class="space-y-6">
+	<p class="text-sm text-muted-foreground">
+		PC-Runner bekommen Aufträge zuerst. Geht der PC in den Standby oder aus, übernimmt ein
+		Server-Runner mit dem gesicherten Zwischenstand.
+	</p>
 	<details bind:open={guideOpen} class="group rounded-lg border bg-card">
 		<summary
 			class="flex min-h-10 cursor-pointer list-none items-center justify-between gap-2 px-4 py-3"
@@ -190,6 +213,7 @@
 			<Table.Row>
 				<Table.Head>Name</Table.Head>
 				<Table.Head>Status</Table.Head>
+				<Table.Head>Vorrang</Table.Head>
 				<Table.Head>Zuletzt gesehen</Table.Head>
 				<Table.Head class="text-right">Slots</Table.Head>
 				<Table.Head>Version</Table.Head>
@@ -206,15 +230,21 @@
 								'size-2 shrink-0 rounded-full',
 								r.online ? 'bg-success' : 'bg-muted-foreground/40'
 							)}
-							title={r.online ? 'Online' : 'Offline'}
+							title={r.online ? 'Online' : r.kind === 'desktop' ? 'PC nicht aktiv' : 'Offline'}
 						></span>
-						<span class="sr-only">{r.online ? 'Online' : 'Offline'}</span>
+						<span class="sr-only"
+							>{r.online ? 'Online' : r.kind === 'desktop' ? 'PC nicht aktiv' : 'Offline'}</span
+						>
 						{r.name}
+						<Badge variant="outline">{r.kind === 'desktop' ? 'PC' : 'Server'}</Badge>
 					</span>
 				</Table.Cell>
 				<Table.Cell>
 					<span class="inline-flex flex-wrap gap-1">
 						<Badge variant={STATUS[r.status].tone}>{STATUS[r.status].label}</Badge>
+						{#if !r.online && r.kind === 'desktop'}
+							<Badge variant="outline">PC nicht aktiv</Badge>
+						{/if}
 						{#if r.draining && r.online}
 							<Badge
 								variant="warning"
@@ -223,6 +253,26 @@
 							>
 						{/if}
 					</span>
+				</Table.Cell>
+				<Table.Cell>
+					{#key `${r.priority}:${busy === r.id}`}
+						<SelectField
+							label={`Vorrang für ${r.name}`}
+							options={r.priority !== null &&
+							!priorityOptions.some((o) => Number(o.value) === r.priority)
+								? [
+										...priorityOptions,
+										{ value: String(r.priority), label: `Individuell (${r.priority})` }
+									]
+								: priorityOptions}
+							emptyLabel="Automatisch (PC vor Server)"
+							value={r.priority === null ? null : String(r.priority)}
+							onchange={(value) => setPriority(r, value)}
+							disabled={busy === r.id}
+							size="sm"
+						/>
+					{/key}
+					<span class="text-xs text-muted-foreground">Wirksam: {r.effectivePriority}</span>
 				</Table.Cell>
 				<Table.Cell class="text-xs text-muted-foreground">
 					{#if r.online}Jetzt{:else}<TimeAgo value={r.lastSeenAt} empty="nie" />{/if}
