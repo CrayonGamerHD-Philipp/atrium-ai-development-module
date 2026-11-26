@@ -24,7 +24,7 @@ export const STATE_LABEL: Record<RunnerDto['state'], { label: string; tone: Tone
 		offline: { label: 'Offline', tone: 'outline', hint: 'Kein Lebenszeichen' },
 		returned: {
 			label: 'Zurück',
-			tone: 'secondary',
+			tone: 'info',
 			hint: 'Kürzlich aus Standby bzw. Funkstille zurück – bekommt wieder neue Aufträge, laufende bleiben, wo sie sind'
 		},
 		pending: {
