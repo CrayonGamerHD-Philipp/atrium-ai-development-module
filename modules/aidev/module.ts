@@ -31,6 +31,7 @@ import m0008 from './migrations/0008_branch_cleanup_safety.sql?raw';
 import m0009 from './migrations/0009_runner_draining.sql?raw';
 import m0010 from './migrations/0010_chat_actions.sql?raw';
 import m0011 from './migrations/0011_attachments.sql?raw';
+import m0012 from './migrations/0012_runner_kind.sql?raw';
 
 export default defineModule({
 	package: pkg,
@@ -118,7 +119,8 @@ export default defineModule({
 		{ name: '0008_branch_cleanup_safety', sql: m0008 },
 		{ name: '0009_runner_draining', sql: m0009 },
 		{ name: '0010_chat_actions', sql: m0010 },
-		{ name: '0011_attachments', sql: m0011 }
+		{ name: '0011_attachments', sql: m0011 },
+		{ name: '0012_runner_kind', sql: m0012 }
 	],
 	jobs: aidevJobs,
 	onUserDeleted,

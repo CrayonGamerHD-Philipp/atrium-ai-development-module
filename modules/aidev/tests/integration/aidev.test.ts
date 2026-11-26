@@ -1051,11 +1051,15 @@ describe('aidev', () => {
 		expect(child).toMatchObject({ status: 'queued', attempts: 0 });
 		expect((await task(parent.id)).task.status).toBe('blocked');
 
-		// abarbeiten und ausliefern
-		for (const c of [a!, b!]) {
-			const o = await offerFor(c.id);
-			ok(await call('runner', 'POST', `/runner/runs/${o.runId}/accept`), 201);
-			ok(await finish(o.runId, { status: 'succeeded', summary: `Ergebnis ${c.title}` }), 201);
+		// abarbeiten und ausliefern – Reihenfolge der Angebote beliebig (gleiche Anlagezeit → Sortierung nach id)
+		const open = new Map([a!, b!].map((c) => [c.id, c]));
+		while (open.size) {
+			const o = (await offers()).find((x) => open.has(x.taskId));
+			expect(o, 'kein Angebot für einen offenen Teilauftrag').toBeTruthy();
+			const c = open.get(o!.taskId)!;
+			open.delete(c.id);
+			ok(await call('runner', 'POST', `/runner/runs/${o!.runId}/accept`), 201);
+			ok(await finish(o!.runId, { status: 'succeeded', summary: `Ergebnis ${c.title}` }), 201);
 		}
 		const deliver = await offerFor(parent.id);
 		ok(await call('runner', 'POST', `/runner/runs/${deliver.runId}/accept`), 201);
@@ -2583,7 +2587,7 @@ describe('aidev', () => {
 			expect(res.taskStatus).toBe('queued');
 			const after = await task(t.id);
 			expect(after.task.status).toBe('queued');
-			expect(after.task.error).toContain('Übergabe: PC geht in den Standby');
+			expect(after.task.errorMessage).toContain('Übergabe: PC geht in den Standby');
 			const [row] = await q<{ attempts: number; handoff: Record<string, unknown> }>(
 				sql`SELECT t.attempts, r.handoff FROM task t JOIN run r ON r.task_id = t.id
 					WHERE r.id = ${first.runId}`
@@ -2643,7 +2647,8 @@ describe('aidev', () => {
 			expect(lost[0]).toMatchObject({ status: 'lost' });
 			expect(lost[0]!.error_message).toContain('PC-Runner nicht erreichbar');
 			const [m] = await q<{ attempts: number }>(sql`SELECT attempts FROM task WHERE id = ${t.id}`);
-			expect(Number(m!.attempts)).toBe(Number(n!.attempts) - 1);
+			// zurückgebucht und gleich neu angeboten (Dispatch des Jobs) → gleiche Versuchsnummer, nicht +1
+			expect(Number(m!.attempts)).toBe(Number(n!.attempts));
 			ok(await call('admin', 'POST', `/tasks/${t.id}/cancel`), 201);
 		} finally {
 			ok(await call('admin', 'PATCH', `/runners/${pcId}`, { status: 'disabled' }));
