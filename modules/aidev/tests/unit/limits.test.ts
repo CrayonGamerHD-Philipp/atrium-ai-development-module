@@ -39,6 +39,7 @@ function state(over: Partial<AccountState> = {}): AccountState {
 		weekStart: NOW - WEEK_MS / 2,
 		contextK: 200,
 		defaultModel: '',
+		runnerPriority: 0,
 		...over
 	};
 }

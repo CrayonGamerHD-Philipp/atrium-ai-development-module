@@ -31,6 +31,17 @@ export const RUNNER_STALE_SEC = 60;
 /** Höchstzahl gleichzeitiger Live-Verbindungen je Person und Hub */
 export const MAX_STREAMS_PER_USER = 20;
 
+/**
+ * Kürzere Lease für Runner auf dem PC des Nutzers (`kind = 'desktop'`): Geht der PC ohne Übergabe in den Standby,
+ * übernimmt ein Server-Runner schneller (Heartbeat alle `HEARTBEAT_SEC` → drei verpasste Heartbeats).
+ */
+export const DESKTOP_LEASE_SEC = 45;
+
+/** Wirksame Lease (Sekunden) eines laufenden Laufs je Runner-Art (unbekannt/fehlend → Server) */
+export function leaseSecOf(kind: unknown): number {
+	return kind === 'desktop' ? DESKTOP_LEASE_SEC : LEASE_SEC;
+}
+
 /** Wert als `jsonb`-Parameter */
 export const jsonb = (v: unknown): SQL => sql`${JSON.stringify(v)}::jsonb`;
 
