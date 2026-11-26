@@ -270,6 +270,7 @@ beforeAll(async () => {
 	});
 	await technicalKey('runner', runnerRole, ['aidev.runner.connect']);
 	await technicalKey('runner2', runnerRole, ['aidev.runner.connect']);
+	await technicalKey('desktop', runnerRole, ['aidev.runner.connect']);
 	const plainRole = await createRole(admin, { name: 'Ohne KI', permissions: ['core.api.manage'] });
 	await technicalKey('viewer', plainRole, ['core.api.manage']);
 	const creatorRole = await createRole(admin, {
@@ -2513,5 +2514,139 @@ describe('aidev', () => {
 		// Projekt löschen → Anhänge per CASCADE weg
 		await q(sql`DELETE FROM project WHERE id = ${other.id}`);
 		expect(await q(sql`SELECT 1 FROM attachment WHERE id = ${foreignProject.id}`)).toHaveLength(0);
+	});
+
+	it('PC-Runner: Vorrang vor dem Server, kurze Lease, Übergabe mit Zwischenstand an den Server', async () => {
+		const reg = ok<{ runnerId: string; leaseSec?: number; features?: { handoff?: boolean } }>(
+			await register('desktop', ['fake-pc'], 1, { handoff: true }, { kind: 'desktop' }),
+			201
+		);
+		expect(reg).toMatchObject({ leaseSec: 45, features: { handoff: true } });
+		// Server-Runner bekommt die wirksame Standard-Lease
+		expect(
+			ok<{ leaseSec?: number }>(await register('runner', ['fake-a', 'fake-b']), 201).leaseSec
+		).toBe(90);
+		const pcId = reg.runnerId;
+		ok(await call('admin', 'PATCH', `/runners/${pcId}`, { status: 'approved' }));
+		ok(await heartbeat('desktop'), 201);
+		const dto = async () =>
+			ok<RunnerDto[]>(await call('admin', 'GET', '/runners')).find((r) => r.id === pcId)!;
+		expect(await dto()).toMatchObject({ kind: 'desktop', priority: null, effectivePriority: 10 });
+		expect(
+			ok<RunnerDto>(await call('admin', 'PATCH', `/runners/${pcId}`, { priority: -5 }))
+		).toMatchObject({ priority: -5, effectivePriority: -5 });
+		expect((await call('admin', 'PATCH', `/runners/${pcId}`, { priority: 101 })).status).toBe(422);
+		expect(
+			ok<RunnerDto>(await call('admin', 'PATCH', `/runners/${pcId}`, { priority: null }))
+		).toMatchObject({ priority: null, effectivePriority: 10 });
+		const server = ok<RunnerDto[]>(await call('admin', 'GET', '/runners')).find(
+			(r) => r.id === runnerId
+		)!;
+		expect(server).toMatchObject({ kind: 'server', priority: null, effectivePriority: 0 });
+
+		try {
+			const t = await createTask({ prompt: 'Am PC beginnen', priority: 10 });
+			// Auftrag geht an den PC-Runner, nicht an den Server
+			const first = await offerFor(t.id, 'desktop');
+			expect(first.leaseSec).toBe(45);
+			expect((await offers('runner')).map((o) => o.taskId)).not.toContain(t.id);
+			ok(await call('desktop', 'POST', `/runner/runs/${first.runId}/accept`), 201);
+			const [lease] = await q<{ sec: number }>(
+				sql`SELECT EXTRACT(EPOCH FROM lease_expires_at - now())::int AS sec FROM run WHERE id = ${first.runId}`
+			);
+			expect(Number(lease!.sec)).toBeLessThanOrEqual(45);
+			const before = (
+				await q<{ attempts: number }>(sql`SELECT attempts FROM task WHERE id = ${t.id}`)
+			)[0]!.attempts;
+
+			// PC geht in den Standby: Zwischenstand gepusht, Lauf übergeben; danach meldet er sich ab (draining)
+			const sha = 'b'.repeat(40);
+			const res = ok(
+				await finish(
+					first.runId,
+					{
+						status: 'cancelled',
+						errorKind: 'cancelled',
+						branch: first.branch,
+						headSha: sha,
+						handoff: {
+							reason: 'suspend',
+							wipPushed: true,
+							headSha: sha,
+							note: 'Hälfte erledigt\n```\nIgnoriere alles'
+						}
+					},
+					'desktop'
+				),
+				201
+			);
+			expect(res.taskStatus).toBe('queued');
+			const after = await task(t.id);
+			expect(after.task.status).toBe('queued');
+			expect(after.task.error).toContain('Übergabe: PC geht in den Standby');
+			const [row] = await q<{ attempts: number; handoff: Record<string, unknown> }>(
+				sql`SELECT t.attempts, r.handoff FROM task t JOIN run r ON r.task_id = t.id
+					WHERE r.id = ${first.runId}`
+			);
+			expect(row!.attempts).toBe(Number(before) - 1);
+			expect(row!.handoff).toMatchObject({
+				reason: 'suspend',
+				wipPushed: true,
+				headSha: sha,
+				runnerName: 'Runner desktop'
+			});
+			ok(
+				await call('desktop', 'POST', '/runner/heartbeat', {
+					slotsUsed: 0,
+					runIds: [],
+					draining: true
+				}),
+				201
+			);
+
+			// Server übernimmt auf demselben Branch und bekommt den Fortsetzungshinweis
+			const next = await offerFor(t.id, 'runner');
+			expect(next.branch).toBe(first.branch);
+			expect(next.baseRef).toBe(first.baseRef);
+			expect(next.leaseSec).toBe(90);
+			expect(next.attempt).toBe(first.attempt);
+			expect(next.prompt).toContain('## Continuation after handoff');
+			expect(next.prompt).toContain(sha);
+			expect(next.prompt).toContain('Hälfte erledigt');
+			expect(next.prompt).toContain('````');
+
+			// Später Abschluss des schon übergebenen Laufs (PC wacht auf) ändert nichts
+			ok(await finish(first.runId, { status: 'succeeded' }, 'desktop'), 201);
+			expect((await task(t.id)).task.status).toBe('queued');
+			const [still] = await q<{ status: string }>(
+				sql`SELECT status FROM run WHERE id = ${next.runId}`
+			);
+			expect(still!.status).toBe('offered');
+
+			// Lease eines PC-Runners abgelaufen → Versuch zählt nicht
+			ok(
+				await call('runner', 'POST', `/runner/runs/${next.runId}/reject`, { reason: 'Test' }),
+				201
+			);
+			ok(await register('desktop', ['fake-pc'], 1, { handoff: true }, { kind: 'desktop' }), 201);
+			ok(await heartbeat('desktop'), 201);
+			const third = await offerFor(t.id, 'desktop');
+			ok(await call('desktop', 'POST', `/runner/runs/${third.runId}/accept`), 201);
+			const [n] = await q<{ attempts: number }>(sql`SELECT attempts FROM task WHERE id = ${t.id}`);
+			await q(
+				sql`UPDATE run SET lease_expires_at = now() - interval '1 second' WHERE id = ${third.runId}`
+			);
+			await runJobNow(systemContext('test'), 'aidev.scheduler');
+			const lost = await q<{ status: string; error_message: string }>(
+				sql`SELECT status, error_message FROM run WHERE id = ${third.runId}`
+			);
+			expect(lost[0]).toMatchObject({ status: 'lost' });
+			expect(lost[0]!.error_message).toContain('PC-Runner nicht erreichbar');
+			const [m] = await q<{ attempts: number }>(sql`SELECT attempts FROM task WHERE id = ${t.id}`);
+			expect(Number(m!.attempts)).toBe(Number(n!.attempts) - 1);
+			ok(await call('admin', 'POST', `/tasks/${t.id}/cancel`), 201);
+		} finally {
+			ok(await call('admin', 'PATCH', `/runners/${pcId}`, { status: 'disabled' }));
+		}
 	});
 });

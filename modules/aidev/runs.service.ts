@@ -434,7 +434,12 @@ export async function finishRun(
 				// Der nächste Lauf muss auf demselben Arbeits-Branch (mit dem WIP-Commit) weitermachen. `branch` ist ab
 				// dem ersten Angebot gesetzt; nur falls nicht (ältere Daten), den gemeldeten Branch übernehmen.
 				const branch = input.branch ?? str(run.branch);
-				if (handoff.wipPushed && branch && !task.branch && !READ_ONLY_ROLES.includes(effectiveRole(task))) {
+				if (
+					handoff.wipPushed &&
+					branch &&
+					!task.branch &&
+					!READ_ONLY_ROLES.includes(effectiveRole(task))
+				) {
 					await tx.execute(sql`UPDATE task SET branch = ${branch} WHERE id = ${task.id}`);
 				}
 			}

@@ -337,7 +337,9 @@ function handoffSection(c: PromptContext): string[] {
 	const h = c.handoff;
 	if (!h) return [];
 	const why = h.reason === 'shutdown' ? 'the PC was shut down' : 'the PC went into standby';
-	const commit = h.headSha ? ` (commit \`${h.headSha.replace(/[^0-9a-f]/gi, '').slice(0, 40)}\`)` : '';
+	const commit = h.headSha
+		? ` (commit \`${h.headSha.replace(/[^0-9a-f]/gi, '').slice(0, 40)}\`)`
+		: '';
 	const branch = h.branch ? ` \`${h.branch.replace(/`/g, '')}\`` : '';
 	const lines = [
 		'',

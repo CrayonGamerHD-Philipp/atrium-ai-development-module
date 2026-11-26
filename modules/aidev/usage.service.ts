@@ -109,7 +109,9 @@ export async function loadAccountViews(
 			// PC-Runner (`desktop`) vor Server-Runnern, sofern die Verwaltung nichts anderes vorgibt
 			runnerPriority: runnerPriorityOf(
 				str(r.runner_kind),
-				r.runner_priority === null || r.runner_priority === undefined ? null : num(r.runner_priority)
+				r.runner_priority === null || r.runner_priority === undefined
+					? null
+					: num(r.runner_priority)
 			)
 		};
 		const u = utilization(state);

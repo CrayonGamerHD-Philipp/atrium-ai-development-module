@@ -595,12 +595,17 @@ describe('Runner-Vorrang (PC vor Server)', () => {
 		);
 		const b = account({ id: 'acc-b', runnerId: 'srv2', running: 1 });
 		expect(
-			planAssignments(plan({ accounts: [server(), b], tasks: [task({ sessionAccountId: 'acc-b' })] }))[0]!
-				.accountId
+			planAssignments(
+				plan({ accounts: [server(), b], tasks: [task({ sessionAccountId: 'acc-b' })] })
+			)[0]!.accountId
 		).toBe('acc-b');
 	});
 	it('explizite Priorität überschreibt die Art', () => {
-		const srv = account({ id: 'acc-srv', runnerId: 'srv', runnerPriority: runnerPriorityOf('server', 50) });
+		const srv = account({
+			id: 'acc-srv',
+			runnerId: 'srv',
+			runnerPriority: runnerPriorityOf('server', 50)
+		});
 		const pc = desktop({ budget5h: 0, used5h: 0, running: 0 });
 		expect(planAssignments(plan({ accounts: [srv, pc], tasks: [task()] }))[0]!.accountId).toBe(
 			'acc-srv'
