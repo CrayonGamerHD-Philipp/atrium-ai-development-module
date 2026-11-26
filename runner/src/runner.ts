@@ -342,6 +342,7 @@ export class Runner {
 		}
 		if (!this.paused) this.executor.resume();
 		if (this.shutdownResumeTimer) clearTimeout(this.shutdownResumeTimer);
+		this.shutdownResumeTimer = null;
 		this.needsRegister = false;
 		if (await this.registerOnce()) this.stream?.reconnect();
 		await this.sendHeartbeat();
@@ -369,12 +370,12 @@ export class Runner {
 		}
 		const grace = this.power?.graceMs ?? null;
 		await this.handover(e.type === 'suspend' ? 'suspend' : 'shutdown', grace);
-		if (e.type === 'shutdown') {
-			// Herunterfahren abgebrochen (z. B. vom Nutzer)? Dann nach 2 min wieder Aufträge annehmen
-			if (this.shutdownResumeTimer) clearTimeout(this.shutdownResumeTimer);
-			this.shutdownResumeTimer = setTimeout(() => void this.wake('Herunterfahren abgebrochen'), 120_000);
-			this.shutdownResumeTimer.unref();
-		}
+		// Standby bzw. Herunterfahren abgebrochen (ohne Aufwach-Ereignis)? Dann nach 1 bzw. 2 min wieder Aufträge
+		// annehmen. Schläft der Rechner wirklich, ist der Timer eingefroren und löst erst nach dem Aufwachen aus.
+		if (this.shutdownResumeTimer) clearTimeout(this.shutdownResumeTimer);
+		const label = e.type === 'suspend' ? 'Standby abgebrochen' : 'Herunterfahren abgebrochen';
+		this.shutdownResumeTimer = setTimeout(() => void this.wake(label), e.type === 'suspend' ? 60_000 : 120_000);
+		this.shutdownResumeTimer.unref();
 	}
 
 	/** Steuerdateien auswerten: `stop`/`handover` (einmalig), `pause` (solange vorhanden) */
@@ -599,6 +600,7 @@ export class Runner {
 			else this.log.info('Alle laufenden Läufe sind fertig');
 		}
 		for (const t of this.timers) clearInterval(t);
+		if (this.shutdownResumeTimer) clearTimeout(this.shutdownResumeTimer);
 		await this.executor.shutdown();
 		this.stop.abort();
 	}
