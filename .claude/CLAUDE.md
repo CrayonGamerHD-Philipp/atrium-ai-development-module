@@ -6,9 +6,12 @@ still apply: `.core/.claude/CLAUDE.md` and `.core/.claude/rules/*.md` (especiall
 
 ## Structure
 - `modules/aidev/` – Atrium module (control center): `protocol.ts` (Runner ↔ Atrium, also bundled by the runner – only `zod`),
-  `schemas.ts` (permissions, DTOs, endpoint table), `scheduler.ts` + `prompts.ts` + `actions.ts` (pure logic; `actions.ts` = agent action proposals from the `aidev-actions` block), `*.endpoints.ts`/`*.service.ts`,
+  `schemas.ts` (permissions, DTOs, endpoint table), `scheduler.ts` + `prompts.ts` + `actions.ts` + `leases.ts` + `handover.ts` (pure logic; `actions.ts` = agent action proposals from the `aidev-actions` block, `leases.ts` = fencing checks, `handover.ts` = handover history/runner state/versions), `runner-release.ts` (runner version shipped with the module, must equal `runner/package.json`), `*.endpoints.ts`/`*.service.ts`,
   `live.ts` (SSE hubs), `jobs.ts`, `migrations/`, `pages/` + `ui.ts` (interface), `tests/`.
-- `runner/` – standalone Node service (Docker) with git, gh, and the agent CLIs; not loaded by Atrium.
+- `runner/` – standalone Node service (Docker or single binary on a PC) with git, gh, and the agent CLIs; not loaded by Atrium.
+  `src/power/` (standby/shutdown detection per OS behind one interface), `src/desktop/` (autostart, PC commands),
+  `src/git/wip.ts` (WIP refs `refs/aidev/wip/<runId>`), `scripts/build-sea.mjs` + `packaging/` (release builds,
+  `.github/workflows/release-runner.yml`, tag `runner-v*`).
 
 ## Commands
 | Command | Purpose |

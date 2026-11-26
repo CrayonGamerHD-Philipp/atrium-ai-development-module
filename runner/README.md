@@ -1,8 +1,8 @@
 # Atrium aidev-Runner
 
 Der Runner führt die Agent-Läufe des Atrium-Moduls **KI-Entwicklung** (`aidev`) aus. Atrium ist die Steuerzentrale;
-der Runner läuft getrennt davon (Docker-Container auf einem Server oder PC), verbindet sich **ausgehend** mit Atrium
-und braucht keine offenen Ports.
+der Runner läuft getrennt davon (Docker-Container auf einem Server oder als fertiges Programm auf deinem PC, siehe
+[PC-Runner](#pc-runner-windows-macos-linux)), verbindet sich **ausgehend** mit Atrium und braucht keine offenen Ports.
 
 - Anmeldung mit einem API-Key, Befehle per Server-Sent Events (`GET /runner/stream`), Rückmeldungen per JSON-POST.
 - Agents: **Claude Code** (`claude`), **Codex** (`codex`), **Gemini CLI** (`gemini`), **OpenAI-kompatible APIs**
@@ -86,8 +86,9 @@ docker compose logs -f runner
 
 Ohne Compose: `docker build -f runner/Dockerfile -t atrium-aidev-runner .` (aus der Repo-Wurzel).
 
-Lokal ohne Docker (nur zur Entwicklung, siehe Sicherheit): `npm install && npm run build && npm start`
-bzw. `npm run dev`.
+Lokal ohne Docker zur Entwicklung: `npm install && npm run build && npm start` bzw. `npm run dev`. Für den
+Dauerbetrieb auf dem eigenen PC gibt es fertige Programme mit Autostart und Übergabe an Server-Runner, siehe
+[PC-Runner](#pc-runner-windows-macos-linux) (Sicherheit ohne Docker beachten).
 
 ### 5. In Atrium freigeben
 
@@ -149,7 +150,8 @@ Ein Neustart ist jederzeit möglich, kein Auftrag geht verloren:
 | geordnet, `DRAIN_SEC=0` (Standard) | sofort abgebrochen, als `cancelled` gemeldet, Atrium plant sie neu ein; bekommt der Auftrag dasselbe Konto wieder, setzt der Agent seine Sitzung fort | nein |
 | geordnet, `DRAIN_SEC>0` | der Runner meldet `draining` (Atrium zeigt „Wird beendet“ und bietet ihm nichts Neues an) und wartet bis zu `DRAIN_SEC` Sekunden, bis die Läufe fertig sind (inkl. Commit, Push, PR); danach Rest wie oben | nein |
 | hart (`kill -9`, Absturz, Stromausfall) | beim nächsten Start meldet der Runner seine (leeren) Läufe bei der Anmeldung (`runIds`); Atrium gibt die verwaisten sofort frei und plant sie neu ein | nein (Verbindungsverlust; nach 20 in Folge `failed`) |
-| Runner kommt nicht wieder | nach Ablauf der Lease (90 s) gibt der Scheduler-Job die Läufe frei und plant sie neu ein | nein (Verbindungsverlust; nach 20 in Folge `failed`) |
+| Runner kommt nicht wieder | nach Ablauf der Lease (Server 90 s, PC-Runner 60 s, je Runner einstellbar) gibt der Scheduler-Job die Läufe frei und plant sie neu ein | nein (Verbindungsverlust; nach 20 in Folge `failed`) |
+| PC-Runner: Standby, Herunterfahren, `handover` | geordnete Übergabe mit Zwischenstand (WIP-Ref), siehe [PC-Runner](#vorrang-und-übergabe) | nein |
 
 Der Heartbeat (alle 15 s) bleibt sicher unter der Lease: je Versuch höchstens 20 s für Antwortkopf und -körper,
 höchstens zwei Versuche und dazwischen höchstens 10 s Wartezeit (auch bei `retry-after`). Ein hängender Antwortkörper
@@ -158,6 +160,191 @@ blockiert die Heartbeat-Schleife damit nicht mehr.
 Signale: Das erste `SIGTERM`/`SIGINT` startet das geordnete Beenden, ein zweites bricht die Wartefrist ab
 (laufende Läufe werden abgebrochen und neu eingeplant), ein drittes beendet sofort. Bei Docker muss
 `stop_grace_period` größer als `DRAIN_SEC` plus etwa 30 s sein, sonst beendet Docker den Runner hart.
+
+## PC-Runner (Windows, macOS, Linux)
+
+Ein Runner kann auch auf deinem eigenen PC laufen – als fertiges Programm aus den
+[GitHub Releases](https://github.com/CrayonGamerHD-Philipp/atrium-ai-development-module/releases?q=runner-v), ohne Node
+und ohne Docker (Docker bleibt möglich). Solange der PC läuft, bekommt er Aufträge **zuerst**; geht er in den Standby,
+wird er heruntergefahren oder verliert er die Verbindung, übernimmt ein Server-Runner die laufenden und wartenden
+Aufträge – ohne Datenverlust und ohne dass der Versuch zählt.
+
+Nicht enthalten sind die Agent-CLIs (`claude`, `codex`, `gemini`), `git` und `gh`. `atrium-runner probe` prüft sie und
+nennt fehlende Programme mit Installationshinweis.
+
+### Installation je Betriebssystem
+
+| System | Download | Installation |
+|---|---|---|
+| Windows 10/11 (x64, arm64) | `atrium-runner-<v>-windows-x64-setup.exe` (oder `.zip`) | Installer ausführen (pro Benutzer, keine Administratorrechte). Er legt das Programm nach `%LOCALAPPDATA%\Programs\AtriumRunner`, ergänzt den `PATH`, legt die Konfigurationsvorlage `%APPDATA%\AtriumRunner\runner.config.json` an und richtet den Autostart ein (Aufgabe „AtriumRunner“ bei Anmeldung, ohne Berechtigung über `HKCU\…\Run`). Startmenü: Status, „Jetzt an Server übergeben“, Pausieren, Fortsetzen, Konfiguration. |
+| macOS (Apple Silicon, Intel) | `atrium-runner-<v>-macos-arm64.pkg` bzw. `-macos-x64.pkg` (oder `.tar.gz`) | `.pkg` öffnen: Programm nach `/usr/local/lib/atrium-runner`, Befehl `/usr/local/bin/atrium-runner`, LaunchAgent `~/Library/LaunchAgents/de.kalypzo.atrium-runner.plist` (ohne Start). Konfiguration: `~/Library/Application Support/AtriumRunner/runner.config.json`, Logs: `~/Library/Logs/AtriumRunner/runner.log`. |
+| Linux (x64, arm64, systemd) | `atrium-runner-<v>-linux-x64.tar.gz` (oder `.deb`) | `tar xzf …tar.gz && ./atrium-runner-<v>-linux-x64/install.sh` (als normaler Benutzer): Programm nach `~/.local/lib/atrium-runner`, Befehl `~/.local/bin/atrium-runner`, systemd-User-Unit `~/.config/systemd/user/atrium-runner.service`. Konfiguration: `~/.config/atrium-runner/runner.config.json`, Daten: `~/.local/share/atrium-runner/`. Das `.deb` installiert nach `/opt/atrium-runner`; den Autostart richtet danach jeder Benutzer mit `atrium-runner install` ein. Damit der Runner auch ohne Anmeldung läuft: `loginctl enable-linger`. |
+
+Danach:
+
+1. In der Konfiguration `atriumUrl` und `apiKey` eintragen (technischer Benutzer, siehe Schritt 1) und die Konten
+   anpassen. Die Datei hat die Rechte `0600`; der API-Key verlässt den PC nie in Richtung der Agents.
+2. Bei den CLIs anmelden: `atrium-runner login <konto>` (wie beim Server-Runner).
+3. `atrium-runner probe` – prüft Konfiguration, git, gh, CLIs und Logins.
+4. `atrium-runner service-start` (bzw. `atrium-runner install`, falls der Autostart noch fehlt).
+5. In Atrium unter **Administration → Runner & Konten** freigeben. Der Runner erscheint als **PC-Runner** mit Vorrang 10.
+
+### Befehle
+
+| Befehl | Wirkung |
+|---|---|
+| `atrium-runner install [--no-start]` | Konfigurationsvorlage anlegen (falls fehlend), Autostart einrichten, starten |
+| `atrium-runner uninstall [--purge]` | geordnet beenden, Autostart entfernen; `--purge` löscht auch Konfiguration und Arbeitsverzeichnis |
+| `atrium-runner service-start` / `stop` / `restart` | über den Autostart starten, geordnet beenden (Übergabe laufender Läufe), neu starten |
+| `atrium-runner status` | Autostart, Prozess, Zustand in Atrium, Übergabe, Läufe, letzter Heartbeat, Energie-Überwachung |
+| `atrium-runner handover` | laufende Läufe **jetzt** an einen Server-Runner übergeben, danach normal weiter |
+| `atrium-runner pause` / `resume` | übergeben und keine neuen Aufträge annehmen bzw. wieder annehmen |
+| `atrium-runner login <konto>`, `probe`, `start`, `init` | wie beim Server-Runner; `start` läuft im Vordergrund, `init` legt nur die Vorlage an |
+
+`stop`, `handover` und `pause` wirken über Steuerdateien im Arbeitsverzeichnis (`<WORK_DIR>/control/`) auf den laufenden
+Runner – plattformunabhängig, auch unter Windows. Ein Tray-Icon gibt es (noch) nicht; unter Windows decken die
+Startmenü-Einträge dieselben Aktionen ab.
+
+PC-spezifische Einstellungen (Datei bzw. Umgebung):
+
+| Variable / Feld | Bedeutung | Standard |
+|---|---|---|
+| `RUNNER_KIND` / `kind` | `server` oder `desktop` | `server` (Vorlage des PC-Runners: `desktop`) |
+| `HANDOVER_SEC` / `handoverSec` | Zeitbudget einer Übergabe (3–300 s); das Betriebssystem begrenzt ggf. weiter | `20` |
+| `WIP_CHECKPOINT_MIN` / `wipCheckpointMin` | Zwischenstände laufender Läufe alle n Minuten sichern (0 = aus) | desktop `10`, server `0` |
+| `POWER_EVENTS` / `powerEvents` | Standby/Herunterfahren beobachten | an für `desktop` |
+
+### Vorrang und Übergabe
+
+- **Vorrang**: Der Scheduler bietet einen Auftrag zuerst den Konten der höchsten Vorrangstufe an, die ihn übernehmen
+  können (Rolle, Anbieter-Wunsch, Limits, freie Slots wie bisher). PC-Runner haben automatisch Vorrang 10,
+  Server-Runner 0; unter **Runner & Konten → Bearbeiten** lassen sich Art, Vorrang und Heartbeat-Zeitlimit festlegen.
+  Innerhalb einer Stufe entscheidet die bisherige Punktzahl (Auslastung, Sitzung, bevorzugter Runner des Projekts).
+- **Kein Hin- und Herspringen**: Kommt der PC zurück, bekommt er nur **neue** Aufträge; laufende Server-Läufe bleiben, wo
+  sie sind. Ein Runner/Konto, auf dem ein Auftrag die Verbindung verloren hat, fällt für diesen Auftrag hinter alle
+  anderen zurück (bleibt aber Ausweg).
+- **Anderes Konto/Anbieter**: Die Übergabe darf auf einem anderen Konto oder Anbieter landen; Rollen-Vorlieben,
+  `providerHint` und Limits gelten unverändert. Die Agent-Sitzung wird nur bei gleichem Konto fortgesetzt, sonst
+  beginnt der neue Agent mit dem Zwischenstand und einem Hinweis im Auftragstext („Continuation after handoff“).
+
+**Geordnete Übergabe** (Standby, Herunterfahren, Abmelden, `handover`/`pause`), so kurz wie möglich:
+
+1. Heartbeat mit `handover` – Atrium zeigt „Wird übergeben“ und bietet nichts Neues an.
+2. Agents stoppen.
+3. Zwischenstand als **WIP-Commit auf dem eigenen Ref `refs/aidev/wip/<runId>`** pushen (falls in der Frist machbar).
+   Der Commit entsteht über einen temporären Index (Worktree, Index und Branch bleiben unberührt) und enthält auch
+   lokale, noch nicht gepushte Commits. Ein Ref außerhalb von `refs/heads/` ist kein Branch: Er erscheint in keinem PR,
+   nicht im Haupt-Branch und löst keine Branch-CI aus.
+4. Läufe als übergeben melden (`finish` mit `status: cancelled` und `handoff`). Atrium plant sofort neu ein – der
+   Versuch zählt nicht –, und der Verlauf zeigt „Übergeben von PC-Runner X an Server-Runner Y (Grund: Standby)“.
+
+Der übernehmende Runner holt den WIP-Ref, prüft, dass er genau der gemeldete Commit ist und den aktuellen Stand von
+`origin/<branch>` enthält (sonst ist er veraltet und wird ignoriert), und stellt ihn als **nicht committete Änderungen**
+wieder her. Ausgeliefert wird wie immer ein normaler Commit; nach Erfolg löscht der Runner den verbrauchten WIP-Ref.
+
+| System | Ereignis | Zeit, die das System lässt |
+|---|---|---|
+| Linux | logind `PrepareForSleep`/`PrepareForShutdown` über D-Bus (`gdbus`, sonst `dbus-monitor`) mit Delay-Inhibitor (`systemd-inhibit --mode=delay`); `SIGTERM` beim Herunterfahren | `InhibitDelayMaxSec` in `/etc/systemd/logind.conf` (Standard 5 s; empfohlen `InhibitDelayMaxSec=30`) |
+| Windows | verstecktes Fenster (PowerShell-Hilfsprozess, C# ohne native Abhängigkeit): `WM_POWERBROADCAST`/`PBT_APMSUSPEND`, `WM_QUERYENDSESSION`/`WM_ENDSESSION` mit `ShutdownBlockReasonCreate` | Standby ca. 2 s, Herunterfahren bis 15 s (Windows zeigt „Atrium-Runner übergibt laufende Aufträge“) |
+| macOS | JXA-Hilfsprozess: `NSWorkspaceWillSleepNotification`, `…WillPowerOffNotification`, `…DidWakeNotification`; `SIGTERM` von launchd (`ExitTimeOut` 30 s) | wenige Sekunden (macOS wartet nicht auf die Benachrichtigung) |
+| alle | Zeitsprung der Wanduhr (Prozess war eingefroren) → Aufwachen erkannt, auch ohne Ereignis | – |
+
+Reicht die Zeit nicht für den Push, wird ohne Zwischenstand übergeben; dann zählt der letzte gepushte Stand bzw. der
+letzte Checkpoint.
+
+**Ungeordneter Ausfall** (Strom weg, Absturz, WLAN weg, Standby ohne Ereignis): Atrium erkennt ihn am Heartbeat-Zeitlimit
+(Lease; PC-Runner **60 s**, Server-Runner 90 s, je Runner einstellbar 30–900 s) und plant den Lauf als
+Verbindungsverlust neu ein – ab dem letzten gepushten Stand bzw. dem letzten **Checkpoint**: Während langer Läufe
+sichert der PC-Runner alle `WIP_CHECKPOINT_MIN` Minuten einen WIP-Commit auf seinen Ref und meldet ihn
+(`POST /runner/runs/:id/checkpoint`).
+
+### Keine doppelte Ausführung (Fencing)
+
+Jedes Angebot erhöht das **Fencing-Token** des Auftrags (`task.lease_epoch` → `offer.fence`). Der Runner sendet es bei
+Ereignissen, Checkpoints und Abschluss mit; Atrium lehnt Meldungen zu einem übernommenen Lauf oder mit veraltetem Token mit
+**409** ab. Vor **jedem Push** (Auslieferung und Checkpoint) prüft der Runner seine Lease (`POST /runner/leases`); ist sie
+ungültig oder Atrium nicht erreichbar, pusht er nicht. Wacht der PC auf, prüft er zuerst alle Leases: übernommene Läufe
+verwirft er (Agent stoppen, nichts pushen, nichts melden), meldet sich neu an und nimmt danach wieder neue Aufträge an.
+Die Worktrees verworfener Läufe räumt das normale Aufräumen später weg. WIP-Refs sind je Lauf getrennt – ein
+aufgewachter PC kann den Zwischenstand des Server-Runners also nicht überschreiben.
+
+### Sicherheit ohne Docker
+
+Die Agents laufen ohne Rückfragen. Im Container begrenzen Benutzer, Capabilities und Netz, was sie anrichten können –
+auf dem PC laufen sie mit **deinen** Rechten: Sie könnten Dateien außerhalb des Worktrees lesen oder ändern (SSH-Keys,
+Browser-Profile, andere Projekte) und alles erreichen, was dein Benutzer im Netz erreicht. Umgesetzt ist eine
+vertretbare Grundlinie:
+
+- kein Root bzw. keine Installation mit Administratorrechten (Installer pro Benutzer, `install`/`start` verweigern root),
+- eigenes Arbeitsverzeichnis je Runner (Repos, Worktrees), Konfiguration mit Rechten `0600`, API-Key nie an Agents,
+  Terminals oder Projektbefehle,
+- Zugangsdaten bleiben auf dem PC, Ausgaben werden bereinigt, `systemd`: `NoNewPrivileges=true`,
+- fine-grained GitHub-Token nur für die gewählten Repos, Branch-Protection auf dem Haupt-Branch.
+
+Empfehlung (abgestuft, **noch abzustimmen**, bevor mehr davon fest eingebaut wird):
+
+1. **Eigenes Benutzerkonto** nur für den Runner (z. B. `atrium-runner`) mit eigenen CLI-Logins und eigenem
+   `gh`-Token – trennt die Agents von deinen persönlichen Daten, ohne Docker. Für die meisten der beste Kompromiss.
+2. **Docker Desktop** bzw. Podman mit dem bestehenden Image – volle Isolation wie auf dem Server.
+3. Zusätzlich möglich: Firewall-Regeln nur für GitHub, Atrium und die KI-Anbieter.
+
+### Manuelle Tests je Betriebssystem
+
+Vorbereitung: ein Server-Runner (Docker) und ein PC-Runner, beide freigegeben, ein Testprojekt mit einem Auftrag, der
+einige Minuten dauert.
+
+| Schritt | Windows | macOS | Linux |
+|---|---|---|---|
+| Installation | Setup ausführen, `atrium-runner status` in neuer Konsole | `.pkg` installieren, `atrium-runner status` | `install.sh`, `systemctl --user status atrium-runner` |
+| Erscheint als „pending“, Freigabe | Runner & Konten | dito | dito |
+| Vorrang | neuer Auftrag läuft auf dem PC | dito | dito |
+| Standby | Start → Energie → Energie sparen | Apple-Menü → Ruhezustand | `systemctl suspend` |
+| Erwartung | Runner-Seite „Wird übergeben“ bzw. „Standby“; Auftrag läuft auf dem Server weiter, Verlauf „Übergeben von PC-Runner … (Grund: Standby)“; `git ls-remote origin 'refs/aidev/wip/*'` zeigt den WIP-Ref; PR wird **einmal** erstellt, kein WIP-Commit im PR | dito | dito |
+| Aufwachen | PC aufwecken: Runner „Zurück“, kein zweiter Push/PR (Log: „Lauf … wurde übernommen und wird verworfen“), neue Aufträge gehen wieder an den PC | dito | dito |
+| Herunterfahren | Herunterfahren mit laufendem Auftrag (kurz „Atrium-Runner übergibt …“) | Ausschalten | `systemctl poweroff` |
+| Harter Ausfall | Netzwerk trennen bzw. Stecker ziehen: nach ≤ 60 s übernimmt der Server ab dem letzten Checkpoint | dito | dito |
+| Deinstallation | Apps → Atrium Runner → Deinstallieren (Autostart weg) | `atrium-runner uninstall`, dann `/usr/local/lib/atrium-runner` löschen | `atrium-runner uninstall`, `rm -r ~/.local/lib/atrium-runner` |
+
+### Release erstellen
+
+1. Version in `runner/package.json` **und** `modules/aidev/runner-release.ts` erhöhen (ein Test prüft die Gleichheit;
+   `runner-release.ts` steuert den Hinweis „Update verfügbar“ auf der Runner-Seite).
+2. Commit auf `main`, dann Tag setzen und pushen: `git tag runner-v0.4.0 && git push origin runner-v0.4.0`.
+   Tags mit `-beta`/`-rc` (z. B. `runner-v0.5.0-rc.1`) werden als Pre-Release veröffentlicht.
+3. `.github/workflows/release-runner.yml` läuft: CI (Lint, Typen, Tests von Modul und Runner) → Versionsprüfung (Tag ↔
+   `package.json` ↔ `runner-release.ts`, sonst Abbruch) → Build auf nativen Runnern (Linux x64/arm64, macOS arm64/x64,
+   Windows x64, optional arm64) → Smoke-Test (`--version`, `probe` mit `fake`-Provider) → Pakete → GitHub Release mit
+   allen Dateien, `SHA256SUMS.txt` und Release Notes aus den Commits seit dem letzten Runner-Tag. Optional veröffentlicht
+   derselbe Workflow das Docker-Image `ghcr.io/<owner>/atrium-aidev-runner:<version>` (und `latest` für Releases).
+   Manuell: **Actions → Release Runner → Run workflow** (nur Artefakte, oder mit „publish“ als Release).
+
+**Technik:** Node **SEA** (Single Executable Application, `scripts/build-sea.mjs`): Die Node-Laufzeit des Build-Rechners
+mit dem gebündelten Runner (CommonJS) als eingebettetem Blob (`postject`). Gewählt, weil der Runner auf genau der
+Node-Version läuft, gegen die `node-pty` gebaut wird (gleiche ABI), und weil keine fremde Laufzeit nötig ist (`bun
+--compile` unterstützt `node-pty` nicht zuverlässig). `node-pty` wird je Plattform/Architektur auf dem nativen Runner
+gebaut und als `node_modules/node-pty` neben das Programm gelegt; der Runner lädt es von dort (`createRequire`).
+
+**Signierung (optional):** Ohne Secrets wird unsigniert gebaut. Repository-Secrets:
+
+| Secret | Zweck |
+|---|---|
+| `WINDOWS_CERT_PFX_BASE64`, `WINDOWS_CERT_PASSWORD` | Authenticode für `atrium-runner.exe` und den Installer |
+| `MACOS_CERT_P12_BASE64`, `MACOS_CERT_PASSWORD`, `MACOS_SIGN_IDENTITY` | Developer ID Application (Hardened Runtime, `packaging/macos/entitlements.plist`) |
+| `MACOS_INSTALLER_IDENTITY` | Developer ID Installer für das `.pkg` |
+| `APPLE_ID`, `APPLE_TEAM_ID`, `APPLE_APP_PASSWORD` | Notarisierung des `.pkg` (`notarytool`, danach `stapler`) |
+
+Zertifikate landen nur im temporären Verzeichnis bzw. einer temporären Keychain des Build-Rechners und werden danach
+gelöscht; die Workflow-Schritte sehen die Werte nur, wo sie sie brauchen.
+
+Unsignierte Builds: **Windows SmartScreen** meldet „Der Computer wurde durch Windows geschützt“ → **Weitere
+Informationen → Trotzdem ausführen**. **macOS Gatekeeper** meldet „kann nicht geöffnet werden, da der Entwickler nicht
+verifiziert werden kann“ → Rechtsklick auf das `.pkg` → **Öffnen** (bzw. Systemeinstellungen → Datenschutz & Sicherheit →
+„Trotzdem öffnen“), beim `.tar.gz`: `xattr -d com.apple.quarantine atrium-runner`. Prüfsummen: `shasum -a 256 -c
+SHA256SUMS.txt --ignore-missing`.
+
+**Update-Hinweis:** Der Runner meldet Version und Protokoll bei der Anmeldung. Die Runner-Seite zeigt „Update
+verfügbar“, wenn er älter ist als die mit dem Modul ausgelieferte Runner-Version, und „Protokoll veraltet“ bei älterer
+Protokollversion. Ein automatisches Selbst-Update gibt es bewusst nicht (erst nach Abstimmung).
 
 ## Annahmen zu den CLIs
 
@@ -233,9 +420,11 @@ der Codex-Sitzungsdateien bleiben auf dem Runner. Die aktive Abfrage spricht nur
 ## Sicherheit
 
 - **Agents laufen ohne Rückfragen** (`--dangerously-skip-permissions`, `--dangerously-bypass-approvals-and-sandbox`,
-  `--yolo`). Den Runner deshalb **nur im Container** betreiben: Benutzer ohne Root (UID 10002), `cap_drop: ALL`,
+  `--yolo`). Auf Servern den Runner deshalb **im Container** betreiben: Benutzer ohne Root (UID 10002), `cap_drop: ALL`,
   `no-new-privileges`, eigenes Netz, optional Egress-Allowlist (nur GitHub, Atrium, KI-Anbieter). Niemals auf dem
-  Atrium-Host.
+  Atrium-Host. Auf dem eigenen PC ohne Docker: siehe [Sicherheit ohne Docker](#sicherheit-ohne-docker).
+- **Übergabe/Fencing**: WIP-Zwischenstände liegen nur unter `refs/aidev/wip/<runId>` (kein Branch, kein PR). Vor jedem
+  Push prüft der Runner seine Lease; Meldungen mit veraltetem Fencing-Token lehnt Atrium ab.
 - **GitHub**: fine-grained Personal Access Token **nur für die gewählten Repos** (Contents, Pull requests, ggf.
   Workflows: Read & write). Auf dem Haupt-Branch **Branch-Protection** aktivieren (Reviews/Checks), dann kann auch ein
   fehlerhafter Agent nichts direkt zerstören. Force-Pushes macht der Runner nur `--force-with-lease` auf eigene
@@ -263,8 +452,9 @@ der Codex-Sitzungsdateien bleiben auf dem Runner. Die aktive Abfrage spricht nur
 ```sh
 npm install
 npm run check   # tsc --noEmit
-npm test        # vitest: SSE, Batcher, Redaction, Pfad-Jail, Limits, Parser, Plan, Git-Ablauf, Runner
+npm test        # vitest: SSE, Batcher, Redaction, Pfad-Jail, Limits, Parser, Plan, Git-Ablauf, Runner, Übergabe/Fencing, PC-Betrieb
 npm run build   # esbuild → dist/main.js (bündelt protocol.ts, zod, cross-spawn; node-pty bleibt extern)
+npm run build:sea   # Einzel-Binary für diese Plattform → release/atrium-runner-<v>-<os>-<arch>/ (Node SEA)
 node dist/main.js --help
 ```
 

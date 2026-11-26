@@ -25,8 +25,9 @@ Browser ──REST + SSE──▶ Atrium (Modul aidev: Projekte, Warteschlange, 
 - **`modules/aidev/`** ist das Atrium-Modul, die Steuerzentrale. Es enthält Datenbank, Endpunkte, Scheduler (`scheduler.ts`),
   Auftragstexte (`prompts.ts`), Aktionsvorschläge der Agents (`actions.ts`) und die Oberfläche (`pages/`, `ui.ts`). Das
   Protokoll zum Runner steht in `protocol.ts`.
-- **`runner/`** ist ein eigenständiger Dienst (Docker), auf dem die Agents mit deinen Abo-Logins laufen. Es können mehrere
-  Runner sein, auf Servern oder deinem PC. Einrichtung: [`runner/README.md`](runner/README.md).
+- **`runner/`** ist ein eigenständiger Dienst, auf dem die Agents mit deinen Abo-Logins laufen: als Docker-Container auf
+  einem Server oder als fertiges Programm auf deinem PC (Windows, macOS, Linux, aus den GitHub Releases). Es können
+  mehrere Runner sein. Einrichtung: [`runner/README.md`](runner/README.md).
 - Atrium selbst braucht weder git noch Agent-CLIs. Der Container bleibt gehärtet.
 
 ### Projekte anlegen
@@ -220,7 +221,32 @@ Ein Runner darf auch mit laufenden Aufträgen neu gestartet werden. Geordnet bee
 Atrium plant sie ohne Zählung des Versuchs neu ein. Mit `DRAIN_SEC` wartet der Runner vorher, bis laufende Läufe fertig
 sind; in der Zeit steht er unter **Runner & Konten** als „Wird beendet“ und bekommt nichts Neues. Nach einem harten Ende
 meldet er bei der nächsten Anmeldung, dass er nichts mehr ausführt (`runIds`), und Atrium gibt die verwaisten Läufe
-sofort frei, statt die Lease (90 s) abzuwarten. Details: [`runner/README.md`](runner/README.md#neustart-während-laufender-aufträge).
+sofort frei, statt die Lease (90 s, PC-Runner 60 s) abzuwarten. Details: [`runner/README.md`](runner/README.md#neustart-während-laufender-aufträge).
+
+### Runner auf dem eigenen PC
+
+Optional läuft ein Runner auf deinem PC – ohne Node und ohne Docker, als Programm aus den
+[Runner-Releases](https://github.com/CrayonGamerHD-Philipp/atrium-ai-development-module/releases?q=runner-v)
+(Windows-Installer, macOS-`.pkg`, Linux-`.tar.gz`/`.deb`). Installation, Befehle und Sicherheitshinweise:
+[`runner/README.md`](runner/README.md#pc-runner-windows-macos-linux).
+
+- **Vorrang:** Solange der PC läuft, bekommt er Aufträge zuerst (PC-Runner Vorrang 10, Server-Runner 0). Server-Runner sind
+  die Rückfallebene. Art, Vorrang und Heartbeat-Zeitlimit lassen sich unter **Runner & Konten → Bearbeiten** festlegen.
+- **Geordnete Übergabe:** Vor Standby, Herunterfahren oder Abmelden meldet der PC „Wird übergeben“, stoppt die Agents,
+  sichert den Zwischenstand als WIP-Commit auf `refs/aidev/wip/<runId>` (kein Branch – PRs und Haupt-Branch bleiben
+  sauber) und meldet die Läufe als übergeben. Atrium plant sie sofort auf einem Server-Runner neu ein, der den
+  Zwischenstand übernimmt – auch mit anderem Konto oder Anbieter, unter Beachtung von Routing und Limits. Die Übergabe
+  zählt nicht als Fehlversuch; der Verlauf zeigt „Übergeben von PC-Runner X an Server-Runner Y (Grund: Standby)“.
+- **Ungeordneter Ausfall:** Ohne Heartbeat übernimmt ein Server-Runner nach dem Zeitlimit (PC-Runner 60 s), ab dem letzten
+  gepushten Stand bzw. dem letzten Checkpoint (PC-Runner sichern laufende Arbeit alle 10 min).
+- **Keine doppelte Ausführung:** Jeder Lauf trägt ein Fencing-Token. Atrium lehnt Meldungen mit veraltetem Token ab, und der
+  Runner prüft seine Lease vor jedem Push sowie nach dem Aufwachen – ein aufgewachter PC verwirft übernommene Läufe und
+  bekommt danach nur neue Aufträge. Laufende Server-Läufe werden nie zurückverschoben.
+- **Version:** Die Runner-Seite zeigt Art, Zustand (aktiv, wird übergeben, Standby/offline, zurück), letzten Heartbeat,
+  übergebene/übernommene Läufe, „Update verfügbar“ und „Protokoll veraltet“.
+
+Ein neues Runner-Release entsteht per Tag `runner-v<Version>` (Pipeline `.github/workflows/release-runner.yml`, Details
+und optionale Signierung: [`runner/README.md`](runner/README.md#release-erstellen)).
 
 ## Entwicklung
 
@@ -260,8 +286,10 @@ anschließend unter **Runner & Konten** frei.
 
 ## Sicherheit
 
-- Die Agents laufen **ohne Rückfragen** (`--dangerously-skip-permissions`, `--yolo` …). Betreibe sie deshalb nur im
-  Runner-Container, nie auf dem Atrium-Host.
+- Die Agents laufen **ohne Rückfragen** (`--dangerously-skip-permissions`, `--yolo` …). Betreibe sie deshalb auf Servern
+  im Runner-Container, nie auf dem Atrium-Host. Auf dem eigenen PC laufen sie ohne Docker mit den Rechten deines
+  Benutzers – Empfehlung dort: eigenes Benutzerkonto für den Runner oder Docker Desktop (siehe
+  [Sicherheit ohne Docker](runner/README.md#sicherheit-ohne-docker)).
 - CLI-Logins, das GitHub-Token und API-Keys bleiben auf dem Runner. Atrium sieht sie nie. Ausgaben werden vor dem
   Hochladen bereinigt (`runner/src/redact.ts`).
 - Für die [Limit-Analyse](#limit-analyse) sendet der Runner nur Limit-Werte (Fenster, Prozent, Rücksetzzeit, Status).
