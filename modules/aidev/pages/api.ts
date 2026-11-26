@@ -218,7 +218,14 @@ export const closeTerminal = (sid: string) =>
 export const listRunners = () => apiFetch<RunnerDto[]>(`${API}/runners`);
 export const updateRunner = (
 	id: string,
-	patch: { name?: string; status?: 'approved' | 'disabled'; maxSlots?: number }
+	patch: {
+		name?: string;
+		status?: 'approved' | 'disabled';
+		maxSlots?: number;
+		kind?: 'server' | 'desktop' | null;
+		priority?: number | null;
+		leaseSec?: number | null;
+	}
 ) => apiFetch<RunnerDto>(`${API}/runners/${id}`, { method: 'PATCH', body: json(patch) });
 export const deleteRunner = (id: string) =>
 	apiFetch<Ok>(`${API}/runners/${id}`, { method: 'DELETE' });

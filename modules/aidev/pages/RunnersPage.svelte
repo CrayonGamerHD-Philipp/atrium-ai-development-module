@@ -1,11 +1,17 @@
 <script lang="ts">
-	// Verwaltung: Runner (freigeben, sperren, entfernen) und ihre Anbieter-Konten (Budgets, Wartezeit aufheben)
+	// Verwaltung: Runner (freigeben, sperren, bearbeiten: Art/Vorrang/Heartbeat-Zeitlimit, entfernen) mit Zustand
+	// (aktiv, wird übergeben, Standby/offline, zurück), Version/Update-Hinweis und Übergaben; dazu die Anbieter-Konten
+	// (Budgets, Wartezeit aufheben)
 	import { onMount } from 'svelte';
 	import { toast } from 'svelte-sonner';
 	import ArrowLeft from '@lucide/svelte/icons/arrow-left';
+	import ArrowRightLeft from '@lucide/svelte/icons/arrow-right-left';
 	import Ban from '@lucide/svelte/icons/ban';
 	import Check from '@lucide/svelte/icons/check';
 	import Clock from '@lucide/svelte/icons/clock';
+	import Laptop from '@lucide/svelte/icons/laptop';
+	import Server from '@lucide/svelte/icons/server';
+	import Settings2 from '@lucide/svelte/icons/settings-2';
 	import Pencil from '@lucide/svelte/icons/pencil';
 	import RefreshCw from '@lucide/svelte/icons/refresh-cw';
 	import Trash2 from '@lucide/svelte/icons/trash-2';
@@ -18,6 +24,9 @@
 	import type { AccountDto, RunnerDto } from '../schemas';
 	import { BASE, clearCooldown, deleteRunner, listRunners, updateRunner } from './api';
 	import AccountDialog from './admin/AccountDialog.svelte';
+	import RunnerDialog from './admin/RunnerDialog.svelte';
+	import { RUNNER_RELEASES_URL } from '../runner-release';
+	import { HANDOVER_REASON_LABEL, KIND_LABEL, STATE_LABEL } from './runner-state';
 	import AccountLimits from './components/AccountLimits.svelte';
 	import ProviderBadge from './components/ProviderBadge.svelte';
 	import TimeAgo from './components/TimeAgo.svelte';
@@ -31,6 +40,8 @@
 	let busy = $state<string | null>(null);
 	let removeTarget = $state<RunnerDto | null>(null);
 	let removeOpen = $state(false);
+	let editRunner = $state<RunnerDto | null>(null);
+	let editRunnerOpen = $state(false);
 	let editAccount = $state<AccountDto | null>(null);
 	let editOpen = $state(false);
 	let guideOpen = $state(false);
@@ -103,11 +114,9 @@
 		);
 	}
 
-	const STATUS = {
-		pending: { label: 'Wartet auf Freigabe', tone: 'warning' },
-		approved: { label: 'Freigegeben', tone: 'success' },
-		disabled: { label: 'Gesperrt', tone: 'outline' }
-	} as const;
+	function patchRunner(r: RunnerDto) {
+		runners = runners.map((x) => (x.id === r.id ? r : x));
+	}
 
 	const coolingDown = (a: AccountDto) => !!a.cooldownUntil && Date.parse(a.cooldownUntil) > now;
 	const caps = (r: RunnerDto) =>
@@ -115,6 +124,8 @@
 			r.capabilities.git && 'git',
 			r.capabilities.gh && 'gh',
 			r.capabilities.pty && 'Terminal',
+			r.capabilities.handoff && 'Übergabe',
+			r.capabilities.fencing && 'Fencing',
 			r.capabilities.os
 		]
 			.filter(Boolean)
@@ -169,6 +180,16 @@
 				</span>
 			</li>
 			<li>
+				<strong>Oder auf dem eigenen PC</strong> (Windows, macOS, Linux – ohne Node und ohne
+				Docker): Programm aus den
+				<a href={RUNNER_RELEASES_URL} class="text-link underline" target="_blank" rel="noreferrer"
+					>Runner-Releases</a
+				>
+				installieren, in der Konfiguration Atrium-Adresse und API-Key eintragen und
+				<code class="font-mono text-xs">atrium-runner install</code> ausführen. PC-Runner bekommen Aufträge
+				zuerst; vor Standby oder Herunterfahren übergeben sie laufende Aufträge an einen Server-Runner.
+			</li>
+			<li>
 				Der Runner erscheint unten als „Wartet auf Freigabe“ – prüfe Name und Version und gib ihn
 				frei.
 			</li>
@@ -189,10 +210,12 @@
 		{#snippet head()}
 			<Table.Row>
 				<Table.Head>Name</Table.Head>
+				<Table.Head>Art</Table.Head>
 				<Table.Head>Status</Table.Head>
-				<Table.Head>Zuletzt gesehen</Table.Head>
+				<Table.Head>Letzter Heartbeat</Table.Head>
 				<Table.Head class="text-right">Slots</Table.Head>
 				<Table.Head>Version</Table.Head>
+				<Table.Head class="text-right">Übergaben (7 Tage)</Table.Head>
 				<Table.Head>Fähigkeiten</Table.Head>
 				<Table.Head class="text-right"><span class="sr-only">Aktionen</span></Table.Head>
 			</Table.Row>
@@ -213,9 +236,31 @@
 					</span>
 				</Table.Cell>
 				<Table.Cell>
+					<span
+						class="inline-flex items-center gap-1.5 text-sm"
+						title={r.kindOverride
+							? `Festgelegt (meldet sich als ${KIND_LABEL[r.reportedKind]})`
+							: ''}
+					>
+						{#if r.kind === 'desktop'}<Laptop class="size-4" aria-hidden="true" />{:else}<Server
+								class="size-4"
+								aria-hidden="true"
+							/>{/if}
+						{KIND_LABEL[r.kind]}
+					</span>
+					<div class="text-xs text-muted-foreground tabular-nums">
+						Vorrang {r.priority}{r.priorityOverride === null ? '' : ' (fest)'} · {r.leaseSec} s
+					</div>
+				</Table.Cell>
+				<Table.Cell>
 					<span class="inline-flex flex-wrap gap-1">
-						<Badge variant={STATUS[r.status].tone}>{STATUS[r.status].label}</Badge>
-						{#if r.draining && r.online}
+						<Badge
+							variant={STATE_LABEL[r.state].tone}
+							title={STATE_LABEL[r.state].hint +
+								(r.handoverReason ? ` (Grund: ${HANDOVER_REASON_LABEL[r.handoverReason]})` : '')}
+							>{STATE_LABEL[r.state].label}</Badge
+						>
+						{#if r.draining && r.online && r.state !== 'handover'}
 							<Badge
 								variant="warning"
 								title="Der Runner wird beendet: laufende Läufe dürfen fertig werden, neue bekommt er nicht"
@@ -225,10 +270,37 @@
 					</span>
 				</Table.Cell>
 				<Table.Cell class="text-xs text-muted-foreground">
-					{#if r.online}Jetzt{:else}<TimeAgo value={r.lastSeenAt} empty="nie" />{/if}
+					<TimeAgo value={r.lastSeenAt} empty="nie" />
 				</Table.Cell>
 				<Table.Cell class="text-right tabular-nums">{r.slotsUsed}/{r.maxSlots}</Table.Cell>
-				<Table.Cell class="font-mono text-xs">{r.version || '–'}</Table.Cell>
+				<Table.Cell>
+					<span class="font-mono text-xs">{r.version || '–'}</span>
+					{#if r.protocolOutdated}
+						<Badge
+							variant="destructive"
+							title="Der Runner spricht ein älteres Protokoll als Atrium – bitte aktualisieren"
+							>Protokoll veraltet</Badge
+						>
+					{:else if r.updateAvailable}
+						<a
+							href={RUNNER_RELEASES_URL}
+							target="_blank"
+							rel="noreferrer"
+							class="block text-xs text-link hover:underline"
+							title={`Version ${r.latestVersion} ist verfügbar`}
+							>Update verfügbar ({r.latestVersion})</a
+						>
+					{/if}
+				</Table.Cell>
+				<Table.Cell class="text-right text-xs tabular-nums">
+					<span
+						class="inline-flex items-center gap-1"
+						title="übergeben an andere Runner / von anderen Runnern übernommen"
+					>
+						<ArrowRightLeft class="size-3.5" aria-hidden="true" />
+						{r.handedOver} / {r.takenOver}
+					</span>
+				</Table.Cell>
 				<Table.Cell class="text-xs text-muted-foreground">{caps(r) || '–'}</Table.Cell>
 				<Table.Cell class="text-right">
 					<div class="flex flex-wrap justify-end gap-1">
@@ -246,6 +318,16 @@
 								<Ban /> Sperren
 							</Button>
 						{/if}
+						<Button
+							size="icon-sm"
+							variant="ghost"
+							aria-label={`${r.name} bearbeiten`}
+							title="Bearbeiten (Art, Vorrang, Heartbeat-Zeitlimit)"
+							onclick={() => {
+								editRunner = r;
+								editRunnerOpen = true;
+							}}><Settings2 /></Button
+						>
 						<Button
 							size="icon-sm"
 							variant="ghost"
@@ -374,6 +456,10 @@
 	destructive
 	onconfirm={remove}
 />
+
+{#if editRunner}
+	<RunnerDialog bind:open={editRunnerOpen} runner={editRunner} onsaved={patchRunner} />
+{/if}
 
 {#if editAccount}
 	<AccountDialog bind:open={editOpen} account={editAccount} onsaved={patchAccount} />

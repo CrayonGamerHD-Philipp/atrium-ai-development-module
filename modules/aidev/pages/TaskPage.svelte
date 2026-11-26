@@ -35,6 +35,7 @@
 	import { Textarea } from '$lib/components/ui/textarea';
 	import type { RunEvent } from '../protocol';
 	import { FINAL_TASK_STATUSES, type DiffDto, type RunDto, type TaskDetailDto } from '../schemas';
+	import { handoverText } from '../handover';
 	import {
 		cancelTask,
 		deleteTask,
@@ -384,7 +385,11 @@
 		runs.map((r) => ({
 			value: r.id,
 			label: `Versuch ${r.attempt} · ${r.provider} · ${
-				connectionLost(r) ? RUN_STATUS_LABELS.lost : RUN_STATUS_LABELS[r.status]
+				r.handover && !connectionLost(r)
+					? 'übergeben'
+					: connectionLost(r)
+						? RUN_STATUS_LABELS.lost
+						: RUN_STATUS_LABELS[r.status]
 			}`
 		}))
 	);
@@ -701,11 +706,37 @@
 									</span>
 								{/if}
 							</div>
-							{#if selectedRun && connectionLost(selectedRun) && !running}
+							{#if selectedRun?.resumedFrom}
+								<Alert.Root variant="info" class="mb-3">
+									<Alert.Title>Fortsetzung nach Übergabe</Alert.Title>
+									<Alert.Description>
+										Dieser Lauf setzt den gesicherten Zwischenstand eines unterbrochenen Laufs fort{runs.find(
+											(r) => r.id === selectedRun?.resumedFrom
+										)?.runnerName
+											? ` (von ${runs.find((r) => r.id === selectedRun?.resumedFrom)?.runnerName})`
+											: ''}.
+									</Alert.Description>
+								</Alert.Root>
+							{/if}
+							{#if selectedRun?.handover && !connectionLost(selectedRun) && !running}
+								<Alert.Root variant="info" class="mb-3">
+									<Alert.Title>{handoverText(selectedRun.handover)}</Alert.Title>
+									<Alert.Description>
+										<p>
+											Die Übergabe zählt nicht als Fehlversuch.{selectedRun.handover.wipPushed
+												? ' Der Zwischenstand wurde gesichert und wird fortgesetzt.'
+												: ' Fortgesetzt wird ab dem zuletzt gepushten Stand.'}
+										</p>
+									</Alert.Description>
+								</Alert.Root>
+							{:else if selectedRun && connectionLost(selectedRun) && !running}
 								<Alert.Root variant="warning" class="mb-3">
 									<Alert.Title>{errorTitle(selectedRun)}</Alert.Title>
 									<Alert.Description>
 										<p>{connectionLostHint(lostState)}</p>
+										{#if selectedRun.handover}
+											<p>{handoverText(selectedRun.handover)}</p>
+										{/if}
 										{#if selectedRun.errorMessage}
 											<p class="whitespace-pre-wrap">{selectedRun.errorMessage}</p>
 										{/if}
