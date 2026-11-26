@@ -1,5 +1,23 @@
 import { describe, expect, it } from 'vitest';
-import { connectionLostHint, offerRestartAtLostRun } from '../../pages/task/connection';
+import {
+	connectionLostHint,
+	newestRunsFirst,
+	offerRestartAtLostRun
+} from '../../pages/task/connection';
+
+it('erkennt den neuesten Lauf auch nach einem Neustart mit zurückgesetzter Versuchsnummer', () => {
+	const runs = [
+		{ id: 'a', createdAt: '2026-01-01T00:00:00.000Z', attempt: 3 },
+		{ id: 'b', createdAt: '2026-01-02T00:00:00.000Z', attempt: 1 },
+		{ id: 'c', createdAt: '2026-01-02T00:00:00.000Z', attempt: 1 }
+	];
+	const latest = newestRunsFirst(runs)[0];
+	expect(latest?.id).toBe('c');
+	expect(offerRestartAtLostRun({ taskStatus: 'failed', latest: latest?.id === 'c' }, true)).toBe(
+		true
+	);
+	expect(runs[0]?.id).toBe('a');
+});
 
 describe('connectionLostHint', () => {
 	it('neuester Lauf, Auftrag wartend/laufend → automatisch neu eingeplant', () => {
