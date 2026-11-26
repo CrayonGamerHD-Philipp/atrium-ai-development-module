@@ -36,7 +36,12 @@ import aidevModule from '$modules/aidev/module';
 import { attachmentCleanup } from '$modules/aidev/jobs';
 import { closeAllLive } from '$modules/aidev/live';
 import { MAX_CONNECTION_RETRIES } from '$modules/aidev/db';
-import { dispatch, startScheduler, whenDispatchIdle } from '$modules/aidev/scheduler.service';
+import {
+	dispatch,
+	expireRunLease,
+	startScheduler,
+	whenDispatchIdle
+} from '$modules/aidev/scheduler.service';
 import {
 	CONNECTION_LOST,
 	CONNECTION_LOST_FAILED_MESSAGE,
@@ -1201,6 +1206,69 @@ describe('aidev', () => {
 		expect(ok(await heartbeat('runner', [o1.runId]), 201).cancel).toContain(o1.runId);
 		const o2 = await offerFor(t.id);
 		expect(o2.runId).not.toBe(o1.runId);
+		ok(await call('runner', 'POST', `/runner/runs/${o2.runId}/accept`), 201);
+		ok(await finish(o2.runId, { status: 'succeeded', summary: 'fertig' }), 201);
+		expect((await task(t.id)).task.status).toBe('done');
+	});
+
+	it('Lease-Ablauf: Wiederverbindung per Heartbeat vor dem Tick verlängert die Lease, Lauf bleibt erhalten', async () => {
+		const t = await createTask({ prompt: 'Lease Wiederverbindung' });
+		const o1 = await offerFor(t.id);
+		ok(await call('runner', 'POST', `/runner/runs/${o1.runId}/accept`), 201);
+		await q(
+			sql`UPDATE run SET lease_expires_at = now() - interval '1 second' WHERE id = ${o1.runId}`
+		);
+		// Runner meldet sich wieder (z. B. nach hängendem Heartbeat), bevor der Scheduler läuft
+		expect(ok(await heartbeat('runner', [o1.runId]), 201).cancel).not.toContain(o1.runId);
+		expect(await expireRunLease(o1.runId, t.id)).toBe(false);
+		expect(await runRow(o1.runId)).toMatchObject({ status: 'running', error_kind: null });
+		expect((await task(t.id)).task.status).toBe('running');
+		ok(await finish(o1.runId, { status: 'succeeded', summary: 'fertig' }), 201);
+		expect((await task(t.id)).task.status).toBe('done');
+	});
+
+	it('Lease-Ablauf und Neustart dazwischen: Scheduler prüft nach dem Sperren erneut, kein Doppellauf, Zähler bleibt', async () => {
+		// Hinweis: Die Tests laufen auf PGlite (Transaktionen nacheinander) – ein echter Deadlock lässt sich hier nicht
+		// erzeugen. Geprüft wird die erneute Prüfung nach dem Sperren: Der Scheduler hat den Lauf als
+		// abgelaufen gesehen, der Neustart kommt ihm zuvor; danach darf der Scheduler nichts mehr ändern.
+		const t = await createTask({ prompt: 'Lease Neustart dazwischen' });
+		const o1 = await offerFor(t.id);
+		ok(await call('runner', 'POST', `/runner/runs/${o1.runId}/accept`), 201);
+		await q(
+			sql`UPDATE run SET lease_expires_at = now() - interval '1 second' WHERE id = ${o1.runId}`
+		);
+		const restarted = ok<TaskDto>(await call('admin', 'POST', `/tasks/${t.id}/retry`), 201);
+		expect(restarted).toMatchObject({ status: 'queued', attempts: 0 });
+		// Kandidat aus der Auswahl des Ticks → nach dem Sperren nicht mehr aktiv
+		expect(await expireRunLease(o1.runId, t.id)).toBe(false);
+		expect(await runRow(o1.runId)).toMatchObject({ status: 'cancelled', error_kind: 'cancelled' });
+		const d = await task(t.id);
+		expect(d.task).toMatchObject({ status: 'queued', attempts: 0, errorMessage: null });
+		expect(d.runs.some((r) => r.errorKind === CONNECTION_LOST)).toBe(false);
+		// genau ein neuer Lauf
+		const o2 = await offerFor(t.id);
+		expect(o2.runId).not.toBe(o1.runId);
+		const active = await q<{ n: number }>(
+			sql`SELECT count(*)::int AS n FROM run WHERE task_id = ${t.id} AND status IN ('offered', 'running')`
+		);
+		expect(active[0]!.n).toBe(1);
+		ok(await call('runner', 'POST', `/runner/runs/${o2.runId}/accept`), 201);
+		ok(await finish(o2.runId, { status: 'succeeded', summary: 'fertig' }), 201);
+		expect((await task(t.id)).task.status).toBe('done');
+	});
+
+	it('Lease-Ablauf: später Abschluss des verlorenen Laufs ändert nichts, neuer Lauf übernimmt', async () => {
+		const t = await createTask({ prompt: 'Lease später Abschluss' });
+		const o1 = await offerFor(t.id);
+		ok(await call('runner', 'POST', `/runner/runs/${o1.runId}/accept`), 201);
+		await expireLease(o1.runId);
+		expect(await runRow(o1.runId)).toMatchObject({ status: 'lost', error_kind: CONNECTION_LOST });
+		// der alte Runner meldet sich zurück: Heartbeat fordert den Abbruch, `finish` belebt nichts wieder
+		expect(ok(await heartbeat('runner', [o1.runId]), 201).cancel).toContain(o1.runId);
+		await finish(o1.runId, { status: 'succeeded', summary: 'zu spät' });
+		expect(await runRow(o1.runId)).toMatchObject({ status: 'lost' });
+		expect((await task(t.id)).task.status).toBe('queued');
+		const o2 = await offerFor(t.id);
 		ok(await call('runner', 'POST', `/runner/runs/${o2.runId}/accept`), 201);
 		ok(await finish(o2.runId, { status: 'succeeded', summary: 'fertig' }), 201);
 		expect((await task(t.id)).task.status).toBe('done');
