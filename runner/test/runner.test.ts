@@ -3,10 +3,12 @@
  * Abbruch über Heartbeat, Wiederholung von Ereignis-Batches, RPCs und Terminal-Fehlerpfad.
  */
 import { randomUUID } from 'node:crypto';
+import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { accountConfigSchema, type RunnerConfig } from '../src/config.ts';
 import type { AccountState } from '../src/executor.ts';
 import { silentLogger } from '../src/log.ts';
+import type { PowerEvent, PowerMonitorLike } from '../src/power.ts';
 import type { FinishInput, RunOffer } from '../src/protocol.ts';
 import { Redactor } from '../src/redact.ts';
 import { Runner } from '../src/runner.ts';
@@ -104,6 +106,8 @@ describe('Runner', () => {
 			// frisch gestartet: keine laufenden Läufe → Atrium gibt verwaiste sofort frei
 			runIds: []
 		});
+		// Modus server (Standard)
+		expect((reg.body as { kind?: string }).kind).toBe('server');
 		await atrium.waitFor((r) => r.path === '/runner/stream');
 	});
 
@@ -338,5 +342,163 @@ describe('Runner.heartbeatAccounts', () => {
 		r.limits.update(acct.key, [win(20)], 'probe', at(2));
 		expect(r.heartbeatAccounts(at(40))[0]?.limits?.windows).toEqual([win(20)]);
 		expect(r.heartbeatAccounts(at(41))[0]?.limits).toBeUndefined();
+	});
+});
+
+/** Energie-Ereignisse von Hand auslösen */
+class FakePower implements PowerMonitorLike {
+	private listeners: ((e: PowerEvent) => void)[] = [];
+	started = 0;
+	stopped = 0;
+	acks = 0;
+	onEvent(l: (e: PowerEvent) => void): void {
+		this.listeners.push(l);
+	}
+	start(): void {
+		this.started++;
+	}
+	stop(): void {
+		this.stopped++;
+	}
+	ack(): void {
+		this.acks++;
+	}
+}
+
+describe('Runner im Modus desktop', () => {
+	let datrium: FakeAtrium;
+	let drunner: Runner;
+	let dstarted: Promise<void>;
+	const power = new FakePower();
+	const count = (p: string) => datrium.requests.filter((r) => r.path === p).length;
+	const dfinish = async (runId: string) => {
+		const r = await datrium.waitFor((x) => x.path === `/runner/runs/${runId}/finish`);
+		expect(r.invalid).toBeUndefined();
+		return r.body as FinishInput;
+	};
+	const indexOf = (pred: (r: { path: string; body: unknown }) => boolean, from = 0) =>
+		datrium.requests.findIndex((r, i) => i >= from && pred(r));
+
+	beforeAll(async () => {
+		datrium = new FakeAtrium();
+		datrium.features = { handoff: true };
+		datrium.leaseSec = 60;
+		await datrium.start();
+		drunner = new Runner({
+			config: {
+				atriumUrl: datrium.url,
+				apiKey: datrium.apiKey,
+				name: 'pc-runner',
+				workDir: path.join(env.tmp, 'work-desktop'),
+				maxSlots: 2,
+				gitRemoteTemplate: env.remoteTemplate,
+				gitAuthorName: 'Atrium Agent',
+				gitAuthorEmail: 'agent@atrium.local',
+				accounts: [accountConfigSchema.parse({ key: 'fake-1', provider: 'fake', models: ['fake-large'] })],
+				mode: 'desktop',
+				handoffSec: 5,
+				powerEvents: true,
+				configFile: null
+			},
+			redactor: new Redactor([datrium.apiKey]),
+			log: silentLogger,
+			backoffBaseMs: 5,
+			powerMonitor: power
+		});
+		dstarted = drunner.start();
+		await datrium.waitFor((r) => r.path === '/runner/stream');
+	});
+
+	afterAll(async () => {
+		await drunner?.shutdown();
+		await dstarted?.catch(() => undefined);
+		await datrium?.stop();
+	});
+
+	it('meldet kind desktop, die Übergabe-Fähigkeit und merkt sich features.handoff', async () => {
+		const reg = await datrium.waitFor((r) => r.path === '/runner/register');
+		expect(reg.invalid).toBeUndefined();
+		expect(reg.body).toMatchObject({ kind: 'desktop', capabilities: { handoff: true } });
+		expect(drunner.handoffSupported).toBe(true);
+		expect(power.started).toBe(1);
+	});
+
+	it('übergibt bei suspend laufende Läufe (draining-Heartbeat, finish mit handoff) und ack', async () => {
+		const o = offer({ prompt: '[fake:slow]' });
+		datrium.send({ type: 'offer', offer: o });
+		await datrium.waitFor((r) => r.path === `/runner/runs/${o.runId}/accept`);
+		const from = datrium.requests.length;
+		await drunner.handlePowerEvent({ kind: 'suspend', source: 'test' });
+		const fin = await dfinish(o.runId);
+		expect(fin).toMatchObject({
+			status: 'cancelled',
+			errorMessage: expect.stringContaining('Standby'),
+			handoff: { reason: 'suspend', wipPushed: expect.any(Boolean) }
+		});
+		const hb = indexOf((r) => r.path === '/runner/heartbeat' && (r.body as { draining?: boolean }).draining === true, from);
+		const fi = indexOf((r) => r.path === `/runner/runs/${o.runId}/finish`, from);
+		expect(hb).toBeGreaterThanOrEqual(0);
+		expect(hb).toBeLessThan(fi);
+		expect(power.acks).toBe(1);
+		// bis zum Aufwachen keine neuen Läufe
+		const late = offer();
+		datrium.send({ type: 'offer', offer: late });
+		await datrium.waitFor((r) => r.path === `/runner/runs/${late.runId}/reject`);
+	});
+
+	it('meldet sich bei resume neu an, sendet einen Heartbeat und gibt die Auslieferung frei', async () => {
+		const regs = count('/runner/register');
+		const streams = count('/runner/stream');
+		const from = datrium.requests.length;
+		const resumed = drunner.handlePowerEvent({ kind: 'resume', source: 'test' });
+		expect(drunner.executor.deliveryHeld).toBe(true);
+		await resumed;
+		expect(drunner.executor.deliveryHeld).toBe(false);
+		const reg = indexOf((r) => r.path === '/runner/register', from);
+		const hb = indexOf((r) => r.path === '/runner/heartbeat', reg);
+		expect(reg).toBeGreaterThanOrEqual(0);
+		expect(hb).toBeGreaterThan(reg);
+		expect(count('/runner/register')).toBe(regs + 1);
+		expect(datrium.requests[reg]?.body).toMatchObject({ kind: 'desktop', runIds: [] });
+		// Befehlsstrom wird neu verbunden
+		await datrium.waitFor(() => count('/runner/stream') > streams);
+		// wieder bereit: ein neues Angebot läuft normal durch
+		const o = offer();
+		datrium.send({ type: 'offer', offer: o });
+		expect((await dfinish(o.runId)).status).toBe('succeeded');
+	});
+
+	it('bricht nach einem Uhrsprung von Atrium übernommene Läufe ohne Auslieferung ab', async () => {
+		const o = offer({ prompt: '[fake:slow]' });
+		datrium.send({ type: 'offer', offer: o });
+		await datrium.waitFor((r) => r.path === `/runner/runs/${o.runId}/accept`);
+		const from = datrium.requests.length;
+		// Atrium hat den Lauf inzwischen einem anderen Runner gegeben
+		datrium.cancel.push(o.runId);
+		await drunner.handlePowerEvent({ kind: 'resume', source: 'clock', detail: 'Uhrsprung 120 s' });
+		const reg = indexOf((r) => r.path === '/runner/register', from);
+		expect((datrium.requests[reg]?.body as { runIds: string[] }).runIds).toContain(o.runId);
+		const fin = await dfinish(o.runId);
+		expect(fin.status).toBe('cancelled');
+		expect(fin.handoff).toBeUndefined();
+		expect(fin.pr).toBeFalsy();
+	});
+
+	it('übergibt beim Beenden statt zu warten und hält den Monitor an', async () => {
+		const o = offer({ prompt: '[fake:slow]' });
+		datrium.send({ type: 'offer', offer: o });
+		await datrium.waitFor((r) => r.path === `/runner/runs/${o.runId}/accept`);
+		const t0 = Date.now();
+		await drunner.shutdown();
+		expect(Date.now() - t0).toBeLessThan(20_000);
+		expect(await dfinish(o.runId)).toMatchObject({ status: 'cancelled', handoff: { reason: 'shutdown' } });
+		expect(power.stopped).toBe(1);
+		// nach dem Beenden werden Energie-Ereignisse ignoriert
+		await drunner.handlePowerEvent({ kind: 'resume', source: 'test' });
+		expect(drunner.executor.deliveryHeld).toBe(false);
+	});
+
+	it('sendet keine Anfrage mit ungültigem Body', () => {
+		expect(datrium.requests.filter((r) => r.invalid && r.invalid !== 'simulierter Fehler')).toEqual([]);
 	});
 });

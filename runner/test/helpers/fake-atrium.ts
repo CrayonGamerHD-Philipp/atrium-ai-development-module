@@ -45,6 +45,12 @@ export class FakeAtrium {
 	attachments = new Map<string, Buffer>();
 	/** Nächste Antworten für Anhänge mit 503 (Wiederholung prüfen) */
 	failAttachments = 0;
+	/** `registerResult.features` (nicht gesetzt = älteres Atrium ohne Feld) */
+	features: { handoff?: boolean } | undefined;
+	/** `registerResult.leaseSec` (nicht gesetzt = älteres Atrium ohne Feld) */
+	leaseSec: number | undefined;
+	/** `registerResult.heartbeatSec` */
+	heartbeatSec = 1;
 	private waiters: { pred: (r: Recorded) => boolean; resolve: (r: Recorded) => void }[] = [];
 
 	constructor() {
@@ -161,7 +167,13 @@ export class FakeAtrium {
 		let data: unknown = {};
 		if (p === '/runner/register') {
 			invalid = check(registerInput);
-			data = { runnerId: RUNNER_ID, status: 'approved', heartbeatSec: 1 };
+			data = {
+				runnerId: RUNNER_ID,
+				status: 'approved',
+				heartbeatSec: this.heartbeatSec,
+				...(this.leaseSec !== undefined ? { leaseSec: this.leaseSec } : {}),
+				...(this.features !== undefined ? { features: this.features } : {})
+			};
 		} else if (p === '/runner/heartbeat') {
 			invalid = check(heartbeatInput);
 			data = { status: 'approved', cancel: this.cancel.splice(0) };

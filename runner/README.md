@@ -40,6 +40,9 @@ Vorlage: [`runner.config.example.json`](runner.config.example.json)):
 | `LIMIT_PROBE` | aktive Limit-Abfrage ohne Lauf (`true`/`false`, Datei: `limitProbe`) | an für Claude-Konten mit OAuth-Login |
 | `LIMIT_PROBE_MIN` | Abstand der aktiven Limit-Abfrage in Minuten (1–1440, Datei: `limitProbeMin`) | `5` |
 | `DRAIN_SEC` | beim Beenden so viele Sekunden auf laufende Läufe warten (0–86400, Datei: `drainSec`), siehe [Neustart](#neustart-während-laufender-aufträge) | `0` |
+| `RUNNER_MODE` | `server` oder `desktop` (Runner auf dem eigenen PC, Datei: `mode`), siehe [Desktop-Modus](#desktop-modus-standby-und-herunterfahren) | `server` |
+| `HANDOFF_SEC` | Frist für die Übergabe laufender Läufe im Modus desktop (1–60, Datei: `handoffSec`) | `8` |
+| `POWER_EVENTS` | Standby, Aufwachen und Herunterfahren beobachten (`true`/`false`, Datei: `powerEvents`) | an im Modus desktop |
 
 Ein Konto (`accounts[]`):
 
@@ -154,6 +157,28 @@ Ein Neustart ist jederzeit möglich, kein Auftrag geht verloren:
 Signale: Das erste `SIGTERM`/`SIGINT` startet das geordnete Beenden, ein zweites bricht die Wartefrist ab
 (laufende Läufe werden abgebrochen und neu eingeplant), ein drittes beendet sofort. Bei Docker muss
 `stop_grace_period` größer als `DRAIN_SEC` plus etwa 30 s sein, sonst beendet Docker den Runner hart.
+
+### Desktop-Modus: Standby und Herunterfahren
+
+Mit `RUNNER_MODE=desktop` (Installation siehe [`desktop/README.md`](desktop/README.md)) meldet sich der Runner
+als `kind: desktop` an. Geht der PC in den Standby, meldet er sofort `draining` (keine neuen Angebote), bricht laufende
+Läufe ab und übergibt sie innerhalb von `HANDOFF_SEC`: `finish` `cancelled` mit `handoff`, bei schreibenden Läufen
+vorher ein WIP-Commit samt Push (nur wenn Atrium `features.handoff` meldet). Ein Server-Runner übernimmt den Auftrag.
+Nach dem Aufwachen sperrt der Runner zuerst jede Auslieferung, meldet sich neu an (`runIds`), sendet einen Heartbeat
+(übernommene Läufe kommen als `cancel` zurück und enden ohne Push), gibt die Auslieferung wieder frei und verbindet den
+Befehlsstrom neu. Beim Herunterfahren bzw. beim ersten `SIGTERM`/`SIGINT` übergibt er statt mit `DRAIN_SEC` zu warten;
+das zweite Signal bricht die Übergabe ab, das dritte beendet sofort.
+
+| Plattform | Erkennung | Zeit vor dem Standby |
+|---|---|---|
+| Linux (systemd-logind) | Delay-Inhibitor über `systemd-inhibit --mode=delay` (ohne Root), Signale `PrepareForSleep`/`PrepareForShutdown` über `gdbus monitor` (Rückfall `dbus-monitor`); der Inhibitor wird nach der Übergabe freigegeben und nach dem Aufwachen neu geholt | bis `InhibitDelayMaxSec` (Standard 5 s) |
+| Windows 10/11 | PowerShell-Kindprozess mit verborgenem Fenster (`WM_POWERBROADCAST`, `WM_QUERYENDSESSION`/`WM_ENDSESSION`); zusätzlich `SIGBREAK`/`SIGHUP` | ca. 2 s |
+| macOS | `osascript` (JXA) mit `NSWorkspaceWillSleep`/`DidWake`/`WillPowerOff`; läuft nur in einer grafischen Sitzung | nicht aufschiebbar |
+| alle | Rückfall: Uhrsprung (Timer feuert > 30 s zu spät) gilt als Aufwachen | – |
+
+Fehlt ein Werkzeug, schreibt der Runner eine Warnung und erkennt nur noch das Aufwachen über den Uhrsprung. Der Hook vor
+dem Standby beschleunigt nur: Reicht die Zeit nicht (Windows, macOS, Linux über 5 s), wird der Rest nach dem Aufwachen
+bereinigt; bei Akku leer oder Stromausfall gibt Atrium die Läufe nach Ablauf der Lease frei.
 
 ## Annahmen zu den CLIs
 

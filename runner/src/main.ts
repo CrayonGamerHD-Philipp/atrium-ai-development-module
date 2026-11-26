@@ -33,6 +33,10 @@ Umgebungsvariablen (Vorrang vor der Konfigurationsdatei):
   WORK_DIR            Arbeitsverzeichnis für Repos/Worktrees (Standard: ./.work)
   MAX_SLOTS           Gleichzeitige Läufe (Standard: 2)
   DRAIN_SEC           Beim Beenden so lange auf laufende Läufe warten (Standard: 0 = sofort abbrechen)
+  RUNNER_MODE         server (Standard) | desktop: Runner auf dem eigenen PC, übergibt laufende Läufe
+                      vor Standby/Herunterfahren an Atrium und meldet sich nach dem Aufwachen sofort wieder
+  HANDOFF_SEC         Frist für die Übergabe im Modus desktop, 1–60 s (Standard: 8)
+  POWER_EVENTS        Standby/Aufwachen/Herunterfahren beobachten, true/false (Standard: an im Modus desktop)
   RUNNER_ACCOUNTS     Konten als JSON-Liste (statt "accounts" in der Datei)
   GIT_AUTHOR_NAME     Commit-Autor (Standard: Atrium Agent)
   GIT_AUTHOR_EMAIL    Commit-E-Mail (Standard: agent@atrium.local)
@@ -131,15 +135,28 @@ async function main(): Promise<void> {
 		return;
 	}
 
-	log.info(`Atrium aidev-Runner ${RUNNER_VERSION} startet (${config.name}, ${config.maxSlots} Slots, ${config.workDir})`);
-	const runner = new Runner({ config, redactor, log });
-	// 1. Signal: geordnet beenden (mit DRAIN_SEC: laufende Läufe dürfen fertig werden),
-	// 2. Signal: Frist abbrechen, laufende Läufe abbrechen und neu einplanen lassen, 3. Signal: sofortiges Ende
+	const desktop = config.mode === 'desktop';
+	log.info(
+		`Atrium aidev-Runner ${RUNNER_VERSION} startet (${config.name}, ${config.maxSlots} Slots, ${config.workDir}${desktop ? ', Modus desktop' : ''})`
+	);
+	const runner = new Runner({
+		config,
+		redactor,
+		log,
+		onPowerShutdown: () => {
+			log.info('Beendet');
+			process.exit(0);
+		}
+	});
+	// 1. Signal: geordnet beenden (mit DRAIN_SEC: laufende Läufe dürfen fertig werden; Modus desktop: Übergabe an
+	// Atrium mit HANDOFF_SEC), 2. Signal: Frist abbrechen, laufende Läufe abbrechen und neu einplanen lassen,
+	// 3. Signal: sofortiges Ende
 	let signals = 0;
 	const skipDrain = new AbortController();
+	const withGrace = desktop || (config.drainSec ?? 0) > 0;
 	const onSignal = (sig: NodeJS.Signals) => {
 		signals++;
-		if (signals > 2 || (signals === 2 && !(config.drainSec ?? 0))) {
+		if (signals > 2 || (signals === 2 && !withGrace)) {
 			log.warn(`${sig} erneut – sofortiges Ende`);
 			process.exit(130);
 		}
@@ -156,6 +173,11 @@ async function main(): Promise<void> {
 	};
 	process.on('SIGTERM', onSignal);
 	process.on('SIGINT', onSignal);
+	if (desktop && process.platform === 'win32') {
+		// Windows: Strg+Pause (SIGBREAK) und Schließen der Konsole bzw. Abmelden (SIGHUP, ca. 10 s bis zum Kill)
+		process.on('SIGBREAK', onSignal);
+		process.on('SIGHUP', onSignal);
+	}
 	process.on('unhandledRejection', (e) => log.error('Unbehandelter Fehler', e instanceof Error ? e.message : String(e)));
 	await runner.start();
 }
