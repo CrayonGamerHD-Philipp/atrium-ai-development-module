@@ -53,6 +53,13 @@ export interface TaskCandidate {
 	/** Sitzung fortsetzen: gleiches Konto bevorzugen, wenn verfügbar */
 	sessionAccountId: string | null;
 	estimatedUnits: number;
+	/**
+	 * Runner, auf denen Läufe dieses Auftrags wegen Verbindungsverlust verloren gingen.
+	 * Nur meiden, wenn möglich (weicher Abzug, kein Ausschluss wie `excludedAccountIds`).
+	 */
+	avoidRunnerIds?: string[];
+	/** Konten, auf denen Läufe dieses Auftrags wegen Verbindungsverlust verloren gingen – nur meiden, wenn möglich */
+	avoidAccountIds?: string[];
 }
 
 export interface ProjectState {
@@ -92,6 +99,12 @@ export const HINT_DEFAULT_WEIGHT = 5;
 export const SESSION_BONUS = 0.25;
 /** Bonus für den bevorzugten Runner des Projekts */
 export const PREFERRED_RUNNER_BONUS = 0.1;
+/**
+ * Abzug für Runner/Konten, auf denen ein Lauf des Auftrags die Verbindung verloren hat. Größer als die
+ * gesamte mögliche Spanne der übrigen Punktzahl (Gewicht ≤ 1, Tempo ±0.5, Parallelität ≤ 0.3, Boni 0.35),
+ * damit jedes andere geeignete Konto vorgeht; ohne Alternative wird das gemiedene trotzdem gewählt.
+ */
+export const LOST_CONNECTION_MALUS = 5;
 
 /** Endliche Zahl oder 0 (NaN/±∞ → 0) */
 function num(n: number): number {
@@ -142,6 +155,8 @@ function routingEntry(routing: Routing, role: Role, provider: Provider) {
 /**
  * Punktzahl eines Kontos für einen Auftrag; `null` = nicht geeignet.
  * weight_role(provider) · (1 − max(u5h, uWeek)) + 0.5 · pace − 0.3 · running/maxConcurrency (+ Boni)
+ * − LOST_CONNECTION_MALUS (höchstens einmal), wenn Runner oder Konto nach Verbindungsverlust gemieden werden
+ * sollen – weicher Abzug: das Konto bleibt geeignet, landet aber hinter allen anderen.
  */
 export function scoreAccount(
 	task: TaskCandidate,
@@ -181,6 +196,12 @@ export function scoreAccount(
 	if (task.sessionAccountId != null && task.sessionAccountId === account.id) score += SESSION_BONUS;
 	if (preferredRunnerId != null && account.runnerId === preferredRunnerId) {
 		score += PREFERRED_RUNNER_BONUS;
+	}
+	if (
+		task.avoidRunnerIds?.includes(account.runnerId) ||
+		task.avoidAccountIds?.includes(account.id)
+	) {
+		score -= LOST_CONNECTION_MALUS;
 	}
 
 	const model = entry?.model || account.defaultModel || null;
