@@ -10,6 +10,7 @@
  * - Das Hilfsskript wartet auf die Antwort und gibt sie auf stdout aus.
  * `.aidev/` steht in `info/exclude` und wird nie committet.
  */
+import { createHash } from 'node:crypto';
 import { mkdir, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { z } from 'zod';
@@ -219,4 +220,50 @@ export function researchTaskPrompt(req: ResearchRequest, task: { title: string }
 	const parts = [`# Research request`, '', `The requesting agent works on the task: ${task.title.replace(/\s+/g, ' ').trim()}`, '', '## Question', '', req.question.trim()];
 	if (req.context?.trim()) parts.push('', '## Context from the requesting agent', '', req.context.trim());
 	return parts.join('\n');
+}
+
+/** Gültigkeit einer zwischengespeicherten Recherche (Standard 3 Tage) */
+export const RESEARCH_CACHE_TTL_MS = 3 * 24 * 3_600_000;
+
+/**
+ * Zwischenspeicher für Recherchen je Repository (`WORK_DIR/meta/research/<owner>/<repo>/<hash>.json`): Dieselbe
+ * Frage (gleicher Text und Kontext, Groß-/Kleinschreibung und Leerraum egal) wird innerhalb der Gültigkeit ohne
+ * neuen Agent-Aufruf beantwortet – null Tokens.
+ */
+export class ResearchCache {
+	constructor(
+		private readonly dir: string,
+		private readonly ttlMs = RESEARCH_CACHE_TTL_MS
+	) {}
+
+	static keyOf(req: ResearchRequest): string {
+		const norm = (s: string | undefined) => (s ?? '').toLowerCase().replace(/\s+/g, ' ').trim();
+		return createHash('sha256').update(`${norm(req.question)}\n${norm(req.context)}`).digest('hex').slice(0, 32);
+	}
+
+	async get(req: ResearchRequest, now = Date.now()): Promise<{ answer: string; account: string } | null> {
+		try {
+			const raw = JSON.parse(await readFile(path.join(this.dir, `${ResearchCache.keyOf(req)}.json`), 'utf8')) as {
+				answer?: unknown;
+				account?: unknown;
+				at?: unknown;
+			};
+			if (typeof raw.answer !== 'string' || typeof raw.at !== 'number' || now - raw.at > this.ttlMs) return null;
+			return { answer: raw.answer, account: typeof raw.account === 'string' ? raw.account : '' };
+		} catch {
+			return null;
+		}
+	}
+
+	async put(req: ResearchRequest, answer: string, account: string, now = Date.now()): Promise<void> {
+		try {
+			await mkdir(this.dir, { recursive: true });
+			const file = path.join(this.dir, `${ResearchCache.keyOf(req)}.json`);
+			const tmp = `${file}.${process.pid}.tmp`;
+			await writeFile(tmp, JSON.stringify({ question: req.question, answer, account, at: now }), 'utf8');
+			await rename(tmp, file);
+		} catch {
+			// nur ein Zwischenspeicher
+		}
+	}
 }

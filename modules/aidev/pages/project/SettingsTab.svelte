@@ -22,6 +22,7 @@
 	import { has, PERM } from '../perms';
 	import { serverErrors, zodErrors, type FieldErrors } from '../components/form-errors';
 	import ProjectFields, { type ProjectFormValues } from '../components/ProjectFields.svelte';
+	import KnowledgeCard from './KnowledgeCard.svelte';
 	import type { ProjectStore } from './store.svelte';
 
 	let { store }: { store: ProjectStore } = $props();
@@ -165,6 +166,8 @@
 			</Card.Footer>
 		{/if}
 	</Card.Root>
+
+	<KnowledgeCard {store} {canManage} />
 
 	{#if canManage}
 		<Card.Root>

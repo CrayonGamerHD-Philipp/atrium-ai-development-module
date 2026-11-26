@@ -6,6 +6,7 @@
  * Repos arbeiten und seine Abschluss-Zusammenfassung in der Sprache des Auftrags schreiben.
  */
 import { CHAT_ACTIONS_LANG, MAX_CHAT_ACTIONS } from './actions';
+import { knowledgeSection } from './knowledge';
 import type { chatActionsBlockSchema } from './actions';
 import type { z } from 'zod';
 import { planSchema } from './protocol';
@@ -27,6 +28,8 @@ export interface PromptContext {
 		defaultBranch: string;
 		instructions: string;
 		testCmd: string;
+		/** Projektwissen aus früheren Läufen (`knowledge.ts`); leer bzw. fehlend → nur Aufforderung zum Festhalten */
+		knowledge?: string;
 	};
 	task: { title: string; prompt: string };
 	readOnly: boolean;
@@ -303,6 +306,10 @@ export function buildSystemPrompt(c: PromptContext): string {
 		);
 	}
 
+	// Arbeitsweise und Projektwissen vor dem Ausgabeformat: die Plan-Vorgabe bleibt die letzte Anweisung
+	lines.push(...workingMethod(c));
+	lines.push(...knowledgeSection(p.knowledge ?? '', { question: c.question }));
+
 	if (c.expectPlan || c.role === 'orchestrate') {
 		lines.push(
 			'',
@@ -324,6 +331,29 @@ export function buildSystemPrompt(c: PromptContext): string {
 		lines.push('', '## Project rules', instructions);
 	}
 	return lines.join('\n');
+}
+
+/**
+ * Arbeitsweise: zielgerichtet lesen statt das ganze Repository zu erkunden (Tokens), eng am Auftrag bleiben,
+ * selbst prüfen (Tests, eigener Diff) – weniger Fehlversuche und Nachbesserungen.
+ */
+function workingMethod(c: PromptContext): string[] {
+	const lines = [
+		'',
+		'## Working method',
+		'- Be economical: start from the project knowledge below and targeted searches (grep/glob for symbols, file names); read only the files and sections you need instead of listing or reading whole directories.'
+	];
+	if (c.question || c.readOnly) {
+		lines.push('- Answer concisely; cite file paths instead of quoting large code blocks.');
+		return lines;
+	}
+	lines.push(
+		'- Understand the relevant code before changing it; for non-trivial tasks make a short plan first.',
+		'- Keep the change focused on the task: no unrelated refactoring, renaming or reformatting.',
+		'- Verify before you finish: build/typecheck and run the relevant tests; then review your own diff (`git diff`) for leftovers (debug output, commented-out code, accidental files).',
+		'- If something cannot be done as asked, do the closest safe thing and say clearly what is missing.'
+	);
+	return lines;
 }
 
 /** Codeblock-Zaun, der länger ist als jede Backtick-Folge im Text (zitierter Text kann ihn nicht schließen) */

@@ -44,6 +44,7 @@ Vorlage: [`runner.config.example.json`](runner.config.example.json)):
 | `RESEARCH` | Recherche-Schnittstelle für Agents (`true`/`false`, Datei: `research`), siehe [Recherche](#recherche-auf-anforderung) | `true` |
 | `RESEARCH_MAX` | höchstens so viele Recherchen je Lauf (0–20, Datei: `researchMax`) | `3` |
 | `RESEARCH_ACCOUNTS` | bevorzugte Konten für Recherchen, kommagetrennt (Datei: `researchAccounts` als Liste) | – (anderes freies Konto, sonst dasselbe) |
+| `REPO_MAP` | Repository-Übersicht aus git an den Auftrag hängen (`true`/`false`, Datei: `repoMap`) | `true` |
 
 Ein Konto (`accounts[]`):
 
@@ -168,7 +169,17 @@ Der Runner beantwortet die Anfrage mit einem eigenen, **nur lesenden** Recherche
 Konto ohne aktives Limit (verteilt die Last, z. B. recherchiert Gemini für Claude), sonst dasselbe Konto. Stößt ein
 Konto ans Limit, wird das nächste versucht. Höchstens `RESEARCH_MAX` Recherchen je Lauf, je höchstens 15 Minuten.
 Fragen und Ergebnisse erscheinen im Verlauf des Laufs; der Verbrauch desselben Kontos zählt zum Lauf. Nicht für
-Chat-Fragen und Recherche-Aufträge (keine Rekursion).
+Chat-Fragen und Recherche-Aufträge (keine Rekursion). Ergebnisse werden je Repository zwischengespeichert
+(`WORK_DIR/meta/research/<owner>/<repo>/`, 3 Tage): dieselbe Frage (gleicher Text und Kontext) kostet dann keine
+Tokens.
+
+### Repository-Übersicht
+
+Vor dem ersten Agent-Aufruf hängt der Runner eine kompakte Übersicht an den Auftrag (höchstens 3000 Zeichen):
+Dateizahl, Ordner mit Dateizahlen (zweite Ebene für große Ordner), Dateitypen, wichtige Dateien (README, Manifeste,
+CI) und die Skripte aus `package.json`. Sie entsteht nur aus git (`ls-files`), kostet also keine Tokens, und wird je
+Tree-SHA unter `WORK_DIR/meta/repomap/<owner>/<repo>/` zwischengespeichert (die letzten 10). Bei einer fortgesetzten
+Sitzung entfällt sie. Abschalten mit `REPO_MAP=false`.
 
 Worktrees bleiben nach dem Lauf erhalten (Editor/Terminal „Lauf“), aufgeräumt wird beim Start und stündlich
 (älter als 48 h bzw. mehr als 30). Die Arbeitskopie des Haupt-Branchs je Projekt liegt in

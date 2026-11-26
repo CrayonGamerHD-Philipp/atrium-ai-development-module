@@ -5,6 +5,7 @@
 import { z } from 'zod';
 import type { RunHandoverDto, RunnerStateValue } from './handover';
 import type { StoredChatAction } from './actions';
+import { KNOWLEDGE_MAX } from './knowledge';
 import {
 	commitPolicySchema,
 	taskDeliverySchema,
@@ -210,6 +211,8 @@ export const projectPatch = z
 		setupCmd: z.string().max(2000),
 		testCmd: z.string().max(2000),
 		instructions: z.string().max(20_000),
+		/** Projektwissen (`knowledge.ts`), von Agents ergänzt und hier von Menschen bearbeitbar */
+		knowledge: z.string().max(KNOWLEDGE_MAX),
 		preferredRunnerId: z.string().uuid().nullable()
 	})
 	.partial();
@@ -380,6 +383,9 @@ export interface ProjectDto {
 	setupCmd: string;
 	testCmd: string;
 	instructions: string;
+	/** Projektwissen aus früheren Läufen (`knowledge.ts`) */
+	knowledge: string;
+	knowledgeUpdatedAt: string | null;
 	preferredRunnerId: string | null;
 	createdAt: string;
 	updatedAt: string;

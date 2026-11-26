@@ -192,6 +192,24 @@ statt einen neuen Lauf von vorn zu starten (spart Zeit, Tokens und Versuche):
   `node .aidev/bin/research.mjs "Frage"` eine Recherche anfordern. Ein eigener, nur lesender Agent (bevorzugt ein
   anderes freies Konto) beantwortet sie, das Ergebnis fließt direkt in den laufenden Agent zurück.
 
+### Weniger Tokens: Projektwissen und Zwischenspeicher
+
+Damit nicht jeder Lauf das Repository von Null erkundet, merkt sich das System, was schon bekannt ist:
+
+- **Projektwissen** (Projekteinstellungen → „Projektwissen“): Agents beenden ihre Antwort optional mit einem
+  ```` ```aidev-notes ```` -Block mit kurzen, dauerhaften Fakten (Befehle und ihre Stolperfallen, wo was liegt,
+  Konventionen). Atrium entfernt den Block aus dem sichtbaren Ergebnis, verwirft Duplikate und offensichtliche
+  Geheimnisse und hängt die Zeilen datiert an (`- [Datum] …`, höchstens 6000 Zeichen; bei Platzmangel fallen die
+  ältesten automatischen Zeilen weg, eigene Zeilen bleiben). Jeder weitere Lauf bekommt das Wissen in der
+  Systemanweisung. Es lässt sich dort bearbeiten oder leeren.
+- **Repository-Übersicht**: Der Runner hängt eine kompakte Übersicht aus git an den Auftrag (Ordner mit Dateizahlen,
+  Dateitypen, wichtige Dateien, `package.json`-Skripte) – ohne Tokens erzeugt und je Stand zwischengespeichert. Bei
+  einer fortgesetzten Sitzung entfällt sie.
+- **Recherche-Zwischenspeicher**: Dieselbe Recherchefrage im selben Repository wird 3 Tage lang ohne neuen
+  Agent-Aufruf beantwortet.
+- **Arbeitsweise** in der Systemanweisung: gezielt suchen statt ganze Ordner lesen, eng am Auftrag bleiben, vor dem
+  Abschluss bauen/testen und den eigenen Diff prüfen – weniger Fehlversuche.
+
 Was automatisch nachgebessert wurde, steht am Ende der Zusammenfassung und im Verlauf. Einstellungen am Runner
 (`AUTO_REPAIR_ROUNDS`, `RESEARCH`, `RESEARCH_MAX`, `RESEARCH_ACCOUNTS`): siehe
 [`runner/README.md`](runner/README.md#selbstreparatur-und-konflikte-im-selben-lauf).

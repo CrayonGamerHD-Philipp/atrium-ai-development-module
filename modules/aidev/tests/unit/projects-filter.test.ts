@@ -39,6 +39,8 @@ function project(over: Partial<ProjectDto> = {}): ProjectDto {
 		setupCmd: '',
 		testCmd: '',
 		instructions: '',
+		knowledge: '',
+		knowledgeUpdatedAt: null,
 		preferredRunnerId: null,
 		createdAt: '2026-01-01T00:00:00.000Z',
 		updatedAt: '2026-01-01T00:00:00.000Z',

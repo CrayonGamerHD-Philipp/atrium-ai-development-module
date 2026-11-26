@@ -80,6 +80,7 @@ const fileSchema = z
 		research: z.boolean().optional(),
 		researchMax: z.number().int().optional(),
 		researchAccounts: z.array(z.string()).optional(),
+		repoMap: z.boolean().optional(),
 		accounts: z.array(z.unknown()).optional()
 	})
 	.strict();
@@ -130,6 +131,8 @@ export interface RunnerConfig {
 	researchMax?: number;
 	/** Bevorzugte Konten für Recherchen (Schlüssel, in Reihenfolge); leer = anderes freies Konto, sonst dasselbe */
 	researchAccounts?: string[];
+	/** Repository-Übersicht aus git an den Auftrag hängen (Standard an; spart dem Agent das Erkunden des Baums) */
+	repoMap?: boolean;
 	/** Pfad der gelesenen Konfigurationsdatei (falls vorhanden) */
 	configFile: string | null;
 }
@@ -162,6 +165,7 @@ const finalSchema = z.object({
 	research: z.boolean(),
 	researchMax: z.number().int().min(0).max(20),
 	researchAccounts: z.array(z.string().min(1).max(64)).max(50),
+	repoMap: z.boolean(),
 	accounts: z.array(accountConfigSchema).max(50)
 });
 
@@ -180,7 +184,8 @@ const LABELS: Record<string, string> = {
 	kind: 'RUNNER_KIND',
 	powerEvents: 'POWER_EVENTS',
 	research: 'RESEARCH',
-	researchAccounts: 'RESEARCH_ACCOUNTS'
+	researchAccounts: 'RESEARCH_ACCOUNTS',
+	repoMap: 'REPO_MAP'
 };
 
 /** Schalter aus einer Umgebungsvariable (`1`/`true`/`on` bzw. `0`/`false`/`off`); ungültig → `invalid` */
@@ -255,6 +260,9 @@ export function loadConfig(o: LoadOptions = {}): RunnerConfig {
 	const researchEnv = envBool(env.RESEARCH);
 	if (researchEnv === 'invalid')
 		throw new ConfigError('Konfiguration ungültig:\n  - RESEARCH: muss true/false (bzw. 1/0) sein');
+	const repoMapEnv = envBool(env.REPO_MAP);
+	if (repoMapEnv === 'invalid')
+		throw new ConfigError('Konfiguration ungültig:\n  - REPO_MAP: muss true/false (bzw. 1/0) sein');
 	const autoRepairRounds = intOf(env.AUTO_REPAIR_ROUNDS, file.autoRepairRounds, '2');
 	const researchMax = intOf(env.RESEARCH_MAX, file.researchMax, '3');
 	const researchAccounts = env.RESEARCH_ACCOUNTS
@@ -287,6 +295,7 @@ export function loadConfig(o: LoadOptions = {}): RunnerConfig {
 		research: researchEnv ?? file.research ?? true,
 		researchMax,
 		researchAccounts,
+		repoMap: repoMapEnv ?? file.repoMap ?? true,
 		accounts
 	};
 	const parsed = finalSchema.safeParse(candidate);

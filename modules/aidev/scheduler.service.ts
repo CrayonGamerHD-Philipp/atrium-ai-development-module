@@ -184,7 +184,8 @@ async function promptContext(tx: Tx, task: Row, project: Row, role: Role): Promi
 			repoName: String(project.repo_name),
 			defaultBranch: String(project.default_branch),
 			instructions: String(project.instructions ?? ''),
-			testCmd: String(project.test_cmd ?? '')
+			testCmd: String(project.test_cmd ?? ''),
+			knowledge: String(project.knowledge ?? '')
 		},
 		task: {
 			title: String(task.title),

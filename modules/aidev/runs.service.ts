@@ -21,6 +21,7 @@ import {
 } from './db';
 import { sendCommand, type Effects } from './effects';
 import { storeLimitSnapshot } from './limits.service';
+import { extractNotes, mergeKnowledge } from './knowledge';
 import { extractPlan } from './prompts';
 import {
 	MAX_EVENT_TEXT,
@@ -477,6 +478,15 @@ export async function finishRun(
 		const t = await getTask(tx, String(run.task_id));
 		return { ok: true, taskStatus: t ? String(t.status) : null };
 	}
+	// Projektwissen: `aidev-notes`-Blöcke aus der Zusammenfassung lösen und am Projekt festhalten (vor Plan-
+	// und Aktionsauswertung, damit sie dort nicht stören und nicht im sichtbaren Ergebnis landen)
+	if (input.status === 'succeeded' && input.summary) {
+		const found = extractNotes(input.summary);
+		if (found.body !== input.summary) {
+			input = { ...input, summary: found.body.trim() ? found.body : null };
+			if (found.notes.length) await rememberNotes(tx, fx, String(run.project_id), found.notes);
+		}
+	}
 	// Übergabe (nur mit `cancelled`, siehe `finishInput`): Infos für Verlauf und nächsten Lauf festhalten
 	const handoff = input.status === 'cancelled' ? (input.handoff ?? null) : null;
 	const runner = handoff
@@ -591,6 +601,30 @@ export async function finishRun(
 	}
 	const after = await getTask(tx, String(task.id));
 	return { ok: true, taskStatus: after ? String(after.status) : null };
+}
+
+/**
+ * Neue Notizen ans Projektwissen anhängen (`mergeKnowledge`: ohne Duplikate, begrenzt). Sperre `FOR NO KEY UPDATE`
+ * verträgt sich mit Fremdschlüssel-Sperren paralleler Inserts (Aufträge, Anhänge) auf das Projekt.
+ */
+async function rememberNotes(
+	tx: Tx,
+	fx: Effects,
+	projectId: string,
+	notes: string[]
+): Promise<void> {
+	const p = await oneOf(
+		tx,
+		sql`SELECT knowledge FROM project WHERE id = ${projectId} FOR NO KEY UPDATE`
+	);
+	if (!p) return;
+	const before = String(p.knowledge ?? '');
+	const next = mergeKnowledge(before, notes, new Date());
+	if (next === before) return;
+	await tx.execute(
+		sql`UPDATE project SET knowledge = ${next}, knowledge_updated_at = now() WHERE id = ${projectId}`
+	);
+	fx.projects.add(projectId);
 }
 
 async function succeed(
