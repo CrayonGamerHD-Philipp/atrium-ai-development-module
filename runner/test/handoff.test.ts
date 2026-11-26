@@ -222,6 +222,22 @@ describe('handoff', () => {
 		executor.resumeOffers();
 	});
 
+	it('Übergabe bei gesperrter Auslieferung (Laufbesitz ungeklärt): kein Zwischenstand gepusht', async () => {
+		const o = offer();
+		await startSlow(o);
+		writeFileSync(path.join(wtDir(o.runId), 'ZWISCHENSTAND.md'), 'x\n');
+		executor.holdDelivery();
+		try {
+			expect(await executor.handoff('suspend', { deadlineMs: 8000, pushWip: true })).toBe(1);
+			const fin = await finishOf(o.runId);
+			expect(fin).toMatchObject({ status: 'cancelled', handoff: { reason: 'suspend', wipPushed: false, headSha: null } });
+			expect(remote.sha(o.branch)).toBeNull();
+		} finally {
+			executor.releaseDelivery();
+			executor.resumeOffers();
+		}
+	});
+
 	it('holdDelivery + cancel + releaseDelivery: kein Push, cancelled', async () => {
 		executor.holdDelivery();
 		const o = offer({ prompt: 'Bitte die README ergänzen.' });

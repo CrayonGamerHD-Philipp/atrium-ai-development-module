@@ -484,6 +484,34 @@ describe('Runner im Modus desktop', () => {
 		expect(fin.pr).toBeFalsy();
 	});
 
+	it('hält die Auslieferung gesperrt, bis nach dem Aufwachen ein Heartbeat durchkommt', async () => {
+		const o = offer({ prompt: '[fake:slow]' });
+		datrium.send({ type: 'offer', offer: o });
+		await datrium.waitFor((r) => r.path === `/runner/runs/${o.runId}/accept`);
+		const from = datrium.requests.length;
+		// Anmeldung klappt, die nächsten Heartbeats scheitern; der Lauf gehört inzwischen einem anderen Runner
+		datrium.failHeartbeats = 1_000;
+		datrium.cancel.push(o.runId);
+		let settled = false;
+		const resumed = drunner.handlePowerEvent({ kind: 'resume', source: 'test' }).then(() => (settled = true));
+		// mehrere Heartbeats sind vollständig gescheitert (je zwei Versuche)
+		await datrium.waitFor(() => datrium.failHeartbeats <= 1_000 - 6);
+		const reg = indexOf((r) => r.path === '/runner/register', from);
+		expect(reg).toBeGreaterThanOrEqual(0);
+		expect(drunner.executor.deliveryHeld).toBe(true);
+		expect(settled).toBe(false);
+		expect(drunner.executor.isRunning(o.runId)).toBe(true);
+		// Atrium wieder erreichbar: freigegeben erst nach dem erfolgreichen Heartbeat, dessen cancel den Lauf abbricht
+		datrium.failHeartbeats = 0;
+		await resumed;
+		expect(drunner.executor.deliveryHeld).toBe(false);
+		const fin = await dfinish(o.runId);
+		expect(fin.status).toBe('cancelled');
+		expect(fin.pr).toBeFalsy();
+		expect(fin.branchPushed).toBe(false);
+		expect(datrium.byPath(new RegExp(`/runner/runs/${o.runId}/events`)).flatMap((r) => (r.body as { events: { kind: string; payload: { action?: string } }[] }).events).some((ev) => ev.kind === 'git' && ev.payload.action === 'push')).toBe(false);
+	});
+
 	it('übergibt beim Beenden statt zu warten und hält den Monitor an', async () => {
 		const o = offer({ prompt: '[fake:slow]' });
 		datrium.send({ type: 'offer', offer: o });

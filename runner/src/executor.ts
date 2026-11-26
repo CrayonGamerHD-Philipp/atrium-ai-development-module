@@ -390,6 +390,11 @@ export class Executor {
 		try {
 			sha = await head();
 			if (!h.pushWip || !prepared || !wipEligible(offer) || stale()) return { pushed: false, headSha: sha };
+			// Gesperrte Auslieferung (aufgewacht, Heartbeat noch offen): der Lauf gehört womöglich schon einem anderen Runner
+			if (this.hold) {
+				emit('error', { text: 'Übergabe: Laufbesitz nach dem Aufwachen ungeklärt – kein Zwischenstand gepusht' });
+				return { pushed: false, headSha: sha };
+			}
 			if (await operationInProgress(ws, dir, signal)) {
 				emit('error', { text: 'Übergabe: Merge/Rebase im Worktree unterbrochen – kein Zwischenstand gepusht' });
 				return { pushed: false, headSha: sha };
