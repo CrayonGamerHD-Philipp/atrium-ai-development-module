@@ -4,13 +4,15 @@
  */
 import { sql } from 'drizzle-orm';
 import { errors, num, rowsOf, str, toIso, type Row } from '$lib/sdk/server';
-import { clip, jsonb, LEASE_SEC, oneOf, type Tx } from './db';
+import { clip, DESKTOP_LEASE_SEC, jsonb, LEASE_SEC, oneOf, type Tx } from './db';
 import { sendCommand, type Effects } from './effects';
 import { storeLimitSnapshot } from './limits.service';
 import { extractPlan } from './prompts';
 import {
 	MAX_EVENT_TEXT,
+	READ_ONLY_ROLES,
 	type FinishInput,
+	type Handoff,
 	type LimitInput,
 	type RunEvent,
 	type UsageInput
@@ -22,6 +24,7 @@ import {
 	applyPlan,
 	checkPlan,
 	createResolveTask,
+	effectiveRole,
 	excludeAccount,
 	getTask,
 	isFinal,
@@ -32,7 +35,16 @@ import {
 	type StoredPlan
 } from './tasks.service';
 
-const LEASE = sql`now() + ${LEASE_SEC}::int * interval '1 second'`;
+/** Neues Lease-Ende eines laufenden Laufs mit der wirksamen Lease des Runners (`leaseSecOf`, PC-Runner kürzer) */
+const leaseOf = (runnerId: string) =>
+	sql`now() + (CASE WHEN EXISTS (SELECT 1 FROM runner WHERE id = ${runnerId} AND kind = 'desktop')
+		THEN ${DESKTOP_LEASE_SEC} ELSE ${LEASE_SEC} END)::int * interval '1 second'`;
+
+/** Grund im Auftrag bei einer Übergabe (PC geht in den Standby / wird heruntergefahren) */
+const HANDOFF_MESSAGES: Record<Handoff['reason'], string> = {
+	suspend: 'Übergabe: PC geht in den Standby – wird neu eingeplant',
+	shutdown: 'Übergabe: PC wird heruntergefahren – wird neu eingeplant'
+};
 const ACTIVE = ['offered', 'running'];
 
 /** Lauf dieses Runners (fremde/unbekannte → 404) */
@@ -114,7 +126,7 @@ export async function acceptRun(tx: Tx, fx: Effects, runnerId: string, runId: st
 		throw errors.conflict('Der Auftrag ist nicht mehr offen');
 	}
 	await tx.execute(
-		sql`UPDATE run SET status = 'running', started_at = now(), lease_expires_at = ${LEASE}
+		sql`UPDATE run SET status = 'running', started_at = now(), lease_expires_at = ${leaseOf(runnerId)}
 			WHERE id = ${run.id}`
 	);
 	await tx.execute(
@@ -204,7 +216,7 @@ export async function recordEvents(
 	await tx.execute(
 		sql`UPDATE run SET event_count = event_count + ${inserted.length},
 				event_bytes = event_bytes + ${bytes},
-				lease_expires_at = CASE WHEN status = 'running' THEN ${LEASE} ELSE lease_expires_at END
+				lease_expires_at = CASE WHEN status = 'running' THEN ${leaseOf(runnerId)} ELSE lease_expires_at END
 			WHERE id = ${run.id}`
 	);
 	return { run, inserted, dropped: unique.length - take.length };
@@ -324,6 +336,16 @@ export async function finishRun(
 		const t = await getTask(tx, String(run.task_id));
 		return { ok: true, taskStatus: t ? String(t.status) : null };
 	}
+	// Übergabe (nur mit `cancelled`, siehe `finishInput`): Infos für den nächsten Lauf am Lauf festhalten
+	const handoff = input.status === 'cancelled' ? (input.handoff ?? null) : null;
+	const handoffInfo = handoff
+		? {
+				...handoff,
+				runnerName: str(
+					(await oneOf(tx, sql`SELECT name FROM runner WHERE id = ${runnerId}`))?.name
+				)
+			}
+		: null;
 	await tx.execute(
 		sql`UPDATE run SET status = ${input.status}, finished_at = now(), lease_expires_at = NULL,
 				session_id = COALESCE(${input.sessionId}, session_id),
@@ -332,6 +354,7 @@ export async function finishRun(
 				summary = ${input.summary},
 				error_kind = ${input.errorKind},
 				error_message = ${input.errorMessage},
+				handoff = ${handoffInfo ? jsonb(handoffInfo) : sql`handoff`},
 				started_at = COALESCE(started_at, now())
 			WHERE id = ${run.id}`
 	);
@@ -403,11 +426,27 @@ export async function finishRun(
 			break;
 		}
 		case 'cancelled':
+			// Abbruch durch den Runner (auch Übergabe): Versuch zählt nicht, sofort neu einplanen (`fx.dispatch`)
 			await tx.execute(
 				sql`UPDATE task SET attempts = GREATEST(attempts - 1, 0) WHERE id = ${task.id}`
 			);
+			if (handoff) {
+				// Der nächste Lauf muss auf demselben Arbeits-Branch (mit dem WIP-Commit) weitermachen. `branch` ist ab
+				// dem ersten Angebot gesetzt; nur falls nicht (ältere Daten), den gemeldeten Branch übernehmen.
+				const branch = input.branch ?? str(run.branch);
+				if (
+					handoff.wipPushed &&
+					branch &&
+					!task.branch &&
+					!READ_ONLY_ROLES.includes(effectiveRole(task))
+				) {
+					await tx.execute(sql`UPDATE task SET branch = ${branch} WHERE id = ${task.id}`);
+				}
+			}
 			await transition(tx, fx, String(task.id), 'queued', {
-				error: input.errorMessage ?? 'Lauf abgebrochen – wird neu eingeplant'
+				error: handoff
+					? HANDOFF_MESSAGES[handoff.reason]
+					: (input.errorMessage ?? 'Lauf abgebrochen – wird neu eingeplant')
 			});
 			break;
 	}

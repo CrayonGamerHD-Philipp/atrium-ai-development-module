@@ -4,7 +4,7 @@
  */
 import { sql } from 'drizzle-orm';
 import { errors, inList, rowsOf, str, type RequestContext } from '$lib/sdk/server';
-import { jsonb, LEASE_SEC, mdb, oneOf, type Row, type Tx } from './db';
+import { jsonb, leaseSecOf, mdb, oneOf, type Row, type Tx } from './db';
 import { newEffects, sendCommand, type Effects } from './effects';
 import {
 	PROTOCOL_VERSION,
@@ -59,15 +59,17 @@ export async function registerRunner(
 		);
 	}
 	const key = runnerKeyOf(ctx);
+	// ältere Runner melden keine Art → Server-Runner
+	const kind = input.kind ?? 'server';
 	let runner = await oneOf(tx, sql`SELECT * FROM runner WHERE api_key_id = ${key} FOR UPDATE`);
 	if (!runner) {
 		const id = crypto.randomUUID();
 		runner = await oneOf(
 			tx,
 			sql`INSERT INTO runner (id, name, api_key_id, status, version, capabilities, max_slots,
-					reported_max_slots, last_seen_at)
+					reported_max_slots, last_seen_at, kind)
 				VALUES (${id}, ${input.name}, ${key}, 'pending', ${input.version}, ${jsonb(input.capabilities)},
-					${input.maxSlots}, ${input.maxSlots}, now())
+					${input.maxSlots}, ${input.maxSlots}, now(), ${kind})
 				ON CONFLICT (api_key_id) DO NOTHING
 				RETURNING *`
 		);
@@ -75,7 +77,7 @@ export async function registerRunner(
 		fx.audits.push({
 			action: 'aidev.runner.registered',
 			target: id,
-			metadata: { name: input.name, version: input.version, accounts: input.accounts.length }
+			metadata: { name: input.name, version: input.version, accounts: input.accounts.length, kind }
 		});
 	} else {
 		// geändertes MAX_SLOTS des Runners übernehmen; ein von der Verwaltung gesetzter Wert bleibt,
@@ -87,6 +89,7 @@ export async function registerRunner(
 			tx,
 			sql`UPDATE runner SET name = ${input.name}, version = ${input.version},
 					capabilities = ${jsonb(input.capabilities)}, last_seen_at = now(), draining = false,
+					kind = ${kind},
 					max_slots = ${slotsChanged ? input.maxSlots : Number(runner.max_slots)},
 					reported_max_slots = ${input.maxSlots}
 				WHERE id = ${runner.id} RETURNING *`
@@ -110,13 +113,18 @@ export async function registerRunner(
 				WHERE runner_id = ${runnerId} AND key NOT IN (${inList(keys)})`
 			: sql`UPDATE provider_account SET logged_in = false WHERE runner_id = ${runnerId}`
 	);
-	if (input.runIds) await releaseOrphanedRuns(tx, fx, runnerId, input.runIds);
+	if (input.runIds) {
+		// PC-Runner (Standby, Neustart des PCs): Versuch zählt nicht – der Auftrag kann nichts dafür
+		await releaseOrphanedRuns(tx, fx, runnerId, input.runIds, kind !== 'desktop');
+	}
 	fx.overview = true;
 	fx.dispatch = true;
 	return {
 		runnerId,
 		status: String(runner!.status) as RegisterResult['status'],
-		heartbeatSec: HEARTBEAT_SEC
+		heartbeatSec: HEARTBEAT_SEC,
+		leaseSec: leaseSecOf(kind),
+		features: { handoff: true }
 	};
 }
 
@@ -125,12 +133,15 @@ export async function registerRunner(
  * als `lost` freigeben, statt bis zum Ende der Lease zu warten. Der Versuch zählt wie beim Lease-Ablauf (ein
  * Auftrag, der den Runner wiederholt abstürzen lässt, endet so nach `max_attempts`); ein geordnetes Beenden meldet
  * seine Läufe vorher selbst als `cancelled`. Angebotene Läufe holt der Runner nach der Anmeldung erneut ab.
+ * Bei PC-Runnern (`counted = false`) zählt der Versuch nicht: Standby oder Neustart des PCs ist kein Fehler des
+ * Auftrags.
  */
 async function releaseOrphanedRuns(
 	tx: Tx,
 	fx: Effects,
 	runnerId: string,
-	active: string[]
+	active: string[],
+	counted: boolean
 ): Promise<number> {
 	const runs = await rowsOf(
 		tx,
@@ -141,7 +152,7 @@ async function releaseOrphanedRuns(
 					ORDER BY created_at FOR UPDATE`
 	);
 	for (const run of runs) {
-		await loseRun(tx, fx, run, 'Runner wurde neu gestartet – Lauf wird neu eingeplant', true);
+		await loseRun(tx, fx, run, 'Runner wurde neu gestartet – Lauf wird neu eingeplant', counted);
 	}
 	return runs.length;
 }
@@ -175,7 +186,7 @@ export async function heartbeat(
 	if (reported.length && status !== 'disabled') {
 		const rows = await rowsOf(
 			tx,
-			sql`UPDATE run r SET lease_expires_at = now() + ${LEASE_SEC}::int * interval '1 second'
+			sql`UPDATE run r SET lease_expires_at = now() + ${leaseSecOf(runner.kind)}::int * interval '1 second'
 				FROM task t
 				WHERE r.task_id = t.id AND r.id IN (${inList(reported)}) AND r.runner_id = ${runnerId}
 					AND r.status = 'running' AND t.status NOT IN ('cancelled', 'done', 'failed')
@@ -239,14 +250,21 @@ export async function patchRunner(
 	tx: Tx,
 	fx: Effects,
 	id: string,
-	patch: { name?: string; status?: 'approved' | 'disabled'; maxSlots?: number }
+	patch: {
+		name?: string;
+		status?: 'approved' | 'disabled';
+		maxSlots?: number;
+		/** Vorrang; `null` = automatisch nach Art, fehlend = unverändert */
+		priority?: number | null;
+	}
 ): Promise<RunnerPatchResult> {
 	const runner = await oneOf(tx, sql`SELECT * FROM runner WHERE id = ${id} FOR UPDATE`);
 	if (!runner) throw errors.notFound('Runner nicht gefunden');
 	await tx.execute(
 		sql`UPDATE runner SET name = ${patch.name ?? String(runner.name)},
 				status = ${patch.status ?? String(runner.status)},
-				max_slots = ${patch.maxSlots ?? Number(runner.max_slots)}
+				max_slots = ${patch.maxSlots ?? Number(runner.max_slots)},
+				priority = ${patch.priority === undefined ? sql`priority` : patch.priority}
 			WHERE id = ${id}`
 	);
 	const changed = patch.status && patch.status !== runner.status ? patch.status : null;

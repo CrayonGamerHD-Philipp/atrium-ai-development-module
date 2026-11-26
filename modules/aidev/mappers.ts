@@ -3,6 +3,7 @@ import { num, str, toIso, toIsoOrNull, type Row } from '$lib/sdk/server';
 import { storedActionsOf } from './actions';
 import { jsonOf, stringList } from './db';
 import type { AttachmentOffer, CommitPolicy, Provider, Role } from './protocol';
+import { runnerPriorityOf } from './scheduler';
 import type {
 	AttachmentDto,
 	AccountDto,
@@ -168,6 +169,7 @@ export function accountDto(
 }
 
 export function runnerDto(r: Row, accounts: AccountDto[]): RunnerDto {
+	const priority = r.priority === null || r.priority === undefined ? null : num(r.priority);
 	return {
 		id: String(r.id),
 		name: String(r.name),
@@ -178,6 +180,9 @@ export function runnerDto(r: Row, accounts: AccountDto[]): RunnerDto {
 		maxSlots: num(r.max_slots),
 		slotsUsed: num(r.slots_used),
 		draining: r.draining === true,
+		kind: r.kind === 'desktop' ? 'desktop' : 'server',
+		priority,
+		effectivePriority: runnerPriorityOf(str(r.kind), priority),
 		capabilities: jsonOf<RunnerDto['capabilities']>(r.capabilities, {}),
 		createdAt: toIso(r.created_at),
 		accounts

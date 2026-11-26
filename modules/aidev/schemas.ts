@@ -16,6 +16,7 @@ import {
 	type LimitWindow,
 	type Provider,
 	type Role,
+	type RunnerKind,
 	type RunEvent
 } from './protocol';
 
@@ -313,7 +314,9 @@ export const liveQuery = z.object({
 export const runnerPatch = z.object({
 	name: z.string().trim().min(1).max(80).optional(),
 	status: z.enum(['approved', 'disabled']).optional(),
-	maxSlots: z.number().int().min(0).max(64).optional()
+	maxSlots: z.number().int().min(0).max(64).optional(),
+	/** Vorrang bei der Vergabe (höher = zuerst); `null` = automatisch nach Art (desktop 10, server 0) */
+	priority: z.number().int().min(-100).max(100).nullable().optional()
 });
 export const accountPatch = z.object({
 	label: z.string().trim().max(120).optional(),
@@ -532,8 +535,15 @@ export interface RunnerDto {
 	slotsUsed: number;
 	/** Runner wird beendet und lässt laufende Läufe fertig werden (bekommt keine neuen) */
 	draining: boolean;
+	/** Art: `server` = dauerhafter Dienst, `desktop` = Runner auf dem PC eines Nutzers (Vorrang, Übergabe) */
+	kind: RunnerKind;
+	/** Von der Verwaltung gesetzter Vorrang; `null` = automatisch nach Art */
+	priority: number | null;
+	/** Wirksamer Vorrang (`priority` oder automatisch: desktop 10, server 0) – höher bekommt Aufträge zuerst */
+	effectivePriority: number;
 	capabilities: {
 		question?: boolean;
+		handoff?: boolean;
 		attachments?: boolean;
 		branchDelivery?: boolean;
 		prUpdate?: boolean;
@@ -709,7 +719,7 @@ export type TerminalLiveEvent =
  * | POST | /terminal/:sid/resize | workspace.terminal | terminalResize | { ok } |
  * | DELETE | /terminal/:sid | workspace.terminal | – | { ok } |
  * | GET | /runners | runner.manage | – | RunnerDto[] |
- * | PATCH | /runners/:id | runner.manage | runnerPatch | RunnerDto |
+ * | PATCH | /runners/:id | runner.manage | runnerPatch | RunnerDto (u. a. `priority`: Vorrang, null = automatisch nach Art) |
  * | DELETE | /runners/:id | runner.manage | – | { ok } |
  * | GET | /accounts | project.view | – | AccountDto[] |
  * | PATCH | /accounts/:id | account.manage | accountPatch | AccountDto |
