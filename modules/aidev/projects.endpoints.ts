@@ -164,6 +164,8 @@ export const projectEndpoints: AnyApiEndpoint[] = [
 							setup_cmd = ${body.setupCmd ?? String(p.setup_cmd)},
 							test_cmd = ${body.testCmd ?? String(p.test_cmd)},
 							instructions = ${body.instructions ?? String(p.instructions)},
+							knowledge = ${body.knowledge ?? String(p.knowledge ?? '')},
+							knowledge_updated_at = ${body.knowledge !== undefined ? sql`now()` : sql`knowledge_updated_at`},
 							preferred_runner_id = ${body.preferredRunnerId === undefined ? (p.preferred_runner_id as string | null) : body.preferredRunnerId},
 							updated_at = now()
 						WHERE id = ${params.id}`

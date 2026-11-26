@@ -626,6 +626,23 @@ describe('Sonderfälle', () => {
 		expect(fin.commits.flatMap((c) => c.files)).toEqual(['AIDEV_FAKE.md']);
 		const events = eventsOf(o.runId);
 		expect(events.some((e) => e.kind === 'status' && e.payload.text?.startsWith('Recherche über fake-1'))).toBe(true);
+
+		// Dieselbe Frage in einem weiteren Lauf → aus dem Zwischenspeicher, ohne Recherche-Agent
+		const again = offer({ prompt: 'Noch einmal [fake:research]' });
+		const fin2 = await runOffer(again);
+		expect(fin2.summary).toContain('Version 4.2');
+		const ev2 = eventsOf(again.runId);
+		expect(ev2.some((e) => e.kind === 'system' && e.payload.text?.startsWith('Recherche aus dem Zwischenspeicher'))).toBe(true);
+		expect(ev2.some((e) => e.kind === 'status' && e.payload.text?.startsWith('Recherche über'))).toBe(false);
+	});
+
+	it('Repository-Übersicht wird je Stand einmal erzeugt und zwischengespeichert', async () => {
+		const o = offer({ prompt: 'Übersicht' });
+		await runOffer(o);
+		const sha = git(path.join(env.workDir, 'wt', o.runId), 'rev-parse', `${remote.sha('main')}^{tree}`);
+		const file = path.join(env.workDir, 'meta', 'repomap', 'acme', 'shop', `${sha}.md`);
+		expect(existsSync(file)).toBe(true);
+		expect(readFileSync(file, 'utf8')).toContain('tracked files');
 	});
 
 	it('setupCmd schlägt fehl → failed setup, Ausgabe als Ereignis', async () => {

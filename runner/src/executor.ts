@@ -50,6 +50,8 @@ import {
 	TOOLS_DIR,
 	type ResearchRequest
 } from './research.ts';
+import { ResearchCache } from './research.ts';
+import { repoMap, repoMapSection } from './repomap.ts';
 import {
 	addUsage,
 	conflictRepairPrompt,
@@ -514,7 +516,12 @@ export class Executor {
 			emit('status', { text: `Agent startet (${offer.account.provider}${offer.model ? `, ${offer.model}` : ''})` });
 			await mkdir(tmpDir, { recursive: true });
 			const adapter = this.o.adapters[acct.provider];
-			const prompt = [offer.prompt, hint, pull?.markdown].filter((p): p is string => !!p).join('\n\n');
+			// Repository-Übersicht (aus git, zwischengespeichert je Stand) – nicht bei fortgesetzter Sitzung, die kennt sie
+			const map =
+				this.o.config.repoMap !== false && !offer.resumeSessionId ? await repoMap(ws, repo, dir) : null;
+			const prompt = [offer.prompt, hint, pull?.markdown, map ? repoMapSection(map) : null]
+				.filter((p): p is string => !!p)
+				.join('\n\n');
 			const systemPrompt = research
 				? `${offer.systemPrompt}\n${researchPromptSection({ max: researchMax })}`
 				: offer.systemPrompt;
@@ -1269,6 +1276,15 @@ export class Executor {
 		emit: (k: RunEventKind, p: Record<string, unknown>) => void,
 		onUsage: (u: AgentUsage) => void
 	): Promise<string> {
+		// Dieselbe Frage im selben Repository kürzlich schon recherchiert → ohne Agent-Aufruf beantworten
+		const cache = new ResearchCache(
+			path.join(this.o.workspace.o.workDir, 'meta', 'research', offer.project.repoOwner, offer.project.repoName)
+		);
+		const hit = await cache.get(req);
+		if (hit) {
+			emit('system', { text: `Recherche aus dem Zwischenspeicher (keine Tokens):\n${tailText(hit.answer, 4000)}` });
+			return hit.answer;
+		}
 		const candidates = this.researchAccounts(acct);
 		if (!candidates.length) throw new Error('Kein angemeldetes Konto für Recherchen verfügbar');
 		const q = req.question.replace(/\s+/g, ' ').trim();
@@ -1331,6 +1347,7 @@ export class Executor {
 				}
 				const answer = this.o.redactor.redact(r.lastText.trim());
 				emit('system', { text: `Recherche-Ergebnis (${cand.key}):\n${tailText(answer, 4000)}` });
+				await cache.put(req, answer, cand.key);
 				return answer;
 			} finally {
 				clearTimeout(timer);

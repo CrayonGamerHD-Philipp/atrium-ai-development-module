@@ -52,6 +52,8 @@ export function projectDto(r: Row, counts: ProjectCounts = EMPTY_COUNTS): Projec
 		setupCmd: String(r.setup_cmd ?? ''),
 		testCmd: String(r.test_cmd ?? ''),
 		instructions: String(r.instructions ?? ''),
+		knowledge: String(r.knowledge ?? ''),
+		knowledgeUpdatedAt: toIsoOrNull(r.knowledge_updated_at),
 		preferredRunnerId: str(r.preferred_runner_id),
 		createdAt: toIso(r.created_at),
 		updatedAt: toIso(r.updated_at),

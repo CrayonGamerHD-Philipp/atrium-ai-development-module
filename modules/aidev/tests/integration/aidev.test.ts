@@ -649,6 +649,42 @@ describe('aidev', () => {
 		expect(cleared.cooldownUntil).toBeNull();
 	});
 
+	it('Projektwissen: Notizen aus dem Ergebnis werden gespeichert und dem nächsten Lauf mitgegeben', async () => {
+		const t = await createTask({ prompt: 'Wissen sammeln' });
+		const first = await offerFor(t.id);
+		expect(first.systemPrompt).toContain('## Remember what you learned');
+		ok(await call('runner', 'POST', `/runner/runs/${first.runId}/accept`), 201);
+		const summary = [
+			'Erledigt.',
+			'',
+			'```aidev-notes',
+			'- Tests brauchen vorher `npm run build:types`',
+			'- token = ghp_abcdefghijklmnopqrstuvwxyz0123456789',
+			'```'
+		].join('\n');
+		ok(await finish(first.runId, { status: 'succeeded', summary }), 201);
+		// Block ist aus dem sichtbaren Ergebnis entfernt, Geheimnis verworfen
+		expect((await task(t.id)).task.resultSummary).toBe('Erledigt.');
+		const project = ok<ProjectDto>(await call('admin', 'GET', `/projects/${t.projectId}`));
+		expect(project.knowledge).toMatch(
+			/^- \[\d{4}-\d{2}-\d{2}\] Tests brauchen vorher `npm run build:types`$/m
+		);
+		expect(project.knowledge).not.toContain('ghp_');
+		expect(project.knowledgeUpdatedAt).not.toBeNull();
+
+		const next = await createTask({ prompt: 'Nächster Auftrag' });
+		const offer = await offerFor(next.id);
+		expect(offer.systemPrompt).toContain('## Project knowledge (notes from earlier runs)');
+		expect(offer.systemPrompt).toContain('npm run build:types');
+		ok<TaskDto>(await call('admin', 'POST', `/tasks/${next.id}/cancel`), 201);
+
+		// von Hand bearbeiten bzw. leeren
+		const cleared = ok<ProjectDto>(
+			await call('admin', 'PATCH', `/projects/${t.projectId}`, { knowledge: '' })
+		);
+		expect(cleared.knowledge).toBe('');
+	});
+
 	it('Orchestrierung: Plan → Teilaufträge mit Abhängigkeiten → Ausliefern', async () => {
 		const parent = await createTask({ prompt: 'Großes Feature', decompose: true });
 		expect(parent.role).toBe('orchestrate');
