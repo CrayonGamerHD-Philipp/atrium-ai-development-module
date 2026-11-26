@@ -8,6 +8,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { controlDir, stateFile, type RunnerStateFile } from '../runner.ts';
 import { RUNNER_VERSION } from '../version.ts';
+import { isolationHint, personalDataFindings } from './isolation.ts';
 import { desktopPaths } from './paths.ts';
 import { serviceManager, ServiceError, type ServiceSpec } from './service.ts';
 import { desktopConfigTemplate } from './template.ts';
@@ -143,6 +144,10 @@ export async function runDesktopCommand(
 				const m = svc();
 				await m.install(spec);
 				io.out(`Autostart eingerichtet (${m.name}): ${m.location}`);
+				const hint = isolationHint(personalDataFindings());
+				if (hint) io.out(`
+Hinweis: ${hint}
+`);
 				if (!rest.includes('--no-start')) {
 					await m.start();
 					io.out('Runner gestartet. Freigabe in Atrium: Administration → Runner & Konten');

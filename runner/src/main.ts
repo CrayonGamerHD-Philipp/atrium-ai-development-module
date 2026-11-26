@@ -17,6 +17,7 @@ import { defaultAdapters } from './providers/index.ts';
 import { Redactor } from './redact.ts';
 import { DESKTOP_COMMANDS, runDesktopCommand } from './desktop/cli.ts';
 import { desktopPaths } from './desktop/paths.ts';
+import { isolationHint, personalDataFindings } from './desktop/isolation.ts';
 import { checkTools } from './desktop/tools.ts';
 import { probeAccounts, Runner } from './runner.ts';
 import { RUNNER_VERSION } from './version.ts';
@@ -139,6 +140,8 @@ async function main(): Promise<void> {
 			if (t.ok) log.info(`Programm ${t.name}: vorhanden (${t.version})`);
 			else log[t.required ? 'error' : 'warn'](`Programm ${t.name} fehlt${t.hint ? ` – Installation: ${t.hint}` : ''}`);
 		}
+		const hint = config.kind === 'desktop' ? isolationHint(personalDataFindings()) : null;
+		if (hint) log.warn(hint);
 		const res = await probeAccounts(config, defaultAdapters, log);
 		const ok = [...res.values()].every((a) => a.ok && a.loggedIn) && tools.every((t) => t.ok || !t.required);
 		process.exitCode = ok ? 0 : 1;
@@ -179,6 +182,10 @@ async function main(): Promise<void> {
 	if (config.kind === 'desktop' && process.platform !== 'win32' && process.getuid?.() === 0 && process.env.ALLOW_ROOT !== '1') {
 		log.error('Der PC-Runner darf nicht als root laufen (Agents hätten volle Rechte). Bitte als normaler Benutzer starten.');
 		process.exit(2);
+	}
+	if (config.kind === 'desktop') {
+		const hint = isolationHint(personalDataFindings());
+		if (hint) log.warn(hint);
 	}
 	let stopRequested: (() => void) | null = null;
 	const runner = new Runner({ config, redactor, log, onStopRequest: () => stopRequested?.() });

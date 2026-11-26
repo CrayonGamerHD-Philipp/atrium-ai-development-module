@@ -7,6 +7,7 @@ import { loadConfig } from '../src/config.ts';
 import { desktopPaths } from '../src/desktop/paths.ts';
 import { launchAgentPlist, systemdQuote, systemdUnit, windowsLauncher, type ServiceSpec } from '../src/desktop/service.ts';
 import { desktopConfigTemplate } from '../src/desktop/template.ts';
+import { isolationHint, personalDataFindings } from '../src/desktop/isolation.ts';
 import { installHint } from '../src/desktop/tools.ts';
 import { ClockDriftMonitor, FakePowerMonitor } from '../src/power/index.ts';
 import { CombinedPowerMonitor } from '../src/power/index.ts';
@@ -137,5 +138,36 @@ describe('Pfade und Vorlage', () => {
 		expect(installHint('git', 'win32')).toContain('winget');
 		expect(installHint('gh', 'darwin')).toContain('brew');
 		expect(installHint('claude', 'linux')).toContain('@anthropic-ai/claude-code');
+	});
+});
+
+describe('Isolation ohne Docker (persönliche Daten im Home)', () => {
+	const fakeFs = (files: string[], dirs: Record<string, string[]> = {}) => ({
+		exists: (p: string) => files.includes(p.replace(/\\/g, '/')),
+		list: (p: string) => dirs[p.replace(/\\/g, '/')] ?? []
+	});
+
+	it('findet private SSH-Schlüssel, aber nicht known_hosts/config allein', () => {
+		const only = fakeFs([], { '/home/a/.ssh': ['known_hosts', 'config'] });
+		expect(personalDataFindings('/home/a', 'linux', only)).toEqual([]);
+		const keys = fakeFs([], { '/home/a/.ssh': ['known_hosts', 'id_ed25519', 'id_ed25519.pub'] });
+		expect(personalDataFindings('/home/a', 'linux', keys)).toEqual([{ label: 'SSH-Schlüssel', path: '~/.ssh/id_ed25519' }]);
+	});
+
+	it('prüft Browser-Profile nur für das jeweilige System', () => {
+		const files = ['/home/a/.mozilla/firefox', 'C:/Users/a/AppData/Local/Google/Chrome/User Data'];
+		expect(personalDataFindings('/home/a', 'linux', fakeFs(files)).map((f) => f.label)).toEqual(['Browser-Profil (Firefox)']);
+		const win = personalDataFindings('C:\\Users\\a', 'win32', fakeFs(files));
+		expect(win).toEqual([
+			{ label: 'Browser-Profil (Chrome)', path: '%USERPROFILE%\\AppData\\Local\\Google\\Chrome\\User Data' }
+		]);
+	});
+
+	it('Hinweis nur bei Funden, mit Benutzer und Empfehlung', () => {
+		expect(isolationHint([], 'a')).toBeNull();
+		const hint = isolationHint([{ label: 'GnuPG-Schlüssel', path: '~/.gnupg' }], 'a')!;
+		expect(hint).toContain('„a“');
+		expect(hint).toContain('GnuPG-Schlüssel: ~/.gnupg');
+		expect(hint).toContain('eigenen Benutzerkonto');
 	});
 });

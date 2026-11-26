@@ -28,6 +28,8 @@ OutputBaseFilename=atrium-runner-{#AppVersion}-windows-{#Arch}-setup
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
+; Sicherheitshinweis vor der Installation (UTF-8 mit BOM, damit Umlaute stimmen)
+InfoBeforeFile=info-before.txt
 UninstallDisplayIcon={app}\atrium-runner.exe
 #if Arch == "arm64"
 ArchitecturesAllowed=arm64

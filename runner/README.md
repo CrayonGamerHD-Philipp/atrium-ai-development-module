@@ -281,12 +281,31 @@ vertretbare Grundlinie:
 - Zugangsdaten bleiben auf dem PC, Ausgaben werden bereinigt, `systemd`: `NoNewPrivileges=true`,
 - fine-grained GitHub-Token nur für die gewählten Repos, Branch-Protection auf dem Haupt-Branch.
 
-Empfehlung (abgestuft, **noch abzustimmen**, bevor mehr davon fest eingebaut wird):
+**Empfohlener Betrieb** (abgestuft):
 
-1. **Eigenes Benutzerkonto** nur für den Runner (z. B. `atrium-runner`) mit eigenen CLI-Logins und eigenem
-   `gh`-Token – trennt die Agents von deinen persönlichen Daten, ohne Docker. Für die meisten der beste Kompromiss.
-2. **Docker Desktop** bzw. Podman mit dem bestehenden Image – volle Isolation wie auf dem Server.
+1. **Eigenes Benutzerkonto nur für den Runner** (Standardempfehlung) – trennt die Agents von deinen persönlichen
+   Daten, ohne Docker. Das Konto bekommt eigene CLI-Logins und ein eigenes fine-grained `gh`-Token, keine
+   Administratorrechte und keinen Zugriff auf dein Home-Verzeichnis.
+2. **Docker Desktop** bzw. Podman mit dem bestehenden Image – volle Isolation wie auf dem Server
+   (siehe [Starten](#4-starten)).
 3. Zusätzlich möglich: Firewall-Regeln nur für GitHub, Atrium und die KI-Anbieter.
+
+**Prüfung im Runner:** Läuft ein PC-Runner unter einem Konto mit persönlichen Daten, warnen `probe`, `install` und der
+Start. Geprüft wird nur, ob typische Pfade existieren (Inhalte werden nie gelesen): private SSH-Schlüssel
+(`~/.ssh/id_*`), Cloud-Zugangsdaten (AWS, Azure, Google Cloud, Kubernetes), GnuPG, Docker-/npm-Anmeldung und
+Browser-Profile. Was der Runner selbst braucht (gh- und CLI-Logins), zählt nicht. Der Hinweis ist eine Warnung; der
+Runner startet trotzdem. Der Windows-Installer zeigt dieselbe Empfehlung vor der Installation.
+
+**Eigenes Konto einrichten:**
+
+| System | Schritte |
+|---|---|
+| Windows | Einstellungen → Konten → Andere Benutzer → „Konto hinzufügen“ → lokales Konto (Standardbenutzer) `atrium-runner`. Als dieses Konto anmelden, git/gh/CLIs installieren (falls nur für den eigenen Benutzer), Installer ausführen, `gh auth login` und `atrium-runner login <konto>`. Der Autostart greift bei der Anmeldung dieses Kontos; per „Benutzer wechseln“ bleibt es angemeldet, während du mit deinem Konto arbeitest. |
+| macOS | Systemeinstellungen → Benutzer & Gruppen → Benutzer hinzufügen (Standard) `atrium-runner`. Das `.pkg` installiert systemweit; als `atrium-runner` anmelden (schneller Benutzerwechsel), dort `atrium-runner install`, `gh auth login`, `atrium-runner login <konto>`. |
+| Linux | `sudo useradd -m -s /bin/bash atrium-runner && sudo loginctl enable-linger atrium-runner`, dann `sudo -iu atrium-runner` und dort `install.sh`, `gh auth login`, `atrium-runner login <konto>`. Mit Linger läuft der Runner ohne Anmeldung; Standby/Herunterfahren erkennt er weiterhin über logind. |
+
+Das Home-Verzeichnis deines persönlichen Kontos sollte für andere Benutzer nicht lesbar sein (Linux: `chmod 700 ~`;
+Windows und macOS sind so voreingestellt).
 
 ### Manuelle Tests je Betriebssystem
 

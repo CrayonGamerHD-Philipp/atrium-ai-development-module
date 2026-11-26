@@ -1,0 +1,13 @@
+﻿Atrium Runner – Hinweis zur Sicherheit
+
+Der Runner führt KI-Agents (Claude, Codex, Gemini) ohne Rückfragen aus. Ohne Docker laufen sie mit den Rechten des
+Windows-Benutzers, unter dem der Runner installiert ist. Sie könnten dann auch Dateien außerhalb ihres
+Arbeitsverzeichnisses lesen, z. B. SSH-Schlüssel, Browser-Profile oder andere Projekte.
+
+Empfehlung: Installieren Sie den Runner unter einem eigenen Windows-Benutzerkonto nur für den Runner
+(Standardbenutzer, z. B. "atrium-runner") mit eigenen Anmeldungen bei GitHub (gh) und den KI-Anbietern.
+
+Volle Isolation bietet Docker Desktop mit dem Server-Image des Runners.
+
+"atrium-runner probe" prüft nach der Installation Programme und Anmeldungen und warnt, wenn persönliche Daten im
+Benutzerkonto gefunden werden. Details: README.md im Programmverzeichnis, Abschnitt "Sicherheit ohne Docker".
