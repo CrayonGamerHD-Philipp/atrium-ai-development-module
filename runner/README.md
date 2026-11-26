@@ -148,8 +148,12 @@ Ein Neustart ist jederzeit möglich, kein Auftrag geht verloren:
 |---|---|---|
 | geordnet, `DRAIN_SEC=0` (Standard) | sofort abgebrochen, als `cancelled` gemeldet, Atrium plant sie neu ein; bekommt der Auftrag dasselbe Konto wieder, setzt der Agent seine Sitzung fort | nein |
 | geordnet, `DRAIN_SEC>0` | der Runner meldet `draining` (Atrium zeigt „Wird beendet“ und bietet ihm nichts Neues an) und wartet bis zu `DRAIN_SEC` Sekunden, bis die Läufe fertig sind (inkl. Commit, Push, PR); danach Rest wie oben | nein |
-| hart (`kill -9`, Absturz, Stromausfall) | beim nächsten Start meldet der Runner seine (leeren) Läufe bei der Anmeldung (`runIds`); Atrium gibt die verwaisten sofort frei und plant sie neu ein | ja |
-| Runner kommt nicht wieder | nach Ablauf der Lease (90 s) gibt der Scheduler-Job die Läufe frei | ja |
+| hart (`kill -9`, Absturz, Stromausfall) | beim nächsten Start meldet der Runner seine (leeren) Läufe bei der Anmeldung (`runIds`); Atrium gibt die verwaisten sofort frei und plant sie neu ein | nein (Verbindungsverlust; nach 20 in Folge `failed`) |
+| Runner kommt nicht wieder | nach Ablauf der Lease (90 s) gibt der Scheduler-Job die Läufe frei und plant sie neu ein | nein (Verbindungsverlust; nach 20 in Folge `failed`) |
+
+Der Heartbeat (alle 15 s) bleibt sicher unter der Lease: je Versuch höchstens 20 s für Antwortkopf und -körper,
+höchstens zwei Versuche und dazwischen höchstens 10 s Wartezeit (auch bei `retry-after`). Ein hängender Antwortkörper
+blockiert die Heartbeat-Schleife damit nicht mehr.
 
 Signale: Das erste `SIGTERM`/`SIGINT` startet das geordnete Beenden, ein zweites bricht die Wartefrist ab
 (laufende Läufe werden abgebrochen und neu eingeplant), ein drittes beendet sofort. Bei Docker muss

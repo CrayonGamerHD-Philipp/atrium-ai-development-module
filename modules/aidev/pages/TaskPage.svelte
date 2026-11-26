@@ -73,6 +73,7 @@
 	import RunLog from './task/RunLog.svelte';
 	import RestartDialog from './task/RestartDialog.svelte';
 	import TaskEditDialog from './task/TaskEditDialog.svelte';
+	import { connectionLostHint, offerRestartAtLostRun } from './task/connection';
 
 	let { params }: ModulePageProps = $props();
 	const projectId = $derived(params.id ?? '');
@@ -400,6 +401,10 @@
 	function connectionLost(r: RunDto) {
 		return r.errorKind === 'connection';
 	}
+	const lostState = $derived({
+		taskStatus: task?.status,
+		latest: !!selectedRun && selectedRun.id === runs[0]?.id
+	});
 	function errorTitle(r: RunDto) {
 		return connectionLost(r)
 			? 'Verbindung zum Runner verloren'
@@ -704,12 +709,17 @@
 								<Alert.Root variant="warning" class="mb-3">
 									<Alert.Title>{errorTitle(selectedRun)}</Alert.Title>
 									<Alert.Description>
-										<p>
-											Dieser Lauf zählt nicht als Versuch. Der Auftrag wird automatisch neu
-											eingeplant, bevorzugt auf einem anderen Agenten.
-										</p>
+										<p>{connectionLostHint(lostState)}</p>
 										{#if selectedRun.errorMessage}
 											<p class="whitespace-pre-wrap">{selectedRun.errorMessage}</p>
+										{/if}
+										{#if offerRestartAtLostRun(lostState, actions.retry)}
+											<Button
+												size="sm"
+												class="mt-2"
+												onclick={() => (restartOpen = true)}
+												disabled={!!busy}><RotateCcw /> Neu starten</Button
+											>
 										{/if}
 									</Alert.Description>
 								</Alert.Root>

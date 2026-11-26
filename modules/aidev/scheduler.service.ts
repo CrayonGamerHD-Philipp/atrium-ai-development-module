@@ -545,25 +545,57 @@ export function startScheduler(): void {
 
 // ---------------------------------------------------------------- Sicherheitsnetz (Job)
 
+/** Meldung eines laufenden Laufs, dessen Lease abgelaufen ist */
+export const LEASE_EXPIRED_MESSAGE = 'Runner meldet sich nicht mehr (Lease abgelaufen)';
+
+/**
+ * Einen Lauf mit abgelaufener Lease freigeben. Eigene Transaktion je Lauf und Sperrreihenfolge **Auftrag → Lauf**
+ * wie beim Neustart/Abbrechen (`requireTask(…, true)` → `cancelActiveRuns`), damit gleichzeitiges Neustarten
+ * keinen Deadlock auslöst. Nach dem Sperren wird erneut geprüft: Ein inzwischen eingetroffener Heartbeat
+ * (verlängerte Lease) oder ein Neustart (Lauf beendet) hat Vorrang. Liefert `true`, wenn der Lauf verloren ging.
+ */
+export async function expireRunLease(runId: string, taskId: string): Promise<boolean> {
+	const fx = newEffects();
+	const lost = await mdb().transaction(async (tx) => {
+		await getTask(tx, taskId, true);
+		const run = await oneOf(
+			tx,
+			sql`SELECT * FROM run WHERE id = ${runId} AND status IN ('offered', 'running')
+				AND lease_expires_at < now() FOR UPDATE`
+		);
+		if (!run) return false;
+		// nie angenommen → ungezählt zurück; lief bereits → Verbindungsverlust (automatisch neu eingeplant)
+		if (run.status === 'offered') {
+			await loseRun(tx, fx, run, 'Angebot nicht rechtzeitig angenommen', false);
+		} else {
+			await loseRun(tx, fx, run, LEASE_EXPIRED_MESSAGE, false, { connection: true });
+		}
+		return true;
+	});
+	await publish(null, fx);
+	return lost;
+}
+
 /** Abgelaufene Leases → `lost`, Runner ohne Heartbeat → offline, danach Dispatch */
 export async function schedulerTick(): Promise<string> {
-	const fx = newEffects();
-	const { lost, offline } = await mdb().transaction(async (tx) => {
-		const expired = await rowsOf(
+	const expired = await mdb().transaction((tx) =>
+		rowsOf(
 			tx,
-			sql`SELECT * FROM run WHERE status IN ('offered', 'running') AND lease_expires_at < now()
-				ORDER BY created_at FOR UPDATE`
-		);
-		for (const run of expired) {
-			// nie angenommen → ungezählt zurück; lief bereits → Verbindungsverlust (automatisch neu eingeplant)
-			if (run.status === 'offered') {
-				await loseRun(tx, fx, run, 'Angebot nicht rechtzeitig angenommen', false);
-			} else {
-				await loseRun(tx, fx, run, 'Runner meldet sich nicht mehr (Lease abgelaufen)', false, {
-					connection: true
-				});
-			}
+			sql`SELECT id, task_id FROM run WHERE status IN ('offered', 'running') AND lease_expires_at < now()
+				ORDER BY created_at`
+		)
+	);
+	let lost = 0;
+	for (const run of expired) {
+		// ein fehlgeschlagener Lauf (z. B. Sperrkonflikt) hält die übrigen nicht auf – nächster Tick versucht es erneut
+		try {
+			if (await expireRunLease(String(run.id), String(run.task_id))) lost++;
+		} catch (e) {
+			logBestEffort('aidev.scheduler.lease', e, { target: String(run.id) });
 		}
+	}
+	const fx = newEffects();
+	const offline = await mdb().transaction(async (tx) => {
 		const stale = await rowsOf(
 			tx,
 			sql`UPDATE runner SET online = false
@@ -572,7 +604,7 @@ export async function schedulerTick(): Promise<string> {
 				RETURNING id`
 		);
 		if (stale.length) fx.overview = true;
-		return { lost: expired.length, offline: stale.length };
+		return stale.length;
 	});
 	await publish(null, fx);
 	const offers = await dispatch();

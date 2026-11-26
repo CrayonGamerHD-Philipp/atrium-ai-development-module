@@ -172,7 +172,8 @@ ihrer Zeile neu. Der übergeordnete Auftrag wartet dann wieder auf seine Teilauf
 Verliert ein Lauf die Verbindung zum Runner (Lease abgelaufen, Runner-Neustart), startet Atrium den Auftrag
 **automatisch neu**. Der Lauf erscheint im Reiter **Verlauf** als **Verbindung verloren** und zählt nicht als Versuch.
 Der Auftrag wird wieder eingeplant und wechselt dabei bevorzugt auf einen anderen Agenten. Erst nach 20
-aufeinanderfolgenden Verbindungsverlusten gilt der Auftrag als **Fehlgeschlagen**.
+aufeinanderfolgenden Verbindungsverlusten gilt der Auftrag als **Fehlgeschlagen**; der Hinweis am verlorenen Lauf
+bietet dann direkt **Neu starten** an (setzt Versuche und Verlustzähler zurück).
 
 ### Limit-Analyse
 
