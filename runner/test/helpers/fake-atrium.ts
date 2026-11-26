@@ -5,9 +5,11 @@
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import {
+	checkpointInput,
 	eventsInput,
 	finishInput,
 	heartbeatInput,
+	leasesInput,
 	limitInput,
 	ptyExitInput,
 	ptyOutputInput,
@@ -45,6 +47,14 @@ export class FakeAtrium {
 	attachments = new Map<string, Buffer>();
 	/** Nächste Antworten für Anhänge mit 503 (Wiederholung prüfen) */
 	failAttachments = 0;
+	/** `registerResult.features` (Standard: keine Erweiterung – wie ein älteres Atrium) */
+	features: Record<string, boolean> | undefined = undefined;
+	/** `registerResult.leaseSec` */
+	leaseSec: number | undefined = undefined;
+	/** Läufe mit ungültiger Lease (`/runner/leases` → revoked) */
+	revoked = new Set<string>();
+	/** Läufe, deren Meldungen (events/finish/checkpoint) mit 409 abgelehnt werden */
+	conflict = new Set<string>();
 	private waiters: { pred: (r: Recorded) => boolean; resolve: (r: Recorded) => void }[] = [];
 
 	constructor() {
@@ -161,7 +171,22 @@ export class FakeAtrium {
 		let data: unknown = {};
 		if (p === '/runner/register') {
 			invalid = check(registerInput);
-			data = { runnerId: RUNNER_ID, status: 'approved', heartbeatSec: 1 };
+			data = {
+				runnerId: RUNNER_ID,
+				status: 'approved',
+				heartbeatSec: 1,
+				...(this.features ? { features: this.features } : {}),
+				...(this.leaseSec ? { leaseSec: this.leaseSec } : {})
+			};
+		} else if (p === '/runner/leases') {
+			invalid = check(leasesInput);
+			const runs = ((body as { runs?: { runId: string }[] })?.runs ?? []).map((r) => r.runId);
+			data = {
+				valid: runs.filter((id) => !this.revoked.has(id)),
+				revoked: runs.filter((id) => this.revoked.has(id)).map((runId) => ({ runId, reason: 'Lauf wurde übernommen' }))
+			};
+		} else if (/\/checkpoint$/.test(p)) {
+			invalid = check(checkpointInput);
 		} else if (p === '/runner/heartbeat') {
 			invalid = check(heartbeatInput);
 			data = { status: 'approved', cancel: this.cancel.splice(0) };
@@ -187,6 +212,11 @@ export class FakeAtrium {
 		else if (/^\/runner\/pty\/[^/]+\/exit$/.test(p)) invalid = check(ptyExitInput);
 		else return this.json(res, 404, { error: { code: 'not_found', message: `Unbekannt: ${p}` } });
 
+		const runId = /^\/runner\/runs\/([0-9a-f-]+)\//.exec(p)?.[1];
+		if (runId && this.conflict.has(runId) && /\/(events|finish|checkpoint)$/.test(p)) {
+			this.record({ method: req.method ?? '', path: p, body, invalid: '409' });
+			return this.json(res, 409, { error: { code: 'conflict', message: 'Lauf wurde übernommen' } });
+		}
 		this.record({ method: req.method ?? '', path: p, body, invalid });
 		if (invalid) return this.json(res, 400, { error: { code: 'invalid', message: invalid } });
 		this.json(res, 200, { data });

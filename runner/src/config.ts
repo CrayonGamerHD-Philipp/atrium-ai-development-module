@@ -72,6 +72,10 @@ const fileSchema = z
 		limitProbe: z.boolean().optional(),
 		limitProbeMin: z.number().optional(),
 		drainSec: z.number().int().optional(),
+		kind: z.enum(['server', 'desktop']).optional(),
+		handoverSec: z.number().int().optional(),
+		wipCheckpointMin: z.number().int().optional(),
+		powerEvents: z.boolean().optional(),
 		accounts: z.array(z.unknown()).optional()
 	})
 	.strict();
@@ -99,6 +103,17 @@ export interface RunnerConfig {
 	 * (Standard 0 = sofort abbrechen und neu einplanen lassen). Während der Frist nimmt der Runner nichts Neues an.
 	 */
 	drainSec?: number;
+	/**
+	 * Art des Runners: `server` (Standard, z. B. Docker) oder `desktop` (PC eines Nutzers: Vorrang in Atrium,
+	 * Übergabe vor Standby/Herunterfahren, Lease-Prüfung nach dem Aufwachen).
+	 */
+	kind?: 'server' | 'desktop';
+	/** Zeitbudget einer Übergabe in Sekunden (Agents stoppen, WIP pushen, melden; Standard 20) */
+	handoverSec?: number;
+	/** Abstand der WIP-Checkpoints laufender Läufe in Minuten (0 = aus; Standard: desktop 10, server 0) */
+	wipCheckpointMin?: number;
+	/** Standby/Herunterfahren des Betriebssystems beobachten (Standard: an für desktop) */
+	powerEvents?: boolean;
 	/** Pfad der gelesenen Konfigurationsdatei (falls vorhanden) */
 	configFile: string | null;
 }
@@ -123,6 +138,10 @@ const finalSchema = z.object({
 	limitProbe: z.boolean().optional(),
 	limitProbeMin: z.number().int().min(1).max(1440),
 	drainSec: z.number().int().min(0).max(86_400),
+	kind: z.enum(['server', 'desktop'], { message: 'muss server oder desktop sein' }),
+	handoverSec: z.number().int().min(3).max(300),
+	wipCheckpointMin: z.number().int().min(0).max(1440),
+	powerEvents: z.boolean(),
 	accounts: z.array(accountConfigSchema).max(50)
 });
 
@@ -137,7 +156,9 @@ const LABELS: Record<string, string> = {
 	gitAuthorEmail: 'GIT_AUTHOR_EMAIL',
 	limitProbe: 'LIMIT_PROBE',
 	limitProbeMin: 'LIMIT_PROBE_MIN',
-	drainSec: 'DRAIN_SEC'
+	drainSec: 'DRAIN_SEC',
+	kind: 'RUNNER_KIND',
+	powerEvents: 'POWER_EVENTS'
 };
 
 /** Schalter aus einer Umgebungsvariable (`1`/`true`/`on` bzw. `0`/`false`/`off`); ungültig → `invalid` */
@@ -199,6 +220,16 @@ export function loadConfig(o: LoadOptions = {}): RunnerConfig {
 	const limitProbeMin = /^\d+$/.test(probeMinRaw.trim()) ? Number(probeMinRaw) : Number.NaN;
 	const drainRaw = env.DRAIN_SEC ?? (file.drainSec !== undefined ? String(file.drainSec) : '0');
 	const drainSec = /^\d+$/.test(drainRaw.trim()) ? Number(drainRaw) : Number.NaN;
+	const intOf = (envValue: string | undefined, fileValue: number | undefined, fallback: string) => {
+		const raw = envValue ?? (fileValue !== undefined ? String(fileValue) : fallback);
+		return /^\d+$/.test(raw.trim()) ? Number(raw) : Number.NaN;
+	};
+	const kind = env.RUNNER_KIND?.trim().toLowerCase() || file.kind || 'server';
+	const handoverSec = intOf(env.HANDOVER_SEC, file.handoverSec, '20');
+	const wipCheckpointMin = intOf(env.WIP_CHECKPOINT_MIN, file.wipCheckpointMin, kind === 'desktop' ? '10' : '0');
+	const powerEnv = envBool(env.POWER_EVENTS);
+	if (powerEnv === 'invalid')
+		throw new ConfigError('Konfiguration ungültig:\n  - POWER_EVENTS: muss true/false (bzw. 1/0) sein');
 	const probeEnv = envBool(env.LIMIT_PROBE);
 	if (probeEnv === 'invalid')
 		throw new ConfigError('Konfiguration ungültig:\n  - LIMIT_PROBE: muss true/false (bzw. 1/0) sein');
@@ -218,6 +249,10 @@ export function loadConfig(o: LoadOptions = {}): RunnerConfig {
 		limitProbe: probeEnv ?? file.limitProbe,
 		limitProbeMin,
 		drainSec,
+		kind,
+		handoverSec,
+		wipCheckpointMin,
+		powerEvents: powerEnv ?? file.powerEvents ?? kind === 'desktop',
 		accounts
 	};
 	const parsed = finalSchema.safeParse(candidate);
@@ -231,6 +266,9 @@ export function loadConfig(o: LoadOptions = {}): RunnerConfig {
 			if (head === 'maxSlots') return '  - MAX_SLOTS: muss eine ganze Zahl zwischen 0 und 64 sein';
 			if (head === 'limitProbeMin') return '  - LIMIT_PROBE_MIN: muss eine ganze Zahl zwischen 1 und 1440 sein';
 			if (head === 'drainSec') return '  - DRAIN_SEC: muss eine ganze Zahl zwischen 0 und 86400 sein';
+			if (head === 'handoverSec') return '  - HANDOVER_SEC: muss eine ganze Zahl zwischen 3 und 300 sein';
+			if (head === 'wipCheckpointMin')
+				return '  - WIP_CHECKPOINT_MIN: muss eine ganze Zahl zwischen 0 und 1440 sein';
 			return `  - ${LABELS[String(head)] ?? String(head)}: ${i.message}`;
 		});
 		throw new ConfigError(`Konfiguration ungültig:\n${lines.join('\n')}`);

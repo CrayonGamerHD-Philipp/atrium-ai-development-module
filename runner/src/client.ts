@@ -14,6 +14,9 @@ import {
 	runnerCommandSchema,
 	runOfferSchema,
 	type AttachmentOffer,
+	type CheckpointInput,
+	type LeasesInput,
+	type LeasesResult,
 	type FinishInput,
 	type HeartbeatInput,
 	type HeartbeatResult,
@@ -26,6 +29,7 @@ import {
 	type RunnerCommand,
 	type UsageInput,
 	heartbeatResult,
+	leasesResult,
 	registerResult
 } from './protocol.ts';
 import { RUNNER_VERSION } from './version.ts';
@@ -307,12 +311,14 @@ export class RunnerApi {
 		const data = await this.client.request('POST', '/runner/register', input, { signal, attempts: 3 });
 		return registerResult.parse(data);
 	}
-	async heartbeat(input: HeartbeatInput): Promise<HeartbeatResult> {
-		// Beide Versuche samt Wartezeit bleiben deutlich unter der Lease (90 s): 2 × 20 s + höchstens 10 s
+	async heartbeat(input: HeartbeatInput, opts: { timeoutMs?: number } = {}): Promise<HeartbeatResult> {
+		// Beide Versuche samt Wartezeit bleiben deutlich unter der Lease (90 s): 2 × 20 s + höchstens 10 s.
+		// Bei der Übergabe (wenige Sekunden) gibt der Aufrufer ein kürzeres Zeitlimit vor.
+		const timeoutMs = opts.timeoutMs ?? HEARTBEAT_TIMEOUT_MS;
 		const data = await this.client.request('POST', '/runner/heartbeat', input, {
 			attempts: 2,
-			timeoutMs: HEARTBEAT_TIMEOUT_MS,
-			maxRetryWaitMs: HEARTBEAT_MAX_RETRY_WAIT_MS
+			timeoutMs,
+			maxRetryWaitMs: Math.min(HEARTBEAT_MAX_RETRY_WAIT_MS, timeoutMs)
 		});
 		return heartbeatResult.parse(data);
 	}
@@ -327,8 +333,21 @@ export class RunnerApi {
 	reject(runId: string, reason: string): Promise<unknown> {
 		return this.client.request('POST', `/runner/runs/${runId}/reject`, { reason: reason.slice(0, 500) }, { attempts: 4 });
 	}
-	events(runId: string, events: RunEvent[]): Promise<unknown> {
-		return this.client.request('POST', `/runner/runs/${runId}/events`, { events }, { attempts: 3 });
+	events(runId: string, events: RunEvent[], fence?: number): Promise<unknown> {
+		const body = fence === undefined ? { events } : { events, fence };
+		return this.client.request('POST', `/runner/runs/${runId}/events`, body, { attempts: 3 });
+	}
+	/** Leases prüfen (Fencing): nach dem Aufwachen und vor jedem Push */
+	async leases(input: LeasesInput, opts: { timeoutMs?: number; attempts?: number } = {}): Promise<LeasesResult> {
+		const data = await this.client.request('POST', '/runner/leases', input, {
+			attempts: opts.attempts ?? 3,
+			timeoutMs: opts.timeoutMs
+		});
+		return leasesResult.parse(data);
+	}
+	/** WIP-Checkpoint melden */
+	checkpoint(runId: string, input: CheckpointInput): Promise<unknown> {
+		return this.client.request('POST', `/runner/runs/${runId}/checkpoint`, input, { attempts: 3 });
 	}
 	usage(runId: string, usage: UsageInput): Promise<unknown> {
 		return this.client.request('POST', `/runner/runs/${runId}/usage`, usage, { attempts: 6 });
@@ -336,8 +355,12 @@ export class RunnerApi {
 	limit(runId: string, limit: LimitInput): Promise<unknown> {
 		return this.client.request('POST', `/runner/runs/${runId}/limit`, limit, { attempts: 6 });
 	}
-	finish(runId: string, input: FinishInput): Promise<unknown> {
-		return this.client.request('POST', `/runner/runs/${runId}/finish`, input, { attempts: 12 });
+	/** Abschluss; `opts` verkürzt Versuche/Zeitlimit (Übergabe vor dem Standby: nur wenige Sekunden) */
+	finish(runId: string, input: FinishInput, opts: { attempts?: number; timeoutMs?: number } = {}): Promise<unknown> {
+		return this.client.request('POST', `/runner/runs/${runId}/finish`, input, {
+			attempts: opts.attempts ?? 12,
+			timeoutMs: opts.timeoutMs
+		});
 	}
 	/**
 	 * Bytes eines Anhangs dieses Laufs (`GET /runner/runs/:id/attachments/:attachmentId`, binär). Höchstens die im
@@ -551,6 +574,8 @@ export interface BatcherOptions {
 	log?: Logger;
 	flushMs?: number;
 	retryBaseMs?: number;
+	/** Fencing-Token des Laufs (`offer.fence`), wird mitgesendet */
+	fence?: number;
 }
 
 /**
@@ -618,7 +643,7 @@ export class EventBatcher {
 						bytes += item.bytes;
 					}
 					try {
-						await this.o.api.events(this.o.runId, batch);
+						await this.o.api.events(this.o.runId, batch, this.o.fence);
 						this.failures = 0;
 					} catch (e) {
 						if (e instanceof ApiError && e.permanent) {

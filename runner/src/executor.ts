@@ -34,6 +34,7 @@ import {
 	type PullContext
 } from './git/delivery.ts';
 import { assertRefName, GitError } from './git/git.ts';
+import { deleteWip, fetchWip, pushWip, restoreWip, snapshotWip, wipUsable } from './git/wip.ts';
 import type { Workspace } from './git/workspace.ts';
 import type { Logger } from './log.ts';
 import { silentLogger } from './log.ts';
@@ -41,7 +42,7 @@ import { extractPlan } from './plan.ts';
 import type { AdapterRegistry } from './providers/index.ts';
 import { LimitStore, limitHitWindow } from './providers/limit-snapshot.ts';
 import type { AgentLimit, AgentResult, AgentUsage } from './providers/types.ts';
-import type { FinishInput, RunEventKind, RunOffer } from './protocol.ts';
+import type { FinishInput, HandoffReason, RunEventKind, RunOffer } from './protocol.ts';
 import type { Redactor } from './redact.ts';
 import { errorMessage } from './util/async.ts';
 import { exec } from './util/proc.ts';
@@ -60,7 +61,11 @@ export class RunError extends Error {
 	}
 }
 
-type AbortReason = 'cancel' | 'timeout' | 'shutdown' | 'limit';
+/**
+ * `handover`: Übergabe vor Standby/Herunterfahren (Zwischenstand sichern, als übergeben melden),
+ * `revoked`: Lease verloren (z. B. nach dem Aufwachen) – nichts mehr pushen und nichts mehr melden
+ */
+type AbortReason = 'cancel' | 'timeout' | 'shutdown' | 'limit' | 'handover' | 'revoked';
 
 interface ActiveRun {
 	offer: RunOffer;
@@ -68,6 +73,23 @@ interface ActiveRun {
 	reason: AbortReason | null;
 	cancelMessage: string;
 	done: Promise<void>;
+	/** Übergabe: Anlass und Frist (ms seit Epoch) */
+	handover?: { reason: HandoffReason; deadline: number };
+}
+
+/** Lease des Laufs verloren (Fencing): nichts pushen, nichts mehr melden */
+export class LeaseLostError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = 'LeaseLostError';
+	}
+}
+
+/** Fähigkeiten von Atrium aus der Anmeldung (`registerResult.features`) */
+export interface AtriumFeatures {
+	handoff?: boolean;
+	fencing?: boolean;
+	checkpoints?: boolean;
 }
 
 export interface AccountState {
@@ -90,6 +112,8 @@ export interface ExecutorOptions {
 	limits?: LimitStore;
 	/** Gnadenfrist für Batcher in Tests */
 	batcherFlushMs?: number;
+	/** Fähigkeiten von Atrium (Standard: keine Erweiterung bekannt) */
+	features?: () => AtriumFeatures;
 }
 
 const NO_CHANGES = 'Keine Änderungen – der Agent hat nichts geändert, daher kein Commit und kein PR.';
@@ -99,6 +123,8 @@ export class Executor {
 	/** Kürzlich bearbeitete Läufe (doppelte Angebote über `/pending` ignorieren) */
 	private readonly seen = new Map<string, number>();
 	private stopping = false;
+	/** Übergabe läuft bzw. pausiert: keine neuen Läufe */
+	private pausedFor: HandoffReason | null = null;
 	private readonly log: Logger;
 	/** Zuletzt beobachteter Limit-Stand je Konto und Fenster */
 	readonly limits: LimitStore;
@@ -138,6 +164,7 @@ export class Executor {
 		};
 
 		if (this.stopping) return reject('Runner wird beendet');
+		if (this.pausedFor) return reject('Runner übergibt bzw. ist pausiert');
 		if (this.running.size >= this.o.config.maxSlots) return reject('Keine freien Slots');
 		const acct = this.o.accounts().get(offer.account.key);
 		if (!acct || acct.config.provider !== offer.account.provider)
@@ -184,6 +211,77 @@ export class Executor {
 		}
 		run.ctrl.abort();
 		return true;
+	}
+
+	/**
+	 * Übergabe aller laufenden Läufe (Standby, Herunterfahren, „jetzt übergeben“): Agents stoppen, Zwischenstand
+	 * als WIP-Commit auf `refs/aidev/wip/<runId>` pushen (sofern Atrium Übergaben kennt und die Zeit reicht) und
+	 * als übergeben melden. Wartet höchstens bis `deadline`; liefert die Zahl der übergebenen Läufe. Danach nimmt der
+	 * Executor bis `resume()` nichts Neues an.
+	 */
+	async handover(reason: HandoffReason, deadline: number): Promise<number> {
+		this.pausedFor = reason;
+		const runs = [...this.running.values()];
+		for (const run of runs) {
+			if (run.reason) continue;
+			run.reason = 'handover';
+			run.cancelMessage = 'Übergabe an einen anderen Runner';
+			run.handover = { reason, deadline };
+			run.ctrl.abort();
+		}
+		const all = Promise.all(runs.map((r) => r.done));
+		await Promise.race([all, new Promise((r) => setTimeout(r, Math.max(0, deadline - Date.now())).unref())]);
+		return runs.length;
+	}
+
+	/** Nach Übergabe bzw. Aufwachen wieder Angebote annehmen */
+	resume(): void {
+		this.pausedFor = null;
+	}
+
+	/** Übergabe läuft bzw. Runner pausiert (keine neuen Läufe) */
+	get handoverReason(): HandoffReason | null {
+		return this.pausedFor;
+	}
+
+	/**
+	 * Lauf verwerfen, dessen Lease nicht mehr gilt (Fencing, z. B. nach dem Aufwachen): Agent stoppen, nichts
+	 * pushen, nichts melden. Der Worktree bleibt und wird später aufgeräumt.
+	 */
+	revoke(runId: string, message: string): boolean {
+		const run = this.running.get(runId);
+		if (!run) return false;
+		run.reason = 'revoked';
+		run.cancelMessage = message;
+		run.ctrl.abort();
+		return true;
+	}
+
+	/** Laufende Läufe mit Fencing-Token (Lease-Prüfung) */
+	leaseRuns(): { runId: string; fence?: number }[] {
+		return [...this.running.values()].map((r) =>
+			r.offer.fence === undefined ? { runId: r.offer.runId } : { runId: r.offer.runId, fence: r.offer.fence }
+		);
+	}
+
+	/**
+	 * Lease eines Laufs vor einem Push prüfen (nur wenn Atrium Fencing kennt). Ungültig → `LeaseLostError`.
+	 * Ist Atrium nicht erreichbar, wird ebenfalls nicht gepusht (der Lauf gilt dann als abgebrochen).
+	 */
+	async assertLease(offer: RunOffer): Promise<void> {
+		if (!this.o.features?.().fencing) return;
+		let res;
+		try {
+			res = await this.o.api.leases({ runs: [offer.fence === undefined ? { runId: offer.runId } : { runId: offer.runId, fence: offer.fence }] });
+		} catch (e) {
+			throw new RunError('cancelled', `Lease konnte nicht geprüft werden – nichts gepusht (${errorMessage(e)})`);
+		}
+		if (!res.valid.includes(offer.runId)) {
+			const why = res.revoked.find((r) => r.runId === offer.runId)?.reason ?? 'Lease ungültig';
+			const run = this.running.get(offer.runId);
+			if (run) run.reason = 'revoked';
+			throw new LeaseLostError(`${why} – nichts gepusht`);
+		}
 	}
 
 	/** Wird der Runner beendet (keine neuen Läufe)? */
@@ -242,7 +340,8 @@ export class Executor {
 			api,
 			redactor,
 			log,
-			flushMs: this.o.batcherFlushMs
+			flushMs: this.o.batcherFlushMs,
+			fence: offer.fence
 		});
 		const emit = (kind: RunEventKind, payload: Record<string, unknown>) => batcher.push(kind, payload);
 		const repo = { repoOwner: offer.project.repoOwner, repoName: offer.project.repoName };
@@ -267,6 +366,7 @@ export class Executor {
 			errorMessage: null,
 			conflictFiles: []
 		};
+		if (offer.fence !== undefined) finish.fence = offer.fence;
 
 		const timeoutMs = Math.max(1, offer.timeoutSec) * 1000;
 		const timer = setTimeout(() => {
@@ -302,6 +402,7 @@ export class Executor {
 
 		let wtDir: string | null = null;
 		let pull: PullContext | null = null;
+		let stopCheckpoints = () => undefined as void;
 		try {
 			emit('status', { text: 'Repository wird vorbereitet' });
 			// 0. Bestehender PR (pr-update): prüfen, bevor etwas geändert wird; Kontext für den Agent.
@@ -314,6 +415,7 @@ export class Executor {
 			const prepared = await this.prepareWorktree(offer, emit);
 			wtDir = prepared.dir;
 			checkAbort();
+			stopCheckpoints = this.startCheckpoints(run, wtDir, emit);
 
 			const baseEnv = accountEnv(acct, process.env, {
 				GIT_AUTHOR_NAME: this.o.config.gitAuthorName,
@@ -442,7 +544,10 @@ export class Executor {
 			};
 			await runTests('Tests laufen (testCmd)', 'Tests fehlgeschlagen');
 
-			// Auslieferung
+			// Auslieferung – nur mit gültiger Lease (Fencing: ein aufgewachter PC pusht nie einen übernommenen Lauf)
+			stopCheckpoints();
+			await this.assertLease(offer);
+			checkAbort();
 			let commitBase = prepared.startSha;
 			const d = offer.delivery;
 			const gitEmit = (k: RunEventKind, p: Record<string, unknown>) => emit(k, p);
@@ -519,6 +624,8 @@ export class Executor {
 			finish.headSha = await headSha(ws, wtDir);
 			finish.commits = await commitInfos(ws, wtDir, commitBase);
 			finish.status = 'succeeded';
+			// fortgesetzten Zwischenstand aufräumen (best effort; der eigene Ref wird nicht mehr gebraucht)
+			if (prepared.resumedWip) await deleteWip(ws, repo, wtDir, prepared.resumedWip).catch(() => false);
 		} catch (e) {
 			const err = toRunError(e, run);
 			finish.status = err.kind === 'cancelled' ? 'cancelled' : 'failed';
@@ -528,37 +635,164 @@ export class Executor {
 			if (err.kind === 'internal') log.error('Interner Fehler', e instanceof Error ? (e.stack ?? e.message) : e);
 			emit('error', { text: finish.errorMessage });
 			if (wtDir && !finish.headSha) finish.headSha = await headSha(ws, wtDir).catch(() => null);
+			if (run.reason === 'handover' && run.handover) {
+				finish.status = 'cancelled';
+				finish.errorKind = 'cancelled';
+				finish.handoff = await this.saveHandover(run, wtDir, emit);
+				finish.errorMessage = finish.handoff.wipPushed
+					? 'Übergabe: Zwischenstand gesichert'
+					: 'Übergabe ohne gesicherten Zwischenstand';
+			}
 		} finally {
 			clearTimeout(timer);
+			stopCheckpoints();
 			await rm(tmpDir, { recursive: true, force: true }).catch(() => undefined);
 			finish.sessionId = sessionId ? sessionId.slice(0, 200) : null;
 			if (finish.summary) finish.summary = redactor.redact(finish.summary).slice(0, 40_000);
 			if (finish.headSha && !/^[0-9a-f]{7,40}$/.test(finish.headSha)) finish.headSha = null;
 			if (finish.pr && !/^https?:\/\//.test(finish.pr.url)) finish.pr = null;
 			finish.commits = finish.commits.slice(-200);
-			emit('status', { text: statusText(finish) });
-			await batcher.close();
-			if (usage) {
-				try {
-					await api.usage(offer.runId, {
-						model: (usage.model || offer.model || '').slice(0, 120),
-						inputTokens: usage.inputTokens,
-						outputTokens: usage.outputTokens,
-						cacheReadTokens: usage.cacheReadTokens,
-						cacheWriteTokens: usage.cacheWriteTokens,
-						costUsd: usage.costUsd
-					});
-				} catch (e) {
-					log.warn('Verbrauchsmeldung fehlgeschlagen', errorMessage(e));
-				}
-			}
-			try {
-				await api.finish(offer.runId, finish);
-				log.info(`Lauf beendet: ${finish.status}${finish.errorKind ? ` (${finish.errorKind})` : ''}`);
-			} catch (e) {
-				log.error('Abschlussmeldung fehlgeschlagen', errorMessage(e));
+			if (run.reason === 'revoked') {
+				// Lease verloren: Atrium lehnt Meldungen ohnehin ab (409) – nichts mehr senden, Worktree bleibt
+				log.warn(`Lauf verworfen: ${run.cancelMessage || 'Lease verloren'}`);
+				await batcher.close();
+			} else {
+				await this.report(run, finish, usage, batcher, log);
 			}
 		}
+	}
+
+	/** Abschluss melden: Status-Ereignis, Ereignisse leeren, Verbrauch, `finish` */
+	private async report(
+		run: ActiveRun,
+		finish: FinishInput,
+		usage: AgentUsage | null,
+		batcher: EventBatcher,
+		log: Logger
+	): Promise<void> {
+		const { offer } = run;
+		const api = this.o.api;
+		batcher.push('status', { text: statusText(finish) });
+		await batcher.close();
+		// Übergabe: Abschluss zuerst (kurze Frist), Verbrauch danach, falls noch Zeit bleibt
+		if (run.handover) await this.sendFinish(run, finish, log);
+		if (usage) {
+			try {
+				await api.usage(offer.runId, {
+					model: (usage.model || offer.model || '').slice(0, 120),
+					inputTokens: usage.inputTokens,
+					outputTokens: usage.outputTokens,
+					cacheReadTokens: usage.cacheReadTokens,
+					cacheWriteTokens: usage.cacheWriteTokens,
+					costUsd: usage.costUsd
+				});
+			} catch (e) {
+				log.warn('Verbrauchsmeldung fehlgeschlagen', errorMessage(e));
+			}
+		}
+		if (!run.handover) await this.sendFinish(run, finish, log);
+	}
+
+	private async sendFinish(run: ActiveRun, finish: FinishInput, log: Logger): Promise<void> {
+		try {
+			// Übergabe: kurze Frist (das Betriebssystem wartet nur wenige Sekunden)
+			const left = run.handover ? Math.max(1000, run.handover.deadline - Date.now()) : undefined;
+			await this.o.api.finish(run.offer.runId, finish, left ? { attempts: 2, timeoutMs: left } : {});
+			log.info(`Lauf beendet: ${finish.status}${finish.errorKind ? ` (${finish.errorKind})` : ''}`);
+		} catch (e) {
+			log.error('Abschlussmeldung fehlgeschlagen', errorMessage(e));
+		}
+	}
+
+	/**
+	 * Übergabe: Zwischenstand des Worktrees als WIP-Commit auf `refs/aidev/wip/<runId>` pushen, solange die Frist
+	 * reicht (nur schreibende Läufe und nur, wenn Atrium Übergaben kennt). Fehlschläge sind kein Fehler des Laufs –
+	 * der Nachfolger startet dann vom letzten gepushten Stand.
+	 */
+	private async saveHandover(
+		run: ActiveRun,
+		dir: string | null,
+		emit: (k: RunEventKind, p: Record<string, unknown>) => void
+	): Promise<NonNullable<FinishInput['handoff']>> {
+		const { offer } = run;
+		const reason = run.handover!.reason;
+		const out: NonNullable<FinishInput['handoff']> = { reason, wipPushed: false, headSha: null, wipRef: null, note: null };
+		if (!dir || offer.readOnly || offer.question || !this.o.features?.().handoff) return out;
+		// etwas Zeit für die Abschlussmeldung lassen
+		const budget = run.handover!.deadline - Date.now() - 1500;
+		if (budget < 1000) {
+			out.note = 'Keine Zeit für einen Zwischenstand';
+			return out;
+		}
+		const ws = this.o.workspace;
+		const repo = { repoOwner: offer.project.repoOwner, repoName: offer.project.repoName };
+		const ctrl = new AbortController();
+		const timer = setTimeout(() => ctrl.abort(), budget);
+		timer.unref();
+		try {
+			const exclude = offer.attachments?.length ? [ATTACHMENTS_DIR] : [];
+			const snap = await snapshotWip(ws, dir, { runId: offer.runId, taskId: offer.taskId, reason, exclude, signal: ctrl.signal });
+			await pushWip(ws, repo, dir, snap, { timeoutMs: Math.max(1000, budget), signal: ctrl.signal });
+			out.wipPushed = true;
+			out.headSha = snap.sha;
+			out.wipRef = snap.ref;
+			emit('git', { action: 'wip', detail: `Zwischenstand gesichert (${snap.ref}, ${snap.sha.slice(0, 10)})` });
+		} catch (e) {
+			out.note = `Zwischenstand nicht gesichert: ${errorMessage(e)}`.slice(0, 4000);
+			emit('error', { text: out.note });
+		} finally {
+			clearTimeout(timer);
+		}
+		return out;
+	}
+
+	/**
+	 * Regelmäßige WIP-Checkpoints während eines laufenden Laufs (`wipCheckpointMin`, nur schreibende Läufe und nur,
+	 * wenn Atrium Checkpoints kennt): Bei einem harten Ausfall setzt ein anderer Runner am letzten Checkpoint fort.
+	 * Vor jedem Push wird die Lease geprüft. Liefert eine Funktion zum Beenden.
+	 */
+	private startCheckpoints(
+		run: ActiveRun,
+		dir: string,
+		emit: (k: RunEventKind, p: Record<string, unknown>) => void
+	): () => void {
+		const min = this.o.config.wipCheckpointMin ?? 0;
+		const { offer } = run;
+		if (!(min > 0) || offer.readOnly || offer.question || !this.o.features?.().checkpoints) return () => undefined;
+		const ws = this.o.workspace;
+		const repo = { repoOwner: offer.project.repoOwner, repoName: offer.project.repoName };
+		let last = '';
+		let busy = false;
+		const tick = async () => {
+			if (busy || run.reason) return;
+			busy = true;
+			try {
+				const exclude = offer.attachments?.length ? [ATTACHMENTS_DIR] : [];
+				const snap = await snapshotWip(ws, dir, { runId: offer.runId, taskId: offer.taskId, reason: 'checkpoint', exclude });
+				const tree = (await ws.run(dir, ['rev-parse', `${snap.sha}^{tree}`])).stdout.trim() + snap.parent;
+				if (tree === last || run.reason) return;
+				await this.assertLease(offer);
+				await pushWip(ws, repo, dir, snap);
+				await this.o.api.checkpoint(offer.runId, {
+					ref: snap.ref,
+					sha: snap.sha,
+					...(offer.fence === undefined ? {} : { fence: offer.fence })
+				});
+				last = tree;
+				emit('git', { action: 'wip', detail: `Checkpoint gesichert (${snap.sha.slice(0, 10)})` });
+			} catch (e) {
+				if (e instanceof LeaseLostError) {
+					this.revoke(offer.runId, e.message);
+					return;
+				}
+				this.log.warn(`Checkpoint für ${offer.runId} fehlgeschlagen`, errorMessage(e));
+			} finally {
+				busy = false;
+			}
+		};
+		const timer = setInterval(() => void tick(), min * 60_000);
+		timer.unref();
+		return () => clearInterval(timer);
 	}
 
 	/**
@@ -596,7 +830,7 @@ export class Executor {
 	private async prepareWorktree(
 		offer: RunOffer,
 		emit: (k: RunEventKind, p: Record<string, unknown>) => void
-	): Promise<{ dir: string; startSha: string; remoteSha: string | null }> {
+	): Promise<{ dir: string; startSha: string; remoteSha: string | null; resumedWip: string | null }> {
 		const ws = this.o.workspace;
 		const repo = { repoOwner: offer.project.repoOwner, repoName: offer.project.repoName };
 		try {
@@ -633,8 +867,24 @@ export class Executor {
 				}
 				// Der Haupt-Branch bleibt der Arbeitskopie vorbehalten → dann ohne lokalen Branch
 				const branch = offer.question || offer.branch === offer.project.defaultBranch ? null : offer.branch;
+				// Zwischenstand eines übergebenen/verlorenen Vorläufers (WIP-Ref) fortsetzen, falls noch aktuell
+				const wip = offer.resumeWip && !offer.readOnly && !offer.question && branch ? offer.resumeWip : null;
+				if (wip) {
+					const fetched = await fetchWip(ws, repo, cache, wip.ref);
+					const usable = await wipUsable(ws, cache, { fetched, expected: wip.sha, remoteSha });
+					if (usable.ok) {
+						await ws.addWorktree(cache, dir, wip.sha, branch);
+						await restoreWip(ws, dir, usable.parent);
+						emit('git', {
+							action: 'worktree',
+							detail: `Zwischenstand von ${wip.fromRunner || 'einem anderen Runner'} übernommen (${wip.sha.slice(0, 10)})`
+						});
+						return { dir, startSha: start, remoteSha, resumedWip: wip.ref };
+					}
+					emit('system', { text: `Zwischenstand nicht übernommen: ${usable.reason} – Start ohne ihn` });
+				}
 				await ws.addWorktree(cache, dir, start, branch);
-				return { dir, startSha: start, remoteSha };
+				return { dir, startSha: start, remoteSha, resumedWip: null };
 			});
 		} catch (e) {
 			if (e instanceof GitError) throw new RunError('git', e.message);
@@ -725,7 +975,8 @@ function toRunError(e: unknown, run: ActiveRun): RunError {
 			return new RunError('timeout', `Zeitlimit von ${run.offer.timeoutSec} s überschritten`);
 		return e;
 	}
-	if (run.reason === 'cancel' || run.reason === 'shutdown')
+	if (e instanceof LeaseLostError) return new RunError('cancelled', e.message);
+	if (run.reason === 'cancel' || run.reason === 'shutdown' || run.reason === 'handover' || run.reason === 'revoked')
 		return new RunError('cancelled', run.cancelMessage || 'Abgebrochen');
 	if (run.reason === 'timeout') return new RunError('timeout', `Zeitlimit von ${run.offer.timeoutSec} s überschritten`);
 	if (e instanceof DeliveryError) return new RunError(e.kind, e.message, e.conflictFiles);

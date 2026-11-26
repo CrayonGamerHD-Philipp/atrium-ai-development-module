@@ -1,7 +1,7 @@
 /**
  * Deterministischer Agent für Tests und Vorführungen (kein externer Prozess). Szenarien über Marker im Auftrag:
  * `[fake:fail]` (Fehler), `[fake:limit]` (5-Stunden-Limit), `[fake:plan]` (gültiger Plan als ```json-Block),
- * `[fake:slow]` (läuft bis zum Abbruch bzw. höchstens 60 s), `[fake:commit]` (Agent committet selbst).
+ * `[fake:slow]` (läuft bis zum Abbruch bzw. höchstens 60 s), `[fake:write-slow]` (schreibt `AIDEV_WIP.md`, läuft dann wie `slow`), `[fake:commit]` (Agent committet selbst).
  * `[fake:stage-ignored]` (Agent merkt ignorierte Dateien mit `git add -f .` vor, ohne zu committen).
  * Meldet außerdem einen Limit-Stand (`limits`, 5-Stunden-Fenster).
  * Schreibt `AIDEV_FAKE.md` mit einem Auszug des Auftrags (nicht bei `readOnly`).
@@ -47,6 +47,12 @@ export const fakeAdapter: ProviderAdapter = {
 				queue.push({ kind: 'system', payload: { text: 'Fake-Agent gestartet', model: o.model ?? 'fake' } });
 				queue.push({ kind: 'thinking', payload: { text: 'Ich lese den Auftrag.' } });
 				await sleep(5, ctrl.signal);
+				if (p.includes('[fake:write-slow]') && !o.readOnly) {
+					// Zwischenstand schreiben, dann bis zum Abbruch weiterarbeiten (Übergabe/Checkpoints testen)
+					await writeFile(path.join(o.cwd, 'AIDEV_WIP.md'), '# Zwischenstand\n', 'utf8');
+					const until = Date.now() + 60_000;
+					while (!ctrl.signal.aborted && Date.now() < until) await sleep(50, ctrl.signal);
+				}
 				if (p.includes('[fake:slow]')) {
 					const until = Date.now() + 60_000;
 					while (!ctrl.signal.aborted && Date.now() < until) await sleep(50, ctrl.signal);

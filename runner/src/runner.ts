@@ -2,11 +2,12 @@
  * Der Runner als Ganzes: Konten prüfen, bei Atrium anmelden, Heartbeat, SSE-Befehlsstrom, Befehle verteilen
  * (Angebote → Executor, RPC, Terminals), Aufräumen, geordnetes Beenden.
  */
-import { mkdir } from 'node:fs/promises';
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
+import path from 'node:path';
 import { accountEnv, publicEnv, type RunnerConfig } from './config.ts';
 import { ApiError, AtriumClient, RunnerApi, runCommandStream, type FetchFn } from './client.ts';
-import { Executor, type AccountState } from './executor.ts';
+import { Executor, type AccountState, type AtriumFeatures } from './executor.ts';
 import { LimitProber, type ProbeFetch } from './limit-probe.ts';
 import { Workspace } from './git/workspace.ts';
 import type { Logger } from './log.ts';
@@ -15,11 +16,13 @@ import { defaultAdapters, type AdapterRegistry } from './providers/index.ts';
 import { LimitStore } from './providers/limit-snapshot.ts';
 import {
 	PROTOCOL_VERSION,
+	type HandoffReason,
 	type HeartbeatInput,
 	type LimitSnapshot,
 	type RegisterInput,
 	type RunnerCommand
 } from './protocol.ts';
+import { defaultPowerMonitor, type PowerEvent, type PowerMonitor } from './power/index.ts';
 import { PtyManager } from './pty.ts';
 import { Redactor } from './redact.ts';
 import { handleRpc } from './rpc.ts';
@@ -40,6 +43,40 @@ export interface RunnerOptions {
 	reprobeMs?: number;
 	cleanupMs?: number;
 	backoffBaseMs?: number;
+	/**
+	 * Energieüberwachung (Standby/Herunterfahren). Standard: bei `powerEvents` die der Plattform plus
+	 * Zeitsprung-Erkennung, sonst keine; `null` = aus (Tests: `FakePowerMonitor`).
+	 */
+	powerMonitor?: PowerMonitor | null;
+	/** Abfrage der Steuerdateien (`handover`, `pause`, `stop`) in ms (Standard 2000) */
+	controlPollMs?: number;
+	/** Steuerdatei `stop` (geordnetes Beenden, z. B. `atrium-runner stop` unter Windows) */
+	onStopRequest?: () => void;
+}
+
+/** Steuerdateien im Arbeitsverzeichnis (Befehle `handover`, `pause`, `resume` des laufenden Runners) */
+export function controlDir(workDir: string): string {
+	return path.join(workDir, 'control');
+}
+/** Zustandsdatei für `status` */
+export function stateFile(workDir: string): string {
+	return path.join(workDir, 'state.json');
+}
+
+/** Inhalt der Zustandsdatei (`atrium-runner status`) */
+export interface RunnerStateFile {
+	pid: number;
+	name: string;
+	version: string;
+	kind: 'server' | 'desktop';
+	status: string;
+	runnerId: string | null;
+	paused: HandoffReason | null;
+	runs: string[];
+	lastHeartbeatAt: string | null;
+	startedAt: string;
+	power: string;
+	updatedAt: string;
 }
 
 /** Konten prüfen (CLI vorhanden, angemeldet) */
@@ -94,7 +131,19 @@ export class Runner {
 	private heartbeatSec = 15;
 	private stream: ReturnType<typeof runCommandStream> | null = null;
 	private timers: NodeJS.Timeout[] = [];
-	private capabilities = { question: true, branchDelivery: true, prUpdate: true, limitReport: true, attachments: true, branchCleanup: false, git: false, gh: false, pty: false, os: `${process.platform}-${process.arch}` };
+	private capabilities = { question: true, branchDelivery: true, prUpdate: true, limitReport: true, attachments: true, handoff: true, fencing: true, wip: true, branchCleanup: false, git: false, gh: false, pty: false, os: `${process.platform}-${process.arch}` };
+	/** Fähigkeiten von Atrium aus der letzten Anmeldung */
+	private features: AtriumFeatures = {};
+	private runnerId: string | null = null;
+	private lastHeartbeatAt: string | null = null;
+	private readonly startedAt = new Date().toISOString();
+	private power: PowerMonitor | null = null;
+	private powerName = 'aus';
+	/** Laufende Übergabe (mehrfache Auslöser warten auf dieselbe) */
+	private handoverRun: Promise<number> | null = null;
+	/** Manuell pausiert (Steuerdatei `pause`) */
+	private paused = false;
+	private shutdownResumeTimer: NodeJS.Timeout | null = null;
 	private needsRegister = false;
 	/** Beenden mit Frist läuft: keine neuen Angebote (`heartbeat.draining`) */
 	private draining = false;
@@ -126,7 +175,8 @@ export class Runner {
 			redactor: o.redactor,
 			accounts: () => this.accounts,
 			limits: this.limits,
-			log: this.log.child('run')
+			log: this.log.child('run'),
+			features: () => this.features
 		});
 		this.limitProber = new LimitProber({
 			config: o.config,
@@ -148,6 +198,7 @@ export class Runner {
 			name: this.o.config.name,
 			version: RUNNER_VERSION,
 			maxSlots: this.o.config.maxSlots,
+			kind: this.kind,
 			capabilities: this.capabilities,
 			accounts: this.o.config.accounts.map((a) => {
 				const s = this.accounts.get(a.key);
@@ -170,7 +221,13 @@ export class Runner {
 			try {
 				const r = await this.api.register(this.registerInput(), this.stop.signal);
 				this.status = r.status;
-				this.heartbeatSec = Math.min(300, Math.max(5, r.heartbeatSec || 15));
+				this.runnerId = r.runnerId;
+				this.features = r.features ?? {};
+				// Heartbeat deutlich unter der Lease halten (PC-Runner: kürzere Lease)
+				const lease = r.leaseSec ?? 90;
+				this.heartbeatSec = Math.min(300, Math.max(5, Math.min(r.heartbeatSec || 15, Math.floor(lease / 4))));
+				if (r.kind && r.kind !== this.kind)
+					this.log.info(`Atrium führt diesen Runner als ${r.kind === 'desktop' ? 'PC-Runner' : 'Server-Runner'}`);
 				this.log.info(`Bei Atrium angemeldet (Runner ${r.runnerId}, Status ${r.status})`);
 				if (r.status === 'pending')
 					this.log.info('Runner wartet auf Freigabe in Atrium (Administration → Runner & Konten)');
@@ -203,14 +260,20 @@ export class Runner {
 		}
 	}
 
-	private async sendHeartbeat(): Promise<void> {
+	private async sendHeartbeat(opts: { timeoutMs?: number } = {}): Promise<void> {
 		try {
-			const r = await this.api.heartbeat({
-				slotsUsed: this.executor.slotsUsed,
-				runIds: this.executor.runIds(),
-				...(this.draining ? { draining: true } : {}),
-				accounts: this.heartbeatAccounts()
-			});
+			const handover = this.executor.handoverReason;
+			const r = await this.api.heartbeat(
+				{
+					slotsUsed: this.executor.slotsUsed,
+					runIds: this.executor.runIds(),
+					...(this.draining ? { draining: true } : {}),
+					...(handover ? { handover } : {}),
+					accounts: this.heartbeatAccounts()
+				},
+				opts
+			);
+			this.lastHeartbeatAt = new Date().toISOString();
 			if (r.status !== this.status) this.log.info(`Status in Atrium: ${r.status}`);
 			this.status = r.status;
 			for (const id of r.cancel) {
@@ -221,7 +284,170 @@ export class Runner {
 			this.sentLimits.clear();
 			if (e instanceof ApiError && (e.status === 404 || e.status === 409)) this.needsRegister = true;
 			this.log.warn('Heartbeat fehlgeschlagen', errorMessage(e));
+		} finally {
+			void this.writeState();
 		}
+	}
+
+	get kind(): 'server' | 'desktop' {
+		return this.o.config.kind ?? 'server';
+	}
+
+	/**
+	 * Geordnete Übergabe (Standby, Herunterfahren, „jetzt an Server übergeben“): 1. Atrium per Heartbeat mit
+	 * `handover` informieren (keine neuen Angebote), 2. Agents stoppen, 3. Zwischenstände als WIP-Ref pushen,
+	 * 4. Läufe als übergeben melden – alles innerhalb von `handoverSec` bzw. der Frist des Betriebssystems.
+	 * Liefert die Zahl der übergebenen Läufe.
+	 */
+	handover(reason: HandoffReason, graceMs: number | null = null): Promise<number> {
+		if (this.handoverRun) return this.handoverRun;
+		const budget = Math.min((this.o.config.handoverSec ?? 20) * 1000, graceMs ?? Number.POSITIVE_INFINITY);
+		const deadline = Date.now() + Math.max(1000, budget);
+		const started = Date.now();
+		this.handoverRun = (async () => {
+			const runs = this.executor.slotsUsed;
+			this.log.info(`Übergabe (${reason}) – ${runs} laufende Läufe, Frist ${Math.round((deadline - started) / 1000)} s`);
+			this.pty.closeAll();
+			// erst melden (kurz), dann stoppen; der Executor nimmt ab jetzt nichts mehr an
+			const hb = this.executor.handover(reason, deadline);
+			await Promise.race([this.sendHeartbeat({ timeoutMs: Math.min(2000, Math.max(500, deadline - Date.now())) }), sleep(2000)]);
+			const n = await hb;
+			this.log.info(`Übergabe abgeschlossen (${n} Läufe, ${Date.now() - started} ms)`);
+			return n;
+		})().finally(() => {
+			this.handoverRun = null;
+		});
+		return this.handoverRun;
+	}
+
+	/**
+	 * Nach dem Aufwachen (bzw. Ende einer Pause): zuerst die Leases prüfen – Läufe, die Atrium inzwischen einem
+	 * anderen Runner gegeben hat, werden verworfen (kein Push, keine Meldung, Worktree wird später aufgeräumt) –,
+	 * dann neu anmelden und den Befehlsstrom neu verbinden. Danach nimmt der Runner wieder neue Aufträge an.
+	 */
+	async wake(source = 'resume'): Promise<void> {
+		this.log.info(`Aufgewacht (${source}) – Leases werden geprüft`);
+		const runs = this.executor.leaseRuns();
+		if (runs.length && this.features.fencing) {
+			try {
+				const res = await this.api.leases({ runs });
+				for (const r of res.revoked) {
+					if (this.executor.revoke(r.runId, `Lease verloren: ${r.reason}`))
+						this.log.warn(`Lauf ${r.runId} wurde übernommen und wird verworfen (${r.reason})`);
+				}
+			} catch (e) {
+				// ohne Prüfung pusht der Executor ohnehin nicht (`assertLease` vor jedem Push)
+				this.log.warn('Lease-Prüfung nach dem Aufwachen fehlgeschlagen', errorMessage(e));
+			}
+		}
+		if (!this.paused) this.executor.resume();
+		if (this.shutdownResumeTimer) clearTimeout(this.shutdownResumeTimer);
+		this.needsRegister = false;
+		if (await this.registerOnce()) this.stream?.reconnect();
+		await this.sendHeartbeat();
+	}
+
+	private async registerOnce(): Promise<boolean> {
+		try {
+			const r = await this.api.register(this.registerInput(), this.stop.signal);
+			this.status = r.status;
+			this.runnerId = r.runnerId;
+			this.features = r.features ?? {};
+			return true;
+		} catch (e) {
+			this.needsRegister = true;
+			this.log.warn('Neuanmeldung fehlgeschlagen', errorMessage(e));
+			return false;
+		}
+	}
+
+	/** Energie-Ereignis des Betriebssystems */
+	async onPower(e: PowerEvent): Promise<void> {
+		if (e.type === 'resume') {
+			await this.wake(e.sleptMs ? `${e.source}, ~${Math.round(e.sleptMs / 1000)} s` : e.source);
+			return;
+		}
+		const grace = this.power?.graceMs ?? null;
+		await this.handover(e.type === 'suspend' ? 'suspend' : 'shutdown', grace);
+		if (e.type === 'shutdown') {
+			// Herunterfahren abgebrochen (z. B. vom Nutzer)? Dann nach 2 min wieder Aufträge annehmen
+			if (this.shutdownResumeTimer) clearTimeout(this.shutdownResumeTimer);
+			this.shutdownResumeTimer = setTimeout(() => void this.wake('Herunterfahren abgebrochen'), 120_000);
+			this.shutdownResumeTimer.unref();
+		}
+	}
+
+	/** Steuerdateien auswerten: `stop`/`handover` (einmalig), `pause` (solange vorhanden) */
+	async pollControl(): Promise<void> {
+		const dir = controlDir(this.o.config.workDir);
+		const exists = async (name: string) => {
+			try {
+				await readFile(path.join(dir, name));
+				return true;
+			} catch {
+				return false;
+			}
+		};
+		if (await exists('stop')) {
+			await rm(path.join(dir, 'stop'), { force: true });
+			this.log.info('Befehl „stop“: Runner wird beendet');
+			this.o.onStopRequest?.();
+			return;
+		}
+		if (await exists('handover')) {
+			await rm(path.join(dir, 'handover'), { force: true });
+			this.log.info('Befehl „handover“: laufende Läufe werden an einen Server-Runner übergeben');
+			await this.handover('manual');
+			if (!this.paused) await this.wake('Übergabe beendet');
+		}
+		const pause = await exists('pause');
+		if (pause && !this.paused) {
+			this.paused = true;
+			this.log.info('Pausiert: keine neuen Aufträge, laufende werden übergeben');
+			await this.handover('manual');
+		} else if (!pause && this.paused) {
+			this.paused = false;
+			this.log.info('Pause beendet');
+			await this.wake('Pause beendet');
+		}
+	}
+
+	/** Zustand für `atrium-runner status` schreiben (best effort) */
+	async writeState(): Promise<void> {
+		const state: RunnerStateFile = {
+			pid: process.pid,
+			name: this.o.config.name,
+			version: RUNNER_VERSION,
+			kind: this.kind,
+			status: this.status,
+			runnerId: this.runnerId,
+			paused: this.executor.handoverReason,
+			runs: this.executor.runIds(),
+			lastHeartbeatAt: this.lastHeartbeatAt,
+			startedAt: this.startedAt,
+			power: this.powerName,
+			updatedAt: new Date().toISOString()
+		};
+		try {
+			await writeFile(stateFile(this.o.config.workDir), JSON.stringify(state, null, 2));
+		} catch {
+			// Arbeitsverzeichnis nicht beschreibbar
+		}
+	}
+
+	/** Energieüberwachung starten (PC-Runner bzw. `POWER_EVENTS`) */
+	private async startPower(): Promise<void> {
+		const monitor =
+			this.o.powerMonitor !== undefined ? this.o.powerMonitor : this.o.config.powerEvents ? defaultPowerMonitor() : null;
+		if (!monitor) return;
+		const ok = await monitor.start((e) => this.onPower(e));
+		if (!ok) {
+			this.log.warn('Standby/Herunterfahren werden nicht erkannt – Atrium übernimmt nach dem Heartbeat-Zeitlimit');
+			return;
+		}
+		this.power = monitor;
+		this.powerName = monitor.name;
+		this.log.info(`Energie-Ereignisse werden beobachtet (${monitor.name})`);
 	}
 
 	/**
@@ -291,7 +517,7 @@ export class Runner {
 	async start(): Promise<void> {
 		await mkdir(this.o.config.workDir, { recursive: true });
 		const [git, ghOk, ptyOk] = await Promise.all([hasCommand('git'), hasCommand('gh'), this.pty.available()]);
-		this.capabilities = { question: true, branchDelivery: true, prUpdate: true, limitReport: true, attachments: true, branchCleanup: git && ghOk, git, gh: ghOk, pty: ptyOk, os: `${os.platform()}-${os.arch()}`.slice(0, 40) };
+		this.capabilities = { question: true, branchDelivery: true, prUpdate: true, limitReport: true, attachments: true, handoff: true, fencing: true, wip: true, branchCleanup: git && ghOk, git, gh: ghOk, pty: ptyOk, os: `${os.platform()}-${os.arch()}`.slice(0, 40) };
 		if (!git) this.log.error('git wurde nicht gefunden – Läufe sind nicht möglich');
 		if (!ghOk) this.log.warn('gh wurde nicht gefunden – PRs und PR-Übersicht sind nicht möglich');
 		if (!ptyOk) this.log.info('node-pty nicht verfügbar – Terminals sind deaktiviert');
@@ -315,6 +541,13 @@ export class Runner {
 			this.timers.push(first, every);
 			this.log.info(`Aktive Limit-Abfrage an (alle ${this.o.config.limitProbeMin ?? 5} min)`);
 		}
+
+		await mkdir(controlDir(this.o.config.workDir), { recursive: true });
+		const control = setInterval(() => void this.pollControl().catch((e: unknown) => this.log.warn('Steuerdatei', errorMessage(e))), this.o.controlPollMs ?? 2000);
+		control.unref();
+		this.timers.push(control);
+		await this.startPower();
+		await this.writeState();
 
 		if (!(await this.register())) return;
 		this.stream = runCommandStream(
@@ -348,6 +581,11 @@ export class Runner {
 		const drainSec = opts.drainSec ?? this.o.config.drainSec ?? 0;
 		this.log.info('Runner wird beendet …');
 		this.pty.closeAll();
+		// PC-Runner (z. B. SIGTERM beim Herunterfahren): nicht warten, sondern sofort übergeben
+		if (this.kind === 'desktop' && this.executor.slotsUsed > 0 && !opts.drainSec) {
+			await this.handover('shutdown', this.power?.graceMs ?? null);
+		}
+		await this.power?.stop();
 		if (drainSec > 0 && this.executor.slotsUsed > 0 && !opts.skipDrain?.aborted) {
 			this.draining = true;
 			this.log.info(
