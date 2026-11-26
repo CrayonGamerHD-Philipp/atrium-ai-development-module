@@ -37,8 +37,8 @@
 	});
 
 	const onBranch = $derived(status === 'done' || status === 'review');
-	// Wartende/blockierte Aufträge hängen evtl. an einem Lauf fest, den das Backend vorher abbricht
-	const waiting = $derived(status === 'queued' || status === 'blocked');
+	// Wartende/blockierte/laufende Aufträge hängen evtl. an einem Lauf fest, den das Backend vorher abbricht
+	const waiting = $derived(status === 'queued' || status === 'blocked' || status === 'running');
 
 	async function confirm() {
 		const subtasks = includeDone ? 'all' : 'failed';

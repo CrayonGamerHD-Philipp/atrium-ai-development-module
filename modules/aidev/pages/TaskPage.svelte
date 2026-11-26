@@ -139,8 +139,8 @@
 	const canWorkspace = $derived(has(PERM.files) || has(PERM.terminal));
 	const isFinal = $derived(!!task && FINAL_TASK_STATUSES.includes(task.status));
 
-	/** Zustände, aus denen ein Auftrag (oder Teilauftrag) manuell neu gestartet werden kann; bei `queued`/`blocked`
-	 * bricht das Backend dabei einen hängenden Lauf ab. `running` und `draft` bleiben ausgenommen. */
+	/** Zustände, aus denen ein Auftrag (oder Teilauftrag) manuell neu gestartet werden kann; bei
+	 * `queued`/`blocked`/`running` bricht das Backend dabei einen hängenden Lauf ab. `draft` bleibt ausgenommen. */
 	const RESTARTABLE: readonly string[] = [
 		'failed',
 		'cancelled',
@@ -148,7 +148,8 @@
 		'done',
 		'review',
 		'queued',
-		'blocked'
+		'blocked',
+		'running'
 	];
 	/** Orchestrierung → im Neustart-Dialog die Option für erledigte Teilaufträge anbieten */
 	const orchestrated = $derived(task?.role === 'orchestrate' || !!detail?.children.length);
@@ -385,13 +386,25 @@
 	const runOptions = $derived(
 		runs.map((r) => ({
 			value: r.id,
-			label: `Versuch ${r.attempt} · ${r.provider} · ${RUN_STATUS_LABELS[r.status]}`
+			label: `Versuch ${r.attempt} · ${r.provider} · ${
+				connectionLost(r) ? RUN_STATUS_LABELS.lost : RUN_STATUS_LABELS[r.status]
+			}`
 		}))
 	);
 	const allCommits = $derived(runs.flatMap((r) => r.commits.map((c) => ({ ...c, run: r }))));
 	const childTitles = $derived(new Map((detail?.children ?? []).map((c) => [c.id, taskTitle(c)])));
 	const doneChildren = $derived(detail?.children.filter((c) => c.status === 'done').length ?? 0);
 	const lastFailedRun = $derived(runs.find((r) => r.errorMessage || r.errorKind) ?? null);
+
+	/** Lauf hat die Verbindung zum Runner verloren (Lease abgelaufen, Runner-Neustart) – zählt nicht als Versuch */
+	function connectionLost(r: RunDto) {
+		return r.errorKind === 'connection';
+	}
+	function errorTitle(r: RunDto) {
+		return connectionLost(r)
+			? 'Verbindung zum Runner verloren'
+			: (ERROR_KIND_LABELS[r.errorKind ?? ''] ?? 'Fehler');
+	}
 
 	function runMeta(r: RunDto) {
 		const parts = [r.accountLabel, r.runnerName].filter(Boolean);
@@ -674,7 +687,10 @@
 									/>
 								{/if}
 								{#if selectedRun}
-									<StatusBadge status={selectedRun.status} run />
+									<StatusBadge
+										status={connectionLost(selectedRun) ? 'lost' : selectedRun.status}
+										run
+									/>
 									<span class="text-xs text-muted-foreground">
 										{runMeta(selectedRun)} · {elapsed(
 											selectedRun.startedAt,
@@ -684,11 +700,22 @@
 									</span>
 								{/if}
 							</div>
-							{#if selectedRun?.errorMessage && !running}
+							{#if selectedRun && connectionLost(selectedRun) && !running}
+								<Alert.Root variant="warning" class="mb-3">
+									<Alert.Title>{errorTitle(selectedRun)}</Alert.Title>
+									<Alert.Description>
+										<p>
+											Dieser Lauf zählt nicht als Versuch. Der Auftrag wird automatisch neu
+											eingeplant, bevorzugt auf einem anderen Agenten.
+										</p>
+										{#if selectedRun.errorMessage}
+											<p class="whitespace-pre-wrap">{selectedRun.errorMessage}</p>
+										{/if}
+									</Alert.Description>
+								</Alert.Root>
+							{:else if selectedRun?.errorMessage && !running}
 								<Alert.Root variant="destructive" class="mb-3">
-									<Alert.Title>
-										{ERROR_KIND_LABELS[selectedRun.errorKind ?? ''] ?? 'Fehler'}
-									</Alert.Title>
+									<Alert.Title>{errorTitle(selectedRun)}</Alert.Title>
 									<Alert.Description class="whitespace-pre-wrap"
 										>{selectedRun.errorMessage}</Alert.Description
 									>
@@ -823,9 +850,7 @@
 								</Alert.Root>
 							{:else if lastFailedRun?.errorMessage && task.status === 'failed'}
 								<Alert.Root variant="destructive">
-									<Alert.Title
-										>{ERROR_KIND_LABELS[lastFailedRun.errorKind ?? ''] ?? 'Fehler'}</Alert.Title
-									>
+									<Alert.Title>{errorTitle(lastFailedRun)}</Alert.Title>
 									<Alert.Description class="whitespace-pre-wrap"
 										>{lastFailedRun.errorMessage}</Alert.Description
 									>
