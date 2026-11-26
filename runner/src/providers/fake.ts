@@ -6,8 +6,9 @@
  * Meldet außerdem einen Limit-Stand (`limits`, 5-Stunden-Fenster).
  * Schreibt `AIDEV_FAKE.md` mit einem Auszug des Auftrags (nicht bei `readOnly`).
  */
-import { writeFile } from 'node:fs/promises';
+import { readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { REPAIR_MARKER } from '../selfheal.ts';
 import { AsyncQueue, sleep } from '../util/async.ts';
 import { exec } from '../util/proc.ts';
 import type {
@@ -27,8 +28,20 @@ export const FAKE_PLAN = {
 	]
 };
 
+/** Ursprünglicher Auftrag je Sitzung (Marker gelten auch in Reparaturrunden) */
+const sessions = new Map<string, string>();
+
+/** Konfliktmarker entfernen und beide Seiten behalten (eigene zuerst) */
+export function stripConflictMarkers(text: string): string {
+	return text
+		.split('\n')
+		.filter((l) => !/^(<{7}|>{7})( |$)|^={7}$|^\|{7}( |$)/.test(l))
+		.join('\n');
+}
+
 export const fakeAdapter: ProviderAdapter = {
 	id: 'fake',
+	resumable: true,
 	probe(): Promise<ProbeResult> {
 		return Promise.resolve({ ok: true, loggedIn: true, version: 'fake-1' });
 	},
@@ -38,8 +51,11 @@ export const fakeAdapter: ProviderAdapter = {
 		const onAbort = () => ctrl.abort();
 		o.signal.addEventListener('abort', onAbort, { once: true });
 		if (o.signal.aborted) ctrl.abort();
-		const sessionId = o.resumeSessionId ?? `fake-${Date.now().toString(36)}`;
+		const sessionId = o.resumeSessionId ?? `fake-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 		const p = o.prompt;
+		// Marker des ursprünglichen Auftrags gelten auch in fortgesetzten Sitzungen (Reparaturrunden)
+		if (!o.resumeSessionId) sessions.set(sessionId, p);
+		const orig = sessions.get(sessionId) ?? p;
 		const done = (async (): Promise<AgentResult> => {
 			const base: AgentResult = { exitCode: 0, sessionId, usage: null, lastText: '', limit: null, error: null };
 			try {
@@ -47,6 +63,46 @@ export const fakeAdapter: ProviderAdapter = {
 				queue.push({ kind: 'system', payload: { text: 'Fake-Agent gestartet', model: o.model ?? 'fake' } });
 				queue.push({ kind: 'thinking', payload: { text: 'Ich lese den Auftrag.' } });
 				await sleep(5, ctrl.signal);
+				if (o.research) {
+					const q = /## Question\n\n([^\n]+)/.exec(p)?.[1] ?? '';
+					const text = `Recherche-Ergebnis zu „${q}“: Version 4.2 (Quelle: package.json)`;
+					queue.push({ kind: 'text', payload: { text } });
+					return { ...base, lastText: text };
+				}
+				if (orig.includes('[fake:transient]') && !o.resumeSessionId) {
+					queue.push({ kind: 'error', payload: { text: 'API Error: 529 overloaded_error' } });
+					return { ...base, exitCode: 1, error: 'API Error: 529 {"type":"overloaded_error"}' };
+				}
+				if (p.includes(`${REPAIR_MARKER} conflict`)) {
+					if (orig.includes('[fake:keep-conflict]')) return { ...base, lastText: 'Konflikt nicht gelöst.' };
+					const files = [...p.matchAll(/^- `([^`]+)`$/gm)].map((m) => m[1] ?? '').filter(Boolean);
+					for (const f of files) {
+						const file = path.join(o.cwd, f);
+						const text = await readFile(file, 'utf8').catch(() => null);
+						if (text !== null) await writeFile(file, stripConflictMarkers(text), 'utf8');
+					}
+					await exec('git', ['add', '-A'], { cwd: o.cwd, env: o.env });
+					await exec('git', ['commit', '--no-edit', '--quiet'], { cwd: o.cwd, env: o.env });
+					const text = `Konflikte gelöst (beide Seiten übernommen): ${files.join(', ')}`;
+					queue.push({ kind: 'text', payload: { text } });
+					return { ...base, lastText: text };
+				}
+				if (p.includes(`${REPAIR_MARKER} tests`)) {
+					if (!orig.includes('[fake:no-fix]'))
+						await writeFile(path.join(o.cwd, 'AIDEV_FIXED.md'), '# Tests repariert\n', 'utf8');
+					const text = 'Testfehler behoben.';
+					queue.push({ kind: 'text', payload: { text } });
+					return { ...base, lastText: text };
+				}
+				let researched = '';
+				if (p.includes('[fake:research]')) {
+					const r = await exec('node', [path.join('.aidev', 'bin', 'research.mjs'), 'Welche Version nutzt das Projekt?'], {
+						cwd: o.cwd,
+						env: o.env,
+						timeoutMs: 30_000
+					});
+					researched = r.code === 0 ? r.stdout.trim() : `Recherche fehlgeschlagen: ${r.stderr.trim()}`;
+				}
 				if (p.includes('[fake:write-slow]') && !o.readOnly) {
 					// Zwischenstand schreiben, dann bis zum Abbruch weiterarbeiten (Übergabe/Checkpoints testen)
 					await writeFile(path.join(o.cwd, 'AIDEV_WIP.md'), '# Zwischenstand\n', 'utf8');
@@ -76,7 +132,7 @@ export const fakeAdapter: ProviderAdapter = {
 					const file = path.join(o.cwd, 'AIDEV_FAKE.md');
 					const excerpt = p.replace(/\r\n/g, '\n').slice(0, 500);
 					queue.push({ kind: 'tool', payload: { name: 'write_file', input: { path: 'AIDEV_FAKE.md' } } });
-					await writeFile(file, `# Fake-Agent\n\n${excerpt}\n`, 'utf8');
+					await writeFile(file, `# Fake-Agent\n\n${excerpt}\n${researched ? `\n${researched}\n` : ''}`, 'utf8');
 					queue.push({ kind: 'tool-result', payload: { name: 'write_file', output: 'ok', isError: false } });
 					if (p.includes('[fake:stage-ignored]')) await exec('git', ['add', '-f', '.'], { cwd: o.cwd, env: o.env });
 					if (p.includes('[fake:commit]')) {
@@ -84,7 +140,7 @@ export const fakeAdapter: ProviderAdapter = {
 						await exec('git', ['commit', '-m', 'Fake-Agent: eigener Commit'], { cwd: o.cwd, env: o.env });
 					}
 				}
-				let text = 'Fertig. Ich habe den Auftrag erledigt.';
+				let text = `Fertig. Ich habe den Auftrag erledigt.${researched ? `\n\n${researched}` : ''}`;
 				if (p.includes('[fake:plan]'))
 					text = `Hier ist der Plan:\n\n\`\`\`json\n${JSON.stringify(FAKE_PLAN, null, 2)}\n\`\`\`\n`;
 				queue.push({ kind: 'text', payload: { text } });

@@ -76,6 +76,10 @@ const fileSchema = z
 		handoverSec: z.number().int().optional(),
 		wipCheckpointMin: z.number().int().optional(),
 		powerEvents: z.boolean().optional(),
+		autoRepairRounds: z.number().int().optional(),
+		research: z.boolean().optional(),
+		researchMax: z.number().int().optional(),
+		researchAccounts: z.array(z.string()).optional(),
 		accounts: z.array(z.unknown()).optional()
 	})
 	.strict();
@@ -114,6 +118,18 @@ export interface RunnerConfig {
 	wipCheckpointMin?: number;
 	/** Standby/Herunterfahren des Betriebssystems beobachten (Standard: an für desktop) */
 	powerEvents?: boolean;
+	/**
+	 * Selbstreparatur im selben Lauf (Standard 2): So viele Runden setzt der Runner die Sitzung des Agents fort, um
+	 * fehlgeschlagene Tests bzw. Merge-Konflikte zu beheben, bevor der Lauf fehlschlägt. Vorübergehende Fehler des
+	 * Agents (Überlastung, Netzwerk) werden zusätzlich bis zu zweimal wiederholt. 0 = aus.
+	 */
+	autoRepairRounds?: number;
+	/** Recherche-Schnittstelle für Agents (Standard an): `.aidev/bin/research.mjs "Frage"` startet eine Recherche */
+	research?: boolean;
+	/** Höchstzahl an Recherchen je Lauf (Standard 3) */
+	researchMax?: number;
+	/** Bevorzugte Konten für Recherchen (Schlüssel, in Reihenfolge); leer = anderes freies Konto, sonst dasselbe */
+	researchAccounts?: string[];
 	/** Pfad der gelesenen Konfigurationsdatei (falls vorhanden) */
 	configFile: string | null;
 }
@@ -142,6 +158,10 @@ const finalSchema = z.object({
 	handoverSec: z.number().int().min(3).max(300),
 	wipCheckpointMin: z.number().int().min(0).max(1440),
 	powerEvents: z.boolean(),
+	autoRepairRounds: z.number().int().min(0).max(10),
+	research: z.boolean(),
+	researchMax: z.number().int().min(0).max(20),
+	researchAccounts: z.array(z.string().min(1).max(64)).max(50),
 	accounts: z.array(accountConfigSchema).max(50)
 });
 
@@ -158,7 +178,9 @@ const LABELS: Record<string, string> = {
 	limitProbeMin: 'LIMIT_PROBE_MIN',
 	drainSec: 'DRAIN_SEC',
 	kind: 'RUNNER_KIND',
-	powerEvents: 'POWER_EVENTS'
+	powerEvents: 'POWER_EVENTS',
+	research: 'RESEARCH',
+	researchAccounts: 'RESEARCH_ACCOUNTS'
 };
 
 /** Schalter aus einer Umgebungsvariable (`1`/`true`/`on` bzw. `0`/`false`/`off`); ungültig → `invalid` */
@@ -230,6 +252,14 @@ export function loadConfig(o: LoadOptions = {}): RunnerConfig {
 	const powerEnv = envBool(env.POWER_EVENTS);
 	if (powerEnv === 'invalid')
 		throw new ConfigError('Konfiguration ungültig:\n  - POWER_EVENTS: muss true/false (bzw. 1/0) sein');
+	const researchEnv = envBool(env.RESEARCH);
+	if (researchEnv === 'invalid')
+		throw new ConfigError('Konfiguration ungültig:\n  - RESEARCH: muss true/false (bzw. 1/0) sein');
+	const autoRepairRounds = intOf(env.AUTO_REPAIR_ROUNDS, file.autoRepairRounds, '2');
+	const researchMax = intOf(env.RESEARCH_MAX, file.researchMax, '3');
+	const researchAccounts = env.RESEARCH_ACCOUNTS
+		? env.RESEARCH_ACCOUNTS.split(',').map((k) => k.trim()).filter(Boolean)
+		: (file.researchAccounts ?? []);
 	const probeEnv = envBool(env.LIMIT_PROBE);
 	if (probeEnv === 'invalid')
 		throw new ConfigError('Konfiguration ungültig:\n  - LIMIT_PROBE: muss true/false (bzw. 1/0) sein');
@@ -253,6 +283,10 @@ export function loadConfig(o: LoadOptions = {}): RunnerConfig {
 		handoverSec,
 		wipCheckpointMin,
 		powerEvents: powerEnv ?? file.powerEvents ?? kind === 'desktop',
+		autoRepairRounds,
+		research: researchEnv ?? file.research ?? true,
+		researchMax,
+		researchAccounts,
 		accounts
 	};
 	const parsed = finalSchema.safeParse(candidate);
@@ -267,6 +301,9 @@ export function loadConfig(o: LoadOptions = {}): RunnerConfig {
 			if (head === 'limitProbeMin') return '  - LIMIT_PROBE_MIN: muss eine ganze Zahl zwischen 1 und 1440 sein';
 			if (head === 'drainSec') return '  - DRAIN_SEC: muss eine ganze Zahl zwischen 0 und 86400 sein';
 			if (head === 'handoverSec') return '  - HANDOVER_SEC: muss eine ganze Zahl zwischen 3 und 300 sein';
+			if (head === 'autoRepairRounds')
+				return '  - AUTO_REPAIR_ROUNDS: muss eine ganze Zahl zwischen 0 und 10 sein';
+			if (head === 'researchMax') return '  - RESEARCH_MAX: muss eine ganze Zahl zwischen 0 und 20 sein';
 			if (head === 'wipCheckpointMin')
 				return '  - WIP_CHECKPOINT_MIN: muss eine ganze Zahl zwischen 0 und 1440 sein';
 			return `  - ${LABELS[String(head)] ?? String(head)}: ${i.message}`;

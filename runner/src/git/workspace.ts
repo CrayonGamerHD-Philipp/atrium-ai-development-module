@@ -10,7 +10,7 @@ import { mkdir, readdir, readFile, rm, stat } from 'node:fs/promises';
 import path from 'node:path';
 import type { Logger } from '../log.ts';
 import { silentLogger } from '../log.ts';
-import { KeyedMutex } from '../util/async.ts';
+import { backoffMs, errorMessage, KeyedMutex, sleep } from '../util/async.ts';
 import { assertRefName, createGitRunner, GitError, gitEnv, type GitOptions, type GitRunner } from './git.ts';
 
 export interface RepoRef {
@@ -27,6 +27,16 @@ export interface WorkspaceOptions {
 	/** `gh` als Credential-Helper für https://github.com verwenden */
 	useGhCredentials: boolean;
 	log?: Logger;
+	/** Grundwartezeit für Wiederholungen bei Netzwerkfehlern (ms, Standard 1000) */
+	retryBaseMs?: number;
+}
+
+const TRANSIENT_GIT =
+	/could not resolve host|connection (?:timed out|reset|refused)|operation timed out|early eof|unexpected disconnect|rpc failed|remote end hung up|returned error: 5\d\d|internal server error|bad gateway|service unavailable|gateway time-?out|gnutls|ssl_error|temporary failure|network is unreachable/i;
+
+/** Netzwerkfehler von git, die ein neuer Versuch beheben kann */
+export function isTransientGitError(e: unknown): boolean {
+	return TRANSIENT_GIT.test(errorMessage(e));
 }
 
 const SAFE_NAME = /^[A-Za-z0-9._-]{1,100}$/;
@@ -116,13 +126,22 @@ export class Workspace {
 			const cur = await this.git(['remote', 'get-url', 'origin'], { cwd: dir, allowFail: true });
 			if (cur.stdout.trim() !== url) await this.git(['remote', 'set-url', 'origin', url], { cwd: dir });
 		}
-		await this.git(['fetch', '--prune', '--quiet', 'origin'], {
-			cwd: dir,
-			config: this.netConfig(r),
-			signal,
-			timeoutMs: 600_000
-		});
-		return dir;
+		// Vorübergehende Netzwerkfehler (Verbindung, 5xx, Zeitüberschreitung) bis zu dreimal mit Wartezeit versuchen
+		for (let attempt = 1; ; attempt++) {
+			try {
+				await this.git(['fetch', '--prune', '--quiet', 'origin'], {
+					cwd: dir,
+					config: this.netConfig(r),
+					signal,
+					timeoutMs: 600_000
+				});
+				return dir;
+			} catch (e) {
+				if (attempt >= 3 || signal?.aborted || !isTransientGitError(e)) throw e;
+				this.log.warn(`fetch für ${r.repoOwner}/${r.repoName} fehlgeschlagen (Versuch ${attempt}) – neuer Versuch`);
+				await sleep(backoffMs(attempt, this.o.retryBaseMs ?? 1000, 15_000), signal);
+			}
+		}
 	}
 
 	/** Cache anlegen bzw. aktualisieren (`fetch --prune`) */

@@ -40,6 +40,10 @@ Vorlage: [`runner.config.example.json`](runner.config.example.json)):
 | `LIMIT_PROBE` | aktive Limit-Abfrage ohne Lauf (`true`/`false`, Datei: `limitProbe`) | an für Claude-Konten mit OAuth-Login |
 | `LIMIT_PROBE_MIN` | Abstand der aktiven Limit-Abfrage in Minuten (1–1440, Datei: `limitProbeMin`) | `5` |
 | `DRAIN_SEC` | beim Beenden so viele Sekunden auf laufende Läufe warten (0–86400, Datei: `drainSec`), siehe [Neustart](#neustart-während-laufender-aufträge) | `0` |
+| `AUTO_REPAIR_ROUNDS` | Selbstreparatur im selben Lauf: Runden je Testfehler bzw. Konflikt (0–10, `0` = aus, Datei: `autoRepairRounds`), siehe [Selbstreparatur](#selbstreparatur-und-konflikte-im-selben-lauf) | `2` |
+| `RESEARCH` | Recherche-Schnittstelle für Agents (`true`/`false`, Datei: `research`), siehe [Recherche](#recherche-auf-anforderung) | `true` |
+| `RESEARCH_MAX` | höchstens so viele Recherchen je Lauf (0–20, Datei: `researchMax`) | `3` |
+| `RESEARCH_ACCOUNTS` | bevorzugte Konten für Recherchen, kommagetrennt (Datei: `researchAccounts` als Liste) | – (anderes freies Konto, sonst dasselbe) |
 
 Ein Konto (`accounts[]`):
 
@@ -120,7 +124,51 @@ der Runner Aufträge. Konten, deren CLI fehlt oder die nicht angemeldet sind, me
    Haupt-Branch, bis zu 3 Versuche), `integrate` (Merge `--no-ff` in den Integrations-Branch, bis zu 3 Versuche),
    `pr-update` (Push ohne Force auf den Head-Branch eines bestehenden PR, nach einem Rebase auf parallel gepushte
    Commits erneut **testCmd**, Zusammenfassung als PR-Kommentar) oder
-   `none`. Konflikte → `conflict` mit Dateiliste.
+   `none`. Konflikte löst der Agent im selben Lauf (siehe unten); erst wenn das scheitert → `conflict` mit Dateiliste.
+
+### Selbstreparatur und Konflikte im selben Lauf
+
+Statt einen Lauf bei der ersten Hürde scheitern zu lassen (und später einen neuen Lauf von vorn zu starten), setzt der
+Runner die **Sitzung desselben Agents im selben Worktree** mit einem gezielten Reparaturauftrag fort (Claude, Codex und
+`openai-api` mit `--resume`, sonst mit dem ursprünglichen Auftrag plus Reparaturauftrag). Je Hürde höchstens
+`AUTO_REPAIR_ROUNDS` Runden (Standard 2); alles läuft innerhalb des Zeitlimits des Laufs:
+
+| Hürde | Verhalten |
+|---|---|
+| vorübergehender Fehler des Agents (Überlastung/529, 5xx, Netzwerk, abgebrochener Stream) | bis zu 2 neue Versuche mit Wartezeit, Sitzung wird fortgesetzt |
+| `git fetch` schlägt mit Netzwerkfehler fehl | bis zu 3 Versuche mit Wartezeit |
+| **testCmd** schlägt fehl | der Agent bekommt Befehl, Exit-Code und das Ende der Ausgabe und behebt die Ursache; Commit „… (Nachbesserung Tests)“, danach erneut testen |
+| **Konflikt** beim Ausliefern (`direct`, `integrate`, `pr-update`) | der Runner mergt den neuen Stand des Ziels in den Branch (Merge statt Rebase: alle Konflikte in einem Durchgang), der Agent löst die Konfliktmarker und committet den Merge; der Runner prüft, dass keine Datei mehr „unmerged“ ist bzw. Marker enthält, testet erneut und liefert aus (bei `direct` per Fast-Forward, ohne erneuten Rebase) |
+| `pr`/`branch`: Branch würde mit dem Haupt-Branch kollidieren | vorab geprüft (`git merge-tree`), dann wie oben gelöst, damit der PR mergebar bleibt; gelingt das nicht, wird trotzdem ausgeliefert (wie bisher) |
+| Auftrag mit Rolle `resolve` (Rückfall von Atrium) | der Runner mergt das Ziel **vor** dem ersten Aufruf, damit die Konflikte wirklich im Worktree stehen |
+
+Gelingt die Lösung nicht, endet der Lauf wie bisher mit `conflict` bzw. `tests`; Atrium plant dann eine Konfliktlösung
+bzw. einen neuen Versuch. Bei `direct` sichert der Runner vorher den Arbeitsstand auf dem Auftrags-Branch, damit die
+Konfliktlösung darauf aufsetzen kann. Was nachgebessert wurde, steht am Ende der Zusammenfassung
+(„Automatisch im selben Lauf nachgebessert“) und im Verlauf.
+
+### Recherche auf Anforderung
+
+Agents können **mitten im Lauf eine Recherche anfordern**, z. B. wenn Claude, Codex oder Gemini Wissen zu einer
+externen API, einer Bibliotheksversion oder einem unklaren Verhalten fehlt. Der Systemanweisung wird dazu ein
+Abschnitt „Research on demand“ angehängt; der Agent ruft auf:
+
+```sh
+node .aidev/bin/research.mjs "<präzise Frage>" "<optional: Kontext, was schon bekannt ist>"
+```
+
+Der Befehl blockiert, bis die Recherche fertig ist, und gibt das Ergebnis als Markdown aus. Ohne `node` kann der
+Agent die Anfrage auch selbst als `.aidev/research/<id>.request.json` (`{"question": "…"}`) ablegen und auf
+`<id>.answer.json` warten. Der Transport läuft über Dateien im Worktree – ohne Netzwerkport, in jeder Sandbox und auf
+allen Systemen; `.aidev/` wird nie committet.
+
+Der Runner beantwortet die Anfrage mit einem eigenen, **nur lesenden** Recherche-Agent im selben Worktree (Claude:
+`Read,Glob,Grep,WebSearch,WebFetch`; Gemini: Lese-Werkzeuge plus `google_web_search`, `web_fetch`; Codex:
+`--sandbox read-only`). Konto: zuerst `RESEARCH_ACCOUNTS` in dieser Reihenfolge, sonst ein **anderes** angemeldetes
+Konto ohne aktives Limit (verteilt die Last, z. B. recherchiert Gemini für Claude), sonst dasselbe Konto. Stößt ein
+Konto ans Limit, wird das nächste versucht. Höchstens `RESEARCH_MAX` Recherchen je Lauf, je höchstens 15 Minuten.
+Fragen und Ergebnisse erscheinen im Verlauf des Laufs; der Verbrauch desselben Kontos zählt zum Lauf. Nicht für
+Chat-Fragen und Recherche-Aufträge (keine Rekursion).
 
 Worktrees bleiben nach dem Lauf erhalten (Editor/Terminal „Lauf“), aufgeräumt wird beim Start und stündlich
 (älter als 48 h bzw. mehr als 30). Die Arbeitskopie des Haupt-Branchs je Projekt liegt in

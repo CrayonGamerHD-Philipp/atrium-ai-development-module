@@ -126,7 +126,8 @@ Grenzen:
 
 - **Fork-PRs** werden nicht bearbeitet. Geschlossene oder gemergte PRs ebenso wenig.
 - **Kein Force-Push**, auch nicht auf `aidev/`-Branches. Lassen sich die eigenen Commits nicht konfliktfrei auf parallel
-  gepushte übernehmen, endet der Lauf als Konflikt; lehnt GitHub den Push ab, schlägt der Lauf fehl.
+  gepushte übernehmen, mergt der Runner den neuen Stand hinein und der Agent löst die Konflikte im selben Lauf; erst
+  wenn das scheitert, endet der Lauf als Konflikt. Lehnt GitHub den Push ab, schlägt der Lauf fehl.
 - **Konflikte** mit dem Haupt-Branch werden gelöst, indem `origin/<Haupt-Branch>` in den PR-Branch gemergt wird. Der
   Branch wird nie rebased.
 - Fehlt der Branch auf dem Remote, bricht der Lauf ab. Er wird nicht neu angelegt.
@@ -175,6 +176,25 @@ Verliert ein Lauf die Verbindung zum Runner (Lease abgelaufen, Runner-Neustart),
 Der Auftrag wird wieder eingeplant und wechselt dabei bevorzugt auf einen anderen Agenten. Erst nach 20
 aufeinanderfolgenden Verbindungsverlusten gilt der Auftrag als **Fehlgeschlagen**; der Hinweis am verlorenen Lauf
 bietet dann direkt **Neu starten** an (setzt Versuche und Verlustzähler zurück).
+
+### Eigenständige Läufe: Selbstreparatur und Recherche
+
+Läufe scheitern nicht mehr an der ersten Hürde. Der Runner setzt die Sitzung desselben Agents im selben Worktree fort,
+statt einen neuen Lauf von vorn zu starten (spart Zeit, Tokens und Versuche):
+
+- **Fehlgeschlagene Tests** (`testCmd`): Der Agent bekommt die Testausgabe und bessert nach (Standard bis zu 2 Runden).
+- **Merge-Konflikte** beim Ausliefern (direkt, Integrations-Branch, bestehender PR) und Konflikte eines PR mit dem
+  Haupt-Branch: Der Runner mergt den neuen Stand hinein, der Agent löst die Konfliktmarker, danach wird erneut getestet
+  und ausgeliefert. Erst wenn das scheitert, entsteht wie bisher ein Auftrag „Konflikt lösen“ – der dann die Konflikte
+  tatsächlich im Worktree vorfindet.
+- **Vorübergehende Fehler** (Überlastung, 5xx, Netzwerk) werden mit Wartezeit wiederholt.
+- **Recherche auf Anforderung**: Claude, Codex oder Gemini können mitten im Lauf mit
+  `node .aidev/bin/research.mjs "Frage"` eine Recherche anfordern. Ein eigener, nur lesender Agent (bevorzugt ein
+  anderes freies Konto) beantwortet sie, das Ergebnis fließt direkt in den laufenden Agent zurück.
+
+Was automatisch nachgebessert wurde, steht am Ende der Zusammenfassung und im Verlauf. Einstellungen am Runner
+(`AUTO_REPAIR_ROUNDS`, `RESEARCH`, `RESEARCH_MAX`, `RESEARCH_ACCOUNTS`): siehe
+[`runner/README.md`](runner/README.md#selbstreparatur-und-konflikte-im-selben-lauf).
 
 ### Limit-Analyse
 

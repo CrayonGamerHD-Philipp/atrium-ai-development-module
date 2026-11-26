@@ -364,6 +364,7 @@ function codexHome(env: NodeJS.ProcessEnv): string {
 
 export const codexAdapter: ProviderAdapter = {
 	id: 'codex',
+	resumable: true,
 	async probe(acct: AccountConfig, env: NodeJS.ProcessEnv): Promise<ProbeResult> {
 		const cmd = acct.command ?? 'codex';
 		const v = await probeVersion(cmd, env);

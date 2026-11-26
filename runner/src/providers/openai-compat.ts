@@ -33,6 +33,7 @@ export function openAiConfigArgs(acct: AccountConfig): string[] {
 
 export const openAiCompatAdapter: ProviderAdapter = {
 	id: 'openai-api',
+	resumable: true,
 	async probe(acct: AccountConfig, env: NodeJS.ProcessEnv): Promise<ProbeResult> {
 		const v = await probeVersion(acct.command ?? 'codex', env);
 		if (!v.ok) return probeFailed(v.message ?? 'codex nicht gefunden');

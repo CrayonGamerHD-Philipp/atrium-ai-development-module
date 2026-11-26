@@ -10,7 +10,8 @@ still apply: `.core/.claude/CLAUDE.md` and `.core/.claude/rules/*.md` (especiall
   `live.ts` (SSE hubs), `jobs.ts`, `migrations/`, `pages/` + `ui.ts` (interface), `tests/`.
 - `runner/` – standalone Node service (Docker or single binary on a PC) with git, gh, and the agent CLIs; not loaded by Atrium.
   `src/power/` (standby/shutdown detection per OS behind one interface), `src/desktop/` (autostart, PC commands),
-  `src/git/wip.ts` (WIP refs `refs/aidev/wip/<runId>`), `scripts/build-sea.mjs` + `packaging/` (release builds,
+  `src/git/wip.ts` (WIP refs `refs/aidev/wip/<runId>`), `src/selfheal.ts` + `src/git/conflicts.ts` (in-run self-repair:
+  failing tests, merge conflicts, transient agent errors), `src/research.ts` (research-on-demand bridge `.aidev/research/`), `scripts/build-sea.mjs` + `packaging/` (release builds,
   `.github/workflows/release-runner.yml`, tag `runner-v*`).
 
 ## Commands

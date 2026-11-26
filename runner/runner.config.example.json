@@ -4,6 +4,10 @@
 	"workDir": "/work",
 	"maxSlots": 2,
 	"limitProbeMin": 5,
+	"autoRepairRounds": 2,
+	"research": true,
+	"researchMax": 3,
+	"researchAccounts": ["gemini-main"],
 	"accounts": [
 		{
 			"key": "claude-main",
