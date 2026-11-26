@@ -20,6 +20,7 @@ import { sql } from 'drizzle-orm';
 import { inList, logBestEffort, num, rowsOf, str, toIso, type Row } from '$lib/sdk/server';
 import {
 	clip,
+	jsonOf,
 	loadSettings,
 	mdb,
 	oneOf,
@@ -44,7 +45,7 @@ import { connectionLossTargets, loseRun } from './runs.service';
 import { planAssignments, type ProjectState, type TaskCandidate } from './scheduler';
 import { effectiveRole, getTask, planOf, resolveInfoOf, topBranchOf } from './tasks.service';
 import { loadAccountViews } from './usage.service';
-import { LEASE_SEC, OFFER_LEASE_SEC, RUNNER_STALE_SEC } from './db';
+import { leaseSecOf, OFFER_LEASE_SEC, RUNNER_STALE_SEC } from './db';
 
 // ---------------------------------------------------------------- Branches, Auslieferung, Prompt
 
@@ -214,6 +215,28 @@ async function promptContext(tx: Tx, task: Row, project: Row, role: Role): Promi
 	};
 }
 
+/**
+ * Zwischenstand, auf dem ein Lauf fortsetzt: der jüngste zuvor gestartete Lauf des Auftrags (seit dem letzten
+ * Neustart), sofern er übergeben bzw. verloren wurde (`cancelled`/`lost`) und einen WIP-Ref hinterlassen hat
+ * (Übergabe oder Checkpoint). Ein späterer gestarteter Lauf ohne WIP verdrängt ihn – dessen Stand liegt auf dem
+ * Branch. Nur für schreibende Rollen.
+ */
+export async function wipSourceOf(tx: Tx, run: Row, task: Row): Promise<Row | null> {
+	if (READ_ONLY_ROLES.includes(effectiveRole(task))) return null;
+	const prev = await oneOf(
+		tx,
+		sql`SELECT r.id, r.status, r.wip_ref, r.wip_sha, r.handoff, r.error_kind, rn.name AS runner_name
+			FROM run r JOIN task t ON t.id = r.task_id LEFT JOIN runner rn ON rn.id = r.runner_id
+			WHERE r.task_id = ${run.task_id} AND r.id <> ${run.id} AND r.started_at IS NOT NULL
+				AND r.created_at < ${run.created_at}
+				AND t.started_at IS NOT NULL AND r.started_at >= t.started_at
+			ORDER BY r.created_at DESC LIMIT 1`
+	);
+	if (!prev || !str(prev.wip_sha) || !str(prev.wip_ref)) return null;
+	if (prev.status !== 'cancelled' && prev.status !== 'lost') return null;
+	return prev;
+}
+
 /** Angebot eines Laufs aus der Datenbank (auch für `GET /runner/pending` und erneutes Senden) */
 export async function buildOffer(
 	tx: Tx,
@@ -228,6 +251,20 @@ export async function buildOffer(
 	if (!task || !project || !account) return null;
 	const role = effectiveRole(task);
 	const ctx = await promptContext(tx, task, project, role);
+	const runner = run.runner_id
+		? await oneOf(tx, sql`SELECT * FROM runner WHERE id = ${run.runner_id}`)
+		: null;
+	const caps = jsonOf<Record<string, unknown>>(runner?.capabilities, {});
+	// Zwischenstand eines übergebenen/verlorenen Vorläufers (nur an Runner, die ihn wiederherstellen können)
+	const wip = caps.wip === true ? await wipSourceOf(tx, run, task) : null;
+	if (wip) {
+		const h = jsonOf<{ reason?: string; note?: string | null } | null>(wip.handoff, null);
+		const reason =
+			h?.reason === 'suspend' || h?.reason === 'shutdown' || h?.reason === 'manual'
+				? h.reason
+				: 'connection';
+		ctx.handoff = { reason, note: h?.note ?? null };
+	}
 	// eigene und geerbte Anhänge (Elternkette); der Runner lädt die Bytes über `/runner/runs/:id/attachments/:aid`
 	const files = uniqueAttachmentNames(
 		(await effectiveAttachmentRows(tx, [String(task.id)])).get(String(task.id)) ?? []
@@ -271,7 +308,17 @@ export async function buildOffer(
 		// ältere Angebote ohne Anhänge enthalten das Feld nicht
 		...(files.length ? { attachments: files.map(attachmentOffer) } : {}),
 		delivery: ctx.delivery,
-		leaseSec: LEASE_SEC,
+		...(run.fence === null || run.fence === undefined ? {} : { fence: num(run.fence) }),
+		...(wip
+			? {
+					resumeWip: {
+						ref: String(wip.wip_ref),
+						sha: String(wip.wip_sha),
+						fromRunner: clip(str(wip.runner_name) ?? '', 80)
+					}
+				}
+			: {}),
+		leaseSec: leaseSecOf(runner),
 		timeoutSec: settings.limits.runTimeoutMin * 60
 	};
 }
@@ -459,12 +506,18 @@ async function dispatchIn(tx: Tx, fx: Effects, settings: AidevSettings): Promise
 		if (claimed) continue;
 		const runId = crypto.randomUUID();
 		const attempt = num(task.attempts) + 1;
+		// Fencing: jedes Angebot erhöht das Token des Auftrags; ältere Läufe (z. B. auf einem PC im Standby) verlieren
+		// damit jede Berechtigung für Meldungen und Pushes
+		const epoch = await oneOf(
+			tx,
+			sql`UPDATE task SET lease_epoch = lease_epoch + 1 WHERE id = ${task.id} RETURNING lease_epoch`
+		);
 		await tx.execute(
 			sql`INSERT INTO run (id, task_id, project_id, attempt, runner_id, account_id, provider, model,
-					status, lease_expires_at, branch)
+					status, lease_expires_at, branch, fence)
 				VALUES (${runId}, ${task.id}, ${task.project_id}, ${attempt}, ${a.runnerId}, ${a.accountId},
 					${a.provider}, ${a.model ?? ''}, 'offered',
-					now() + ${OFFER_LEASE_SEC}::int * interval '1 second', ${plan.branch})`
+					now() + ${OFFER_LEASE_SEC}::int * interval '1 second', ${plan.branch}, ${num(epoch?.lease_epoch)})`
 		);
 		const writes = !READ_ONLY_ROLES.includes(effectiveRole(task));
 		await tx.execute(
@@ -480,6 +533,12 @@ async function dispatchIn(tx: Tx, fx: Effects, settings: AidevSettings): Promise
 		);
 		const run = await oneOf(tx, sql`SELECT * FROM run WHERE id = ${runId}`);
 		const offer = run ? await buildOffer(tx, run, settings) : null;
+		// Fortsetzung eines Zwischenstands im Verlauf festhalten („übernommen von …“)
+		if (run && offer?.resumeWip) {
+			const source = await wipSourceOf(tx, run, task);
+			if (source)
+				await tx.execute(sql`UPDATE run SET resumed_from = ${source.id} WHERE id = ${runId}`);
+		}
 		if (offer) {
 			sendCommand(fx, a.runnerId, { type: 'offer', offer });
 			offers++;

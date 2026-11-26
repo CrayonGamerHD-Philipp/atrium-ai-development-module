@@ -5,13 +5,13 @@
  * (inkl. Limit-Analyse aus `limits.ts`) für die Oberfläche.
  */
 import { sql, type SQL } from 'drizzle-orm';
-import { num, rowsOf, toIso, type Row } from '$lib/sdk/server';
+import { num, rowsOf, str, toIso, type Row } from '$lib/sdk/server';
 import type { Tx } from './db';
 import { analyzeLimits, parseSnapshot, reportedUtil, rejectedUntil } from './limits';
 import { loadLimitSamples } from './limits.service';
 import { accountDto, runnerDto, runSummaryDto } from './mappers';
 import type { Provider } from './protocol';
-import { utilization, weekStartOf, type AccountState } from './scheduler';
+import { runnerPriorityOf, utilization, weekStartOf, type AccountState } from './scheduler';
 import type { AccountDto, OverviewDto, RunnerDto } from './schemas';
 
 const FIVE_HOURS_MS = 5 * 3600 * 1000;
@@ -41,6 +41,7 @@ export async function loadAccountViews(
 		tx,
 		sql`SELECT a.*, rn.name AS runner_name, rn.online AS runner_online, rn.status AS runner_status,
 				rn.max_slots AS runner_max_slots, rn.draining AS runner_draining,
+				COALESCE(rn.kind_override, rn.kind) AS runner_kind, rn.priority AS runner_priority,
 				(SELECT count(*) FROM run r WHERE r.account_id = a.id AND r.status IN ('offered', 'running')) AS running,
 				(SELECT count(*) FROM run r WHERE r.runner_id = a.runner_id AND r.status IN ('offered', 'running')) AS runner_active,
 				(SELECT COALESCE(sum(u.units), 0) FROM usage_ledger u
@@ -104,7 +105,14 @@ export async function loadAccountViews(
 			contextK: num(r.context_k),
 			defaultModel: String(r.default_model ?? ''),
 			reported: reportedUtil(snapshot, now),
-			rejectedUntil: rejectedUntil(snapshot, now)
+			rejectedUntil: rejectedUntil(snapshot, now),
+			// PC-Runner (`desktop`) vor Server-Runnern, sofern die Verwaltung nichts anderes vorgibt
+			runnerPriority: runnerPriorityOf(
+				str(r.runner_kind),
+				r.runner_priority === null || r.runner_priority === undefined
+					? null
+					: num(r.runner_priority)
+			)
 		};
 		const u = utilization(state);
 		const dto = accountDto(
@@ -130,7 +138,18 @@ export async function loadAccountDtos(tx: Tx, where?: SQL): Promise<AccountDto[]
 export async function loadRunnerDtos(tx: Tx, where: SQL = sql`TRUE`): Promise<RunnerDto[]> {
 	const rows = await rowsOf(
 		tx,
-		sql`SELECT * FROM runner WHERE ${where} ORDER BY lower(name), created_at`
+		sql`SELECT rn.*,
+				(SELECT count(*) FROM run r WHERE r.runner_id = rn.id AND r.handoff IS NOT NULL
+					AND r.created_at > now() - interval '7 days') AS handed_over,
+				(SELECT count(*) FROM run r WHERE r.runner_id = rn.id AND r.created_at > now() - interval '7 days'
+					AND (r.resumed_from IS NOT NULL OR EXISTS (
+						SELECT 1 FROM run p WHERE p.task_id = r.task_id AND p.created_at < r.created_at
+							AND p.runner_id IS DISTINCT FROM r.runner_id
+							AND (p.handoff IS NOT NULL OR (p.status = 'lost' AND p.error_kind = 'connection'))
+							AND NOT EXISTS (SELECT 1 FROM run q WHERE q.task_id = r.task_id
+								AND q.created_at > p.created_at AND q.created_at < r.created_at
+								AND q.started_at IS NOT NULL)))) AS taken_over
+			FROM runner rn WHERE ${where} ORDER BY lower(rn.name), rn.created_at`
 	);
 	if (!rows.length) return [];
 	const accounts = await loadAccountDtos(tx);

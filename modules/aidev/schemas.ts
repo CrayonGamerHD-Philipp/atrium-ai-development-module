@@ -3,6 +3,7 @@
  * Live-Ereignisse. Reine Datei ohne Server-Importe (Client + Server). Endpunkte: siehe `API` unten.
  */
 import { z } from 'zod';
+import type { RunHandoverDto, RunnerStateValue } from './handover';
 import type { StoredChatAction } from './actions';
 import {
 	commitPolicySchema,
@@ -313,7 +314,13 @@ export const liveQuery = z.object({
 export const runnerPatch = z.object({
 	name: z.string().trim().min(1).max(80).optional(),
 	status: z.enum(['approved', 'disabled']).optional(),
-	maxSlots: z.number().int().min(0).max(64).optional()
+	maxSlots: z.number().int().min(0).max(64).optional(),
+	/** Art festlegen (`null` = wie vom Runner gemeldet) */
+	kind: z.enum(['server', 'desktop']).nullable().optional(),
+	/** Vorrang (höher = zuerst; `null` = automatisch: PC 10, Server 0) */
+	priority: z.number().int().min(-100).max(100).nullable().optional(),
+	/** Heartbeat-Zeitlimit laufender Läufe in Sekunden (`null` = Standard: PC 60, Server 90) */
+	leaseSec: z.number().int().min(30).max(900).nullable().optional()
 });
 export const accountPatch = z.object({
 	label: z.string().trim().max(120).optional(),
@@ -464,6 +471,10 @@ export interface RunDto extends RunSummaryDto {
 	units: number;
 	createdAt: string;
 	commits: CommitDto[];
+	/** Übergabe dieses Laufs an den nächsten (Standby, Herunterfahren, manuell, Verbindungsverlust) */
+	handover: RunHandoverDto | null;
+	/** Lauf, dessen Zwischenstand (WIP) dieser Lauf fortsetzt */
+	resumedFrom: string | null;
 }
 
 export interface CommitDto {
@@ -537,6 +548,9 @@ export interface RunnerDto {
 		attachments?: boolean;
 		branchDelivery?: boolean;
 		prUpdate?: boolean;
+		handoff?: boolean;
+		fencing?: boolean;
+		wip?: boolean;
 		git?: boolean;
 		gh?: boolean;
 		pty?: boolean;
@@ -544,7 +558,42 @@ export interface RunnerDto {
 	};
 	createdAt: string;
 	accounts: AccountDto[];
+	/** Wirksame Art (Vorgabe der Verwaltung, sonst gemeldet) */
+	kind: 'server' | 'desktop';
+	/** Vom Runner gemeldete Art */
+	reportedKind: 'server' | 'desktop';
+	/** Art von der Verwaltung festgelegt */
+	kindOverride: 'server' | 'desktop' | null;
+	/** Wirksamer Vorrang und Vorgabe der Verwaltung (`null` = automatisch) */
+	priority: number;
+	priorityOverride: number | null;
+	/** Wirksames Heartbeat-Zeitlimit (s) und Vorgabe der Verwaltung (`null` = Standard nach Art) */
+	leaseSec: number;
+	leaseSecOverride: number | null;
+	/** Zuletzt gemeldete Protokollversion (`null` = vor Migration 0012 angemeldet) */
+	protocol: number | null;
+	/** Anzeige-Zustand, siehe `runnerStateOf` */
+	state: RunnerState;
+	/** Laufende bzw. letzte Übergabe */
+	handoverReason: 'suspend' | 'shutdown' | 'manual' | null;
+	handoverAt: string | null;
+	returnedAt: string | null;
+	/** Läufe der letzten 7 Tage, die dieser Runner übergeben bzw. von einem anderen übernommen hat */
+	handedOver: number;
+	takenOver: number;
+	/** Neuere Runner-Version verfügbar (Version des mit dem Modul ausgelieferten Runners) */
+	latestVersion: string;
+	updateAvailable: boolean;
+	/** Protokoll des Runners passt nicht (älter als das von Atrium) */
+	protocolOutdated: boolean;
 }
+
+/**
+ * Anzeige-Zustand eines Runners: `active` (online), `handover` (übergibt gerade), `standby` (nach Übergabe wegen
+ * Standby nicht erreichbar), `offline`, `returned` (kürzlich aus Standby/offline zurück), `pending`/`disabled`
+ * (Freigabe) – siehe `runnerStateOf` (`handover.ts`)
+ */
+export type RunnerState = RunnerStateValue;
 
 export interface AccountDto {
 	id: string;

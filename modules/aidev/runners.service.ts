@@ -4,12 +4,14 @@
  */
 import { sql } from 'drizzle-orm';
 import { errors, inList, rowsOf, str, type RequestContext } from '$lib/sdk/server';
-import { jsonb, LEASE_SEC, mdb, oneOf, type Row, type Tx } from './db';
+import { jsonb, leaseSecOf, mdb, oneOf, runnerKindOf, type Row, type Tx } from './db';
 import { newEffects, sendCommand, type Effects } from './effects';
 import {
 	PROTOCOL_VERSION,
 	type HeartbeatInput,
 	type HeartbeatResult,
+	type LeasesInput,
+	type LeasesResult,
 	type RegisterInput,
 	type RegisterResult
 } from './protocol';
@@ -17,7 +19,8 @@ import { publish } from './publish.service';
 import { rejectAllRpc } from './rpc.service';
 import { loseRun } from './runs.service';
 import { storeLimitSnapshot } from './limits.service';
-import { HEARTBEAT_SEC } from './db';
+import { HEARTBEAT_SEC, RUNNER_STALE_SEC } from './db';
+import { leaseProblem } from './leases';
 
 /** API-Key des aufrufenden Runners (nur technische Konten per API-Key) */
 export function runnerKeyOf(ctx: RequestContext): string {
@@ -59,15 +62,17 @@ export async function registerRunner(
 		);
 	}
 	const key = runnerKeyOf(ctx);
+	// ältere Runner melden keine Art → Server-Runner
+	const kind = input.kind ?? 'server';
 	let runner = await oneOf(tx, sql`SELECT * FROM runner WHERE api_key_id = ${key} FOR UPDATE`);
 	if (!runner) {
 		const id = crypto.randomUUID();
 		runner = await oneOf(
 			tx,
 			sql`INSERT INTO runner (id, name, api_key_id, status, version, capabilities, max_slots,
-					reported_max_slots, last_seen_at)
+					reported_max_slots, last_seen_at, kind, protocol)
 				VALUES (${id}, ${input.name}, ${key}, 'pending', ${input.version}, ${jsonb(input.capabilities)},
-					${input.maxSlots}, ${input.maxSlots}, now())
+					${input.maxSlots}, ${input.maxSlots}, now(), ${kind}, ${input.protocol})
 				ON CONFLICT (api_key_id) DO NOTHING
 				RETURNING *`
 		);
@@ -75,7 +80,12 @@ export async function registerRunner(
 		fx.audits.push({
 			action: 'aidev.runner.registered',
 			target: id,
-			metadata: { name: input.name, version: input.version, accounts: input.accounts.length }
+			metadata: {
+				name: input.name,
+				version: input.version,
+				accounts: input.accounts.length,
+				kind
+			}
 		});
 	} else {
 		// geändertes MAX_SLOTS des Runners übernehmen; ein von der Verwaltung gesetzter Wert bleibt,
@@ -87,6 +97,10 @@ export async function registerRunner(
 			tx,
 			sql`UPDATE runner SET name = ${input.name}, version = ${input.version},
 					capabilities = ${jsonb(input.capabilities)}, last_seen_at = now(), draining = false,
+					kind = ${kind}, protocol = ${input.protocol},
+					returned_at = CASE WHEN handover_reason IS NOT NULL OR last_seen_at < now() - ${RUNNER_STALE_SEC}::int * interval '1 second'
+						THEN now() ELSE returned_at END,
+					handover_reason = NULL,
 					max_slots = ${slotsChanged ? input.maxSlots : Number(runner.max_slots)},
 					reported_max_slots = ${input.maxSlots}
 				WHERE id = ${runner.id} RETURNING *`
@@ -116,7 +130,10 @@ export async function registerRunner(
 	return {
 		runnerId,
 		status: String(runner!.status) as RegisterResult['status'],
-		heartbeatSec: HEARTBEAT_SEC
+		heartbeatSec: HEARTBEAT_SEC,
+		leaseSec: leaseSecOf(runner),
+		features: { handoff: true, fencing: true, checkpoints: true },
+		kind: runnerKindOf(runner)
 	};
 }
 
@@ -167,17 +184,33 @@ export async function heartbeat(
 	const runner = await requireRunner(tx, ctx, { allowDisabled: true, forUpdate: true });
 	const status = String(runner.status) as HeartbeatResult['status'];
 	const runnerId = String(runner.id);
+	const handover = input.handover ?? null;
+	// Übergabe läuft → wie `draining` keine neuen Angebote. Ein Heartbeat ohne `handover` nach einer Übergabe oder
+	// nach längerer Funkstille (PC aus dem Standby zurück) beendet sie und vermerkt die Rückkehr (`returned_at`).
 	await tx.execute(
 		sql`UPDATE runner SET last_seen_at = now(), online = ${status !== 'disabled'},
-				slots_used = ${input.slotsUsed}, draining = ${input.draining === true}
+				slots_used = ${input.slotsUsed}, draining = ${input.draining === true || handover !== null},
+				returned_at = CASE WHEN ${handover}::text IS NULL AND (handover_reason IS NOT NULL
+						OR last_seen_at < now() - ${RUNNER_STALE_SEC}::int * interval '1 second')
+					THEN now() ELSE returned_at END,
+				handover_at = CASE WHEN ${handover}::text IS NOT NULL AND handover_reason IS NULL
+					THEN now() ELSE handover_at END,
+				handover_reason = ${handover}
 			WHERE id = ${runnerId}`
 	);
+	if (handover && !runner.handover_reason) {
+		fx.audits.push({
+			action: 'aidev.runner.handover',
+			target: runnerId,
+			metadata: { name: String(runner.name), reason: handover, runs: input.runIds.length }
+		});
+	}
 	const reported = [...new Set(input.runIds)];
 	let keep = new Set<string>();
 	if (reported.length && status !== 'disabled') {
 		const rows = await rowsOf(
 			tx,
-			sql`UPDATE run r SET lease_expires_at = now() + ${LEASE_SEC}::int * interval '1 second'
+			sql`UPDATE run r SET lease_expires_at = now() + ${leaseSecOf(runner)}::int * interval '1 second'
 				FROM task t
 				WHERE r.task_id = t.id AND r.id IN (${inList(reported)}) AND r.runner_id = ${runnerId}
 					AND r.status = 'running' AND t.status NOT IN ('cancelled', 'done', 'failed')
@@ -255,18 +288,37 @@ export interface RunnerPatchResult {
 	changedStatus: 'approved' | 'disabled' | null;
 }
 
+export interface RunnerPatchInput {
+	name?: string;
+	status?: 'approved' | 'disabled';
+	maxSlots?: number;
+	/** Art festlegen; `null` = wie vom Runner gemeldet, fehlend = unverändert */
+	kind?: 'server' | 'desktop' | null;
+	/** Vorrang; `null` = automatisch nach Art, fehlend = unverändert */
+	priority?: number | null;
+	/** Heartbeat-Zeitlimit laufender Läufe (s); `null` = Standard nach Art, fehlend = unverändert */
+	leaseSec?: number | null;
+}
+
+/** Wert für eine optionale Spalte: `undefined` = unverändert lassen */
+const keep = (column: string, v: unknown) =>
+	v === undefined ? sql.raw(column) : sql`${v as string | number | null}`;
+
 export async function patchRunner(
 	tx: Tx,
 	fx: Effects,
 	id: string,
-	patch: { name?: string; status?: 'approved' | 'disabled'; maxSlots?: number }
+	patch: RunnerPatchInput
 ): Promise<RunnerPatchResult> {
 	const runner = await oneOf(tx, sql`SELECT * FROM runner WHERE id = ${id} FOR UPDATE`);
 	if (!runner) throw errors.notFound('Runner nicht gefunden');
 	await tx.execute(
 		sql`UPDATE runner SET name = ${patch.name ?? String(runner.name)},
 				status = ${patch.status ?? String(runner.status)},
-				max_slots = ${patch.maxSlots ?? Number(runner.max_slots)}
+				max_slots = ${patch.maxSlots ?? Number(runner.max_slots)},
+				kind_override = ${keep('kind_override', patch.kind)},
+				priority = ${keep('priority', patch.priority)},
+				lease_sec = ${keep('lease_sec', patch.leaseSec)}
 			WHERE id = ${id}`
 	);
 	const changed = patch.status && patch.status !== runner.status ? patch.status : null;
@@ -307,4 +359,35 @@ export async function deleteRunner(tx: Tx, fx: Effects, id: string): Promise<voi
 	});
 	fx.overview = true;
 	fx.dispatch = true;
+}
+
+/**
+ * Lease-Prüfung (`POST /runner/leases`): je gemeldetem Lauf, ob er noch diesem Runner gehört, angeboten bzw.
+ * laufend ist, seine Lease nicht abgelaufen ist und das Fencing-Token (`fence`, falls gemeldet) dem aktuellen
+ * Token des Auftrags entspricht. Reine Leseabfrage – sie verlängert nichts.
+ */
+export async function checkLeases(
+	tx: Tx,
+	runnerId: string,
+	input: LeasesInput
+): Promise<LeasesResult> {
+	const ids = [...new Set(input.runs.map((r) => r.runId))];
+	if (!ids.length) return { valid: [], revoked: [] };
+	const rows = await rowsOf(
+		tx,
+		sql`SELECT r.id, r.status, r.runner_id, r.fence, r.lease_expires_at < now() AS expired,
+				t.lease_epoch, t.status AS task_status
+			FROM run r JOIN task t ON t.id = r.task_id
+			WHERE r.id IN (${inList(ids)})`
+	);
+	const byId = new Map(rows.map((r) => [String(r.id), r]));
+	const valid: string[] = [];
+	const revoked: LeasesResult['revoked'] = [];
+	for (const { runId, fence } of input.runs) {
+		if (valid.includes(runId) || revoked.some((r) => r.runId === runId)) continue;
+		const reason = leaseProblem(byId.get(runId) ?? null, runnerId, fence);
+		if (reason) revoked.push({ runId, reason });
+		else valid.push(runId);
+	}
+	return { valid, revoked };
 }

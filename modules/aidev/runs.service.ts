@@ -10,17 +10,28 @@
  */
 import { sql } from 'drizzle-orm';
 import { errors, inList, num, rowsOf, str, toIso, type Row } from '$lib/sdk/server';
-import { clip, jsonb, LEASE_SEC, MAX_CONNECTION_RETRIES, oneOf, type Tx } from './db';
+import {
+	clip,
+	jsonb,
+	leaseSecOf,
+	MAX_CONNECTION_RETRIES,
+	oneOf,
+	runnerKindOf,
+	type Tx
+} from './db';
 import { sendCommand, type Effects } from './effects';
 import { storeLimitSnapshot } from './limits.service';
 import { extractPlan } from './prompts';
 import {
 	MAX_EVENT_TEXT,
+	type CheckpointInput,
 	type FinishInput,
+	type Handoff,
 	type LimitInput,
 	type RunEvent,
 	type UsageInput
 } from './protocol';
+import { fenceProblem } from './leases';
 import { backoffMs, calibrateBudget, unitsOf, weekStartOf } from './scheduler';
 import type { Limits } from './schemas';
 import {
@@ -38,8 +49,46 @@ import {
 	type StoredPlan
 } from './tasks.service';
 
-const LEASE = sql`now() + ${LEASE_SEC}::int * interval '1 second'`;
 const ACTIVE = ['offered', 'running'];
+
+/** Neues Lease-Ende eines laufenden Laufs mit der wirksamen Lease des Runners (`leaseSecOf`, PC-Runner kürzer) */
+async function leaseOf(tx: Tx, runnerId: string) {
+	const runner = await oneOf(
+		tx,
+		sql`SELECT kind, kind_override, lease_sec FROM runner WHERE id = ${runnerId}`
+	);
+	return sql`now() + ${leaseSecOf(runner)}::int * interval '1 second'`;
+}
+
+/** Anzeigenamen der Übergabe-Anlässe (Auftragsverlauf) */
+export const HANDOFF_REASON_LABELS: Record<Handoff['reason'] | 'connection', string> = {
+	suspend: 'Standby',
+	shutdown: 'Herunterfahren',
+	manual: 'manuelle Übergabe',
+	connection: 'Verbindungsverlust'
+};
+
+/** Meldung am Auftrag nach einer Übergabe (wird sofort auf einem anderen Runner neu eingeplant) */
+export function handoffMessage(
+	runnerName: string,
+	kind: string,
+	reason: Handoff['reason']
+): string {
+	const who = `${kind === 'desktop' ? 'PC-Runner' : 'Runner'} „${runnerName}“`;
+	return `Übergeben von ${who} (Grund: ${HANDOFF_REASON_LABELS[reason]}) – wird auf einem anderen Runner fortgesetzt`;
+}
+
+/**
+ * Fencing (Runner mit `capabilities.fencing` senden `fence` mit): Meldungen zu einem übernommenen (`lost`) Lauf
+ * oder mit veraltetem Token werden mit 409 abgelehnt – ein aufgewachter PC kann so nichts mehr übernehmen lassen.
+ */
+async function assertFence(tx: Tx, run: Row, fence: number | undefined): Promise<void> {
+	if (fence === undefined) return;
+	if (run.status === 'lost') throw errors.conflict('Lauf wurde übernommen – Meldung verworfen');
+	const task = await oneOf(tx, sql`SELECT lease_epoch FROM task WHERE id = ${run.task_id}`);
+	const problem = fenceProblem({ ...run, lease_epoch: task?.lease_epoch ?? null }, fence);
+	if (problem) throw errors.conflict(`${problem} – Meldung verworfen`);
+}
 
 /** Lauf dieses Runners (fremde/unbekannte → 404) */
 export async function ownRun(tx: Tx, runnerId: string, runId: string): Promise<Row> {
@@ -215,7 +264,7 @@ export async function acceptRun(tx: Tx, fx: Effects, runnerId: string, runId: st
 		throw errors.conflict('Der Auftrag ist nicht mehr offen');
 	}
 	await tx.execute(
-		sql`UPDATE run SET status = 'running', started_at = now(), lease_expires_at = ${LEASE}
+		sql`UPDATE run SET status = 'running', started_at = now(), lease_expires_at = ${await leaseOf(tx, runnerId)}
 			WHERE id = ${run.id}`
 	);
 	await tx.execute(
@@ -268,9 +317,11 @@ export async function recordEvents(
 	runnerId: string,
 	runId: string,
 	events: RunEvent[],
-	limits: Limits
+	limits: Limits,
+	fence?: number
 ): Promise<{ run: Row; inserted: RunEvent[]; dropped: number }> {
 	const run = await ownRun(tx, runnerId, runId);
+	await assertFence(tx, run, fence);
 	const room = Math.max(0, limits.maxEventsPerRun - num(run.event_count));
 	const unique = [...new Map(events.map((e) => [e.seq, e])).values()].sort((a, b) => a.seq - b.seq);
 	const take = unique.slice(0, room);
@@ -305,7 +356,7 @@ export async function recordEvents(
 	await tx.execute(
 		sql`UPDATE run SET event_count = event_count + ${inserted.length},
 				event_bytes = event_bytes + ${bytes},
-				lease_expires_at = CASE WHEN status = 'running' THEN ${LEASE} ELSE lease_expires_at END
+				lease_expires_at = CASE WHEN status = 'running' THEN ${await leaseOf(tx, runnerId)} ELSE lease_expires_at END
 			WHERE id = ${run.id}`
 	);
 	return { run, inserted, dropped: unique.length - take.length };
@@ -420,11 +471,30 @@ export async function finishRun(
 	input: FinishInput
 ): Promise<{ ok: true; taskStatus: string | null }> {
 	const run = await ownRun(tx, runnerId, runId);
+	await assertFence(tx, run, input.fence);
 	if (!ACTIVE.includes(String(run.status))) {
 		// schon abgeschlossen (Wiederholung des Runners) – nichts mehr ändern
 		const t = await getTask(tx, String(run.task_id));
 		return { ok: true, taskStatus: t ? String(t.status) : null };
 	}
+	// Übergabe (nur mit `cancelled`, siehe `finishInput`): Infos für Verlauf und nächsten Lauf festhalten
+	const handoff = input.status === 'cancelled' ? (input.handoff ?? null) : null;
+	const runner = handoff
+		? await oneOf(tx, sql`SELECT name, kind, kind_override FROM runner WHERE id = ${runnerId}`)
+		: null;
+	const wip =
+		handoff?.wipPushed && handoff.wipRef === `refs/aidev/wip/${String(run.id)}` && handoff.headSha
+			? { ref: handoff.wipRef, sha: handoff.headSha }
+			: null;
+	const handoffInfo = handoff
+		? {
+				reason: handoff.reason,
+				wipPushed: !!wip,
+				note: handoff.note,
+				runnerName: str(runner?.name) ?? '',
+				runnerKind: runnerKindOf(runner)
+			}
+		: null;
 	await tx.execute(
 		sql`UPDATE run SET status = ${input.status}, finished_at = now(), lease_expires_at = NULL,
 				session_id = COALESCE(${input.sessionId}, session_id),
@@ -433,6 +503,9 @@ export async function finishRun(
 				summary = ${input.summary},
 				error_kind = ${input.errorKind},
 				error_message = ${input.errorMessage},
+				handoff = ${handoffInfo ? jsonb(handoffInfo) : sql`handoff`},
+				wip_ref = ${wip ? wip.ref : sql`wip_ref`},
+				wip_sha = ${wip ? wip.sha : sql`wip_sha`},
 				started_at = COALESCE(started_at, now())
 			WHERE id = ${run.id}`
 	);
@@ -507,8 +580,12 @@ export async function finishRun(
 			await tx.execute(
 				sql`UPDATE task SET attempts = GREATEST(attempts - 1, 0) WHERE id = ${task.id}`
 			);
+			// Übergabe: zählt nicht als Fehlversuch und wird sofort neu eingeplant (`fx.dispatch`); der PC-Runner
+			// meldet `handover` und bekommt bis zu seiner Rückkehr nichts Neues
 			await transition(tx, fx, String(task.id), 'queued', {
-				error: input.errorMessage ?? 'Lauf abgebrochen – wird neu eingeplant'
+				error: handoffInfo
+					? handoffMessage(handoffInfo.runnerName, handoffInfo.runnerKind, handoffInfo.reason)
+					: (input.errorMessage ?? 'Lauf abgebrochen – wird neu eingeplant')
 			});
 			break;
 	}
@@ -595,4 +672,32 @@ async function fail(tx: Tx, fx: Effects, task: Row, run: Row, input: FinishInput
 		await excludeAccount(tx, String(task.id), String(run.account_id));
 	}
 	await failAttempt(tx, fx, task, message);
+}
+
+// ---------------------------------------------------------------- WIP-Checkpoints
+
+/**
+ * WIP-Checkpoint eines laufenden Laufs merken (`POST /runner/runs/:id/checkpoint`). Nur der eigene Ref des Laufs
+ * (`refs/aidev/wip/<runId>`) wird angenommen; ein übernommener Lauf bzw. veraltetes Token → 409. Verlängert die Lease.
+ */
+export async function recordCheckpoint(
+	tx: Tx,
+	fx: Effects,
+	runnerId: string,
+	runId: string,
+	input: CheckpointInput
+): Promise<{ ok: true }> {
+	const run = await ownRun(tx, runnerId, runId);
+	await assertFence(tx, run, input.fence);
+	if (run.status !== 'running') throw errors.conflict('Der Lauf läuft nicht mehr');
+	if (input.ref !== `refs/aidev/wip/${String(run.id)}`) {
+		throw errors.badRequest('WIP-Ref gehört nicht zu diesem Lauf');
+	}
+	await tx.execute(
+		sql`UPDATE run SET wip_ref = ${input.ref}, wip_sha = ${input.sha},
+				lease_expires_at = ${await leaseOf(tx, runnerId)}
+			WHERE id = ${run.id}`
+	);
+	fx.runs.add(runId);
+	return { ok: true };
 }

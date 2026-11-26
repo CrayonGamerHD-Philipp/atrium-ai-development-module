@@ -1,11 +1,13 @@
 /** Lesende Abfragen, die DTOs zusammensetzen (Aufträge, Läufe, Projekte, Pull Requests, Chat). Nur Datenbank. */
 import { sql, type SQL } from 'drizzle-orm';
+import { handoversOf } from './handover';
 import { inList, num, rowsOf, type Row } from '$lib/sdk/server';
 import { chatAttachmentsOf, taskAttachmentsOf } from './attachments.service';
 import { oneOf, type Tx } from './db';
 import {
 	chatDto,
 	commitDto,
+	handoverRunOf,
 	EMPTY_COUNTS,
 	prDto,
 	projectDto,
@@ -26,7 +28,8 @@ import type {
 } from './schemas';
 
 /** Lauf mit Konto- und Runner-Namen */
-export const RUN_SELECT = sql`SELECT r.*, a.label AS account_label, a.key AS account_key, rn.name AS runner_name
+export const RUN_SELECT = sql`SELECT r.*, a.label AS account_label, a.key AS account_key, rn.name AS runner_name,
+		COALESCE(rn.kind_override, rn.kind) AS runner_kind
 	FROM run r
 	LEFT JOIN provider_account a ON a.id = r.account_id
 	LEFT JOIN runner rn ON rn.id = r.runner_id`;
@@ -161,8 +164,13 @@ export async function loadTaskDetail(tx: Tx, task: Row): Promise<TaskDetailDto> 
 					ORDER BY created_at, sha`
 			)
 		: [];
+	const handovers = handoversOf(runRows.map(handoverRunOf));
 	const runs: RunDto[] = runRows.map((r) =>
-		runDto(r, commitRows.filter((c) => String(c.run_id) === String(r.id)).map(commitDto))
+		runDto(
+			r,
+			commitRows.filter((c) => String(c.run_id) === String(r.id)).map(commitDto),
+			handovers.get(String(r.id)) ?? null
+		)
 	);
 	const children = await taskDtosOf(
 		tx,

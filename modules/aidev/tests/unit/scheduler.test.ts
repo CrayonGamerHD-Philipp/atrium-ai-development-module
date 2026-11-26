@@ -12,6 +12,7 @@ import {
 	calibrateBudget,
 	findCycle,
 	planAssignments,
+	runnerPriorityOf,
 	scoreAccount,
 	unitsOf,
 	utilization,
@@ -45,6 +46,7 @@ function account(over: Partial<AccountState> = {}): AccountState {
 		weekStart: NOW - WEEK_MS / 2,
 		contextK: 200,
 		defaultModel: '',
+		runnerPriority: 0,
 		...over
 	};
 }
@@ -599,5 +601,156 @@ describe('gemeldete Limits', () => {
 		expect(accountAvailable(account({ rejectedUntil: rejectedUntil(fresh, NOW) }), NOW)).toBe(
 			false
 		);
+	});
+});
+
+describe('Runner-Vorrang (PC vor Server)', () => {
+	// Server-Konto mit deutlich besserer Punktzahl (leer), PC-Konto stark ausgelastet, aber geeignet
+	const server = () => account({ id: 'acc-srv', runnerId: 'srv', runnerPriority: 0 });
+	const desktop = (over: Partial<AccountState> = {}) =>
+		account({
+			id: 'acc-pc',
+			runnerId: 'pc',
+			runnerPriority: runnerPriorityOf('desktop', null),
+			budget5h: 100,
+			used5h: 80,
+			running: 1,
+			...over
+		});
+
+	it('wirksamer Vorrang: Vorgabe der Verwaltung, sonst nach Art', () => {
+		expect(runnerPriorityOf('desktop', null)).toBe(10);
+		expect(runnerPriorityOf('server', null)).toBe(0);
+		expect(runnerPriorityOf(undefined, undefined)).toBe(0);
+		expect(runnerPriorityOf('desktop', -5)).toBe(-5);
+		expect(runnerPriorityOf('server', 20)).toBe(20);
+		expect(runnerPriorityOf('server', 0)).toBe(0);
+	});
+	it('PC-Konto mit freiem Slot schlägt das Server-Konto trotz schlechterer Punktzahl', () => {
+		const t = task();
+		expect(scoreAccount(t, server(), ROUTING, NOW)!.score).toBeGreaterThan(
+			scoreAccount(t, desktop(), ROUTING, NOW)!.score
+		);
+		const res = planAssignments(plan({ accounts: [server(), desktop()], tasks: [t] }));
+		expect(res.map((r) => r.accountId)).toEqual(['acc-pc']);
+	});
+	it.each([
+		['PC voll (keine freien Slots)', { runnerFreeSlots: 0 }],
+		['PC-Konto ausgelastet (Parallelität)', { running: 2 }],
+		['PC offline', { runnerOnline: false }],
+		// `loadAccountViews` setzt bei `draining` keine freien Slots
+		['PC wird beendet (draining)', { runnerFreeSlots: 0, running: 0 }]
+	] as [string, Partial<AccountState>][])('%s → Server übernimmt', (_, over) => {
+		const res = planAssignments(plan({ accounts: [server(), desktop(over)], tasks: [task()] }));
+		expect(res.map((r) => r.accountId)).toEqual(['acc-srv']);
+	});
+	it('PC-Konto für den Auftrag ausgeschlossen → Server übernimmt', () => {
+		const res = planAssignments(
+			plan({
+				accounts: [server(), desktop()],
+				tasks: [task({ excludedAccountIds: ['acc-pc'] })]
+			})
+		);
+		expect(res.map((r) => r.accountId)).toEqual(['acc-srv']);
+	});
+	it('PC-Slot belegt → weitere Aufträge gehen an den Server', () => {
+		const res = planAssignments(
+			plan({
+				accounts: [server(), desktop({ runnerFreeSlots: 1, running: 0 })],
+				tasks: [task({ id: 't1' }), task({ id: 't2', createdAt: 2000 })]
+			})
+		);
+		expect(res.map((r) => [r.taskId, r.accountId])).toEqual([
+			['t1', 'acc-pc'],
+			['t2', 'acc-srv']
+		]);
+	});
+	it('gleiche Stufe → bisherige Punktzahl entscheidet (inkl. Sitzungsbonus)', () => {
+		const a = desktop({ runnerPriority: 0 });
+		expect(planAssignments(plan({ accounts: [server(), a], tasks: [task()] }))[0]!.accountId).toBe(
+			'acc-srv'
+		);
+		const b = account({ id: 'acc-b', runnerId: 'srv2', running: 1 });
+		expect(
+			planAssignments(
+				plan({ accounts: [server(), b], tasks: [task({ sessionAccountId: 'acc-b' })] })
+			)[0]!.accountId
+		).toBe('acc-b');
+	});
+	it('explizite Priorität überschreibt die Art', () => {
+		const srv = account({
+			id: 'acc-srv',
+			runnerId: 'srv',
+			runnerPriority: runnerPriorityOf('server', 50)
+		});
+		const pc = desktop({ budget5h: 0, used5h: 0, running: 0 });
+		expect(planAssignments(plan({ accounts: [srv, pc], tasks: [task()] }))[0]!.accountId).toBe(
+			'acc-srv'
+		);
+		const pcLow = desktop({ runnerPriority: runnerPriorityOf('desktop', -1) });
+		expect(
+			planAssignments(plan({ accounts: [server(), pcLow], tasks: [task()] }))[0]!.accountId
+		).toBe('acc-srv');
+	});
+});
+
+describe('Übergabe PC → Server mit anderem Konto/Anbieter', () => {
+	// PC-Runner mit Claude, Server-Runner nur mit Codex
+	const pc = (over: Partial<AccountState> = {}) =>
+		account({ id: 'acc-pc', runnerId: 'pc', provider: 'claude', runnerPriority: 10, ...over });
+	const srvCodex = (over: Partial<AccountState> = {}) =>
+		account({ id: 'acc-srv', runnerId: 'srv', provider: 'codex', ...over });
+
+	it('PC übergibt (draining) → Server-Konto eines anderen Anbieters übernimmt, Modell aus dem Routing', () => {
+		const res = planAssignments(
+			plan({
+				accounts: [pc({ runnerFreeSlots: 0 }), srvCodex()],
+				tasks: [task({ sessionAccountId: 'acc-pc' })]
+			})
+		);
+		expect(res).toHaveLength(1);
+		expect(res[0]).toMatchObject({ accountId: 'acc-srv', provider: 'codex', model: null });
+	});
+	it('Rollen-Vorlieben gelten weiter: Anbieter mit Gewicht 0 übernimmt nicht', () => {
+		const gemini = account({ id: 'acc-gem', runnerId: 'srv', provider: 'gemini' });
+		const res = planAssignments(
+			plan({ accounts: [pc({ runnerOnline: false }), gemini], tasks: [task()] })
+		);
+		expect(res).toEqual([]);
+	});
+	it('Limits gelten weiter: ausgeschöpftes Server-Konto übernimmt nicht', () => {
+		const res = planAssignments(
+			plan({
+				accounts: [pc({ runnerOnline: false }), srvCodex({ budget5h: 100, used5h: 99 })],
+				tasks: [task()]
+			})
+		);
+		expect(res).toEqual([]);
+	});
+	it('Anbieter-Wunsch (providerHint) bleibt bindend', () => {
+		const res = planAssignments(
+			plan({
+				accounts: [pc({ runnerFreeSlots: 0 }), srvCodex()],
+				tasks: [task({ providerHint: 'claude' })]
+			})
+		);
+		expect(res).toEqual([]);
+	});
+	it('nach Verbindungsverlust gemiedener PC fällt hinter den Server zurück, bleibt aber Ausweg', () => {
+		const t = task({ avoidRunnerIds: ['pc'] });
+		const both = planAssignments(plan({ accounts: [pc(), srvCodex()], tasks: [t] }));
+		expect(both[0]!.accountId).toBe('acc-srv');
+		const alone = planAssignments(plan({ accounts: [pc()], tasks: [t] }));
+		expect(alone[0]!.accountId).toBe('acc-pc');
+	});
+	it('zurückgekehrter PC bekommt neue Aufträge, laufende bleiben auf dem Server (keine Verdrängung)', () => {
+		// Der Server-Lauf ist nicht Teil der Kandidaten (läuft schon); nur der neue Auftrag wird verteilt
+		const res = planAssignments(
+			plan({
+				accounts: [pc(), srvCodex({ running: 1 })],
+				tasks: [task({ id: 'neu' })]
+			})
+		);
+		expect(res.map((r) => [r.taskId, r.accountId])).toEqual([['neu', 'acc-pc']]);
 	});
 });

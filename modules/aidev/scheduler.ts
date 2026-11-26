@@ -2,6 +2,14 @@
  * Scheduler (reine Logik, keine Server-Importe): verteilt wartende Aufträge auf Anbieter-Konten der Runner.
  * Ziel: Abos gleichmäßig auslasten (5-h-Fenster und Woche), Rollen-Vorlieben beachten (Routing), Limits respektieren,
  * je Projekt höchstens `maxParallel` gleichzeitig. Aufgerufen von `scheduler.service.ts` unter einer Advisory-Sperre.
+ *
+ * Vorrang der Runner (`AccountState.runnerPriority`, siehe `runnerPriorityOf`): Je Auftrag wird zuerst unter den
+ * Konten der höchsten Vorrangstufe gewählt, die mindestens ein geeignetes Konto hat (`scoreAccount` ≠ null). Erst
+ * wenn dort keines geeignet ist (voll, offline, draining, ausgeschlossen …), kommt die nächste Stufe dran. Innerhalb
+ * einer Stufe entscheidet die Punktzahl (inkl. Sitzungs- und Projekt-Runner-Bonus). So entlasten PC-Runner
+ * (`desktop`, automatisch 10) die Server-Runner (automatisch 0). Ein bereits eingeplanter Lauf auf einem Server-Runner
+ * wird nicht verdrängt, wenn ein Runner höherer Stufe (wieder) online kommt (kein Hin- und Herspringen). Nach einem
+ * Verbindungsverlust gemiedene Runner/Konten (`avoidRunnerIds`/`avoidAccountIds`) zählen zur niedrigsten Stufe.
  */
 import type { Provider, Role } from './protocol';
 import type { Routing } from './schemas';
@@ -37,6 +45,8 @@ export interface AccountState {
 	reported?: { u5h: number | null; uWeek: number | null };
 	/** Ein Limit-Fenster meldet `rejected` bis zu dieser Zeit (ms) – wirkt wie eine Wartezeit */
 	rejectedUntil?: number | null;
+	/** Wirksamer Vorrang des Runners (höher = zuerst), siehe `runnerPriorityOf`; fehlend = 0 (Server) */
+	runnerPriority?: number;
 }
 
 export interface TaskCandidate {
@@ -105,6 +115,19 @@ export const PREFERRED_RUNNER_BONUS = 0.1;
  * damit jedes andere geeignete Konto vorgeht; ohne Alternative wird das gemiedene trotzdem gewählt.
  */
 export const LOST_CONNECTION_MALUS = 5;
+
+/** Automatischer Vorrang je Runner-Art (ohne Vorgabe der Verwaltung) */
+export const DESKTOP_PRIORITY = 10;
+export const SERVER_PRIORITY = 0;
+
+/** Wirksamer Vorrang: Vorgabe der Verwaltung, sonst nach Art (desktop 10, server/unbekannt 0) */
+export function runnerPriorityOf(
+	kind: string | null | undefined,
+	priority: number | null | undefined
+): number {
+	if (priority != null && Number.isFinite(priority)) return priority;
+	return kind === 'desktop' ? DESKTOP_PRIORITY : SERVER_PRIORITY;
+}
 
 /** Endliche Zahl oder 0 (NaN/±∞ → 0) */
 function num(n: number): number {
@@ -208,6 +231,13 @@ export function scoreAccount(
 	return { score, model };
 }
 
+/** Soll das Konto für den Auftrag nach einem Verbindungsverlust gemieden werden? */
+function avoided(task: TaskCandidate, account: AccountState): boolean {
+	return !!(
+		task.avoidRunnerIds?.includes(account.runnerId) || task.avoidAccountIds?.includes(account.id)
+	);
+}
+
 /** Sortierung der Aufgaben: Priorität absteigend, dann älteste zuerst, dann id (deterministisch). */
 function compareTasks(a: TaskCandidate, b: TaskCandidate): number {
 	if (a.priority !== b.priority) return b.priority - a.priority;
@@ -230,21 +260,29 @@ export function planAssignments(input: PlanInput): Assignment[] {
 		const project = projects.get(task.projectId);
 		if (project && project.running >= project.maxParallel) continue;
 
-		let best: { account: AccountState; score: number; model: string | null; load: number } | null =
-			null;
+		// höchste Vorrangstufe mit geeignetem Konto; innerhalb der Stufe Punktzahl, dann Auslastung, dann id
+		let best: {
+			account: AccountState;
+			score: number;
+			model: string | null;
+			load: number;
+			tier: number;
+		} | null = null;
 		for (const account of accounts) {
 			const s = scoreAccount(task, account, routing, now, project?.preferredRunnerId ?? null);
 			if (!s) continue;
+			// nach Verbindungsverlust gemiedene Runner/Konten fallen hinter jede Vorrangstufe zurück (bleiben Ausweg)
+			const tier = avoided(task, account) ? -Infinity : num(account.runnerPriority ?? 0);
 			const { u5h, uWeek } = utilization(account);
 			const load = Math.max(u5h, uWeek);
-			if (
+			const better =
 				!best ||
-				s.score > best.score ||
-				(s.score === best.score &&
-					(load < best.load || (load === best.load && account.id < best.account.id)))
-			) {
-				best = { account, score: s.score, model: s.model, load };
-			}
+				tier > best.tier ||
+				(tier === best.tier &&
+					(s.score > best.score ||
+						(s.score === best.score &&
+							(load < best.load || (load === best.load && account.id < best.account.id)))));
+			if (better) best = { account, score: s.score, model: s.model, load, tier };
 		}
 		if (!best) continue;
 

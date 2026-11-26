@@ -17,9 +17,11 @@ import { loadSettings, mdb, oneOf, type Row, type Tx } from './db';
 import { newEffects, type Effects } from './effects';
 import { runnerHub, terminalEvent, terminalClosed, broadcastProject } from './live';
 import {
+	checkpointInput,
 	eventsInput,
 	finishInput,
 	heartbeatInput,
+	leasesInput,
 	limitInput,
 	ptyExitInput,
 	ptyOutputInput,
@@ -31,10 +33,17 @@ import {
 } from './protocol';
 import { publish } from './publish.service';
 import { resolveRpc } from './rpc.service';
-import { heartbeat, registerRunner, requireRunner, runnerOnline } from './runners.service';
+import {
+	checkLeases,
+	heartbeat,
+	registerRunner,
+	requireRunner,
+	runnerOnline
+} from './runners.service';
 import {
 	acceptRun,
 	finishRun,
+	recordCheckpoint,
 	recordEvents,
 	recordLimit,
 	recordUsage,
@@ -135,7 +144,7 @@ export const runnerApiEndpoints: AnyApiEndpoint[] = [
 		path: '/runner/heartbeat',
 		summary: 'Lebenszeichen, Slots und Läufe melden',
 		description:
-			'Verlängert die Lease der gemeldeten laufenden Läufe (90 s) und liefert die Läufe, die der Runner abbrechen soll.',
+			'Verlängert die Lease der gemeldeten laufenden Läufe (Server-Runner 90 s, PC-Runner 60 s, je Runner einstellbar) und liefert die Läufe, die der Runner abbrechen soll. `handover`: Übergabe läuft (keine neuen Angebote).',
 		tags,
 		permission,
 		rateLimit: { limit: 600, windowSec: 60 },
@@ -146,6 +155,35 @@ export const runnerApiEndpoints: AnyApiEndpoint[] = [
 			await publish(ctx, fx);
 			return result;
 		}
+	}),
+	defineEndpoint({
+		method: 'POST',
+		path: '/runner/leases',
+		summary: 'Leases prüfen (Fencing)',
+		description:
+			'Prüft je Lauf, ob er noch diesem Runner gehört, angeboten bzw. laufend ist, seine Lease gilt und das Fencing-Token aktuell ist. Der Runner fragt nach dem Aufwachen und vor jedem Push; ungültige Läufe verwirft er, ohne zu pushen. Verlängert nichts.',
+		tags,
+		permission,
+		rateLimit: { limit: 1200, windowSec: 60 },
+		body: leasesInput,
+		handler: ({ ctx, body }) =>
+			asRunner(ctx, (tx, _fx, runner) => checkLeases(tx, String(runner.id), body))
+	}),
+	defineEndpoint({
+		method: 'POST',
+		path: '/runner/runs/:id/checkpoint',
+		summary: 'WIP-Checkpoint melden',
+		description:
+			'Zwischenstand eines laufenden Laufs liegt als Commit unter `refs/aidev/wip/<runId>`. Ein späterer Lauf setzt nach einem Ausfall darauf fort. Übernommener Lauf bzw. veraltetes Fencing-Token → 409.',
+		tags,
+		permission,
+		rateLimit: { limit: 600, windowSec: 60 },
+		params: idParams,
+		body: checkpointInput,
+		handler: ({ ctx, params, body }) =>
+			asRunner(ctx, (tx, fx, runner) =>
+				recordCheckpoint(tx, fx, String(runner.id), params.id, body)
+			)
 	}),
 	defineEndpoint({
 		method: 'GET',
@@ -194,7 +232,7 @@ export const runnerApiEndpoints: AnyApiEndpoint[] = [
 		path: '/runner/runs/:id/events',
 		summary: 'Lauf-Ereignisse hochladen',
 		description:
-			'Idempotent über `seq` (doppelte werden ignoriert), Texte werden gekürzt, über der Obergrenze je Lauf verworfen. Verlängert die Lease.',
+			'Idempotent über `seq` (doppelte werden ignoriert), Texte werden gekürzt, über der Obergrenze je Lauf verworfen. Verlängert die Lease. Mit `fence`: übernommener Lauf bzw. veraltetes Fencing-Token → 409.',
 		tags,
 		permission,
 		rateLimit: { limit: 3000, windowSec: 60 },
@@ -204,7 +242,7 @@ export const runnerApiEndpoints: AnyApiEndpoint[] = [
 			const { limits } = await loadSettings();
 			const res = await mdb().transaction(async (tx) => {
 				const runner = await requireRunner(tx, ctx);
-				return recordEvents(tx, String(runner.id), params.id, body.events, limits);
+				return recordEvents(tx, String(runner.id), params.id, body.events, limits, body.fence);
 			});
 			if (res.inserted.length) {
 				broadcastProject(String(res.run.project_id), {

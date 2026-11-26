@@ -8,7 +8,8 @@
  * Zyklus im Plan abgelehnt; Konflikt → Konfliktlösung; Rechte; Aktionsvorschläge im Chat (übernehmen/verwerfen, replyTo); bestehenden PR bearbeiten (`targetPr`, pr-update);
  * PR-Sync löscht Branches gemergter `aidev/`-PRs (nur Runner mit `branchCleanup`; keine Forks, nichts Genutztes,
  * unter der Sperre der Branch-Vergabe, mit Rotation); SSE (Projekt, Runner) inkl.
- * RPC über den Stream.
+ * RPC über den Stream; PC-Runner: Vorrang, geordnete Übergabe mit WIP-Ref, Fencing (aufgewachter PC darf nichts mehr
+ * melden), Heartbeat-Timeout mit Checkpoint, Rückkehr.
  */
 import { createHash } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
@@ -309,6 +310,7 @@ beforeAll(async () => {
 	await technicalKey('runner', runnerRole, ['aidev.runner.connect']);
 	await technicalKey('runner2', runnerRole, ['aidev.runner.connect']);
 	await technicalKey('runner3', runnerRole, ['aidev.runner.connect']);
+	await technicalKey('pc', runnerRole, ['aidev.runner.connect']);
 	const plainRole = await createRole(admin, { name: 'Ohne KI', permissions: ['core.api.manage'] });
 	await technicalKey('viewer', plainRole, ['core.api.manage']);
 	const creatorRole = await createRole(admin, {
@@ -2800,5 +2802,227 @@ describe('aidev', () => {
 		// Projekt löschen → Anhänge per CASCADE weg
 		await q(sql`DELETE FROM project WHERE id = ${other.id}`);
 		expect(await q(sql`SELECT 1 FROM attachment WHERE id = ${foreignProject.id}`)).toHaveLength(0);
+	});
+	it('PC-Runner: Vorrang, Übergabe bei Standby, Fencing nach dem Aufwachen, Heartbeat-Timeout, Rückkehr', async () => {
+		const sha = (c: string) => c.repeat(40);
+		const pcCaps = { handoff: true, fencing: true, wip: true };
+		const reg = ok<{
+			runnerId: string;
+			leaseSec?: number;
+			features?: Record<string, boolean>;
+			kind?: string;
+		}>(await register('pc', ['fake-pc'], 2, pcCaps, { kind: 'desktop' }), 201);
+		const pcId = reg.runnerId;
+		expect(reg).toMatchObject({
+			leaseSec: 60,
+			kind: 'desktop',
+			features: { handoff: true, fencing: true, checkpoints: true }
+		});
+		ok(await call('admin', 'PATCH', `/runners/${pcId}`, { status: 'approved' }));
+		ok(await heartbeat('pc'), 201);
+		// Server-Runner kann WIP-Stände fortsetzen; runner2 (alter Runner) bleibt außen vor
+		ok(await register('runner', ['fake-a', 'fake-b'], 4, pcCaps), 201);
+		const runner2 = await q<{ id: string }>(
+			sql`SELECT id FROM runner WHERE name = 'Runner runner2'`
+		);
+		for (const r of runner2) {
+			ok(await call('admin', 'PATCH', `/runners/${r.id}`, { maxSlots: 0 }));
+		}
+		const dto = async (id: string) =>
+			ok<RunnerDto[]>(await call('admin', 'GET', '/runners')).find((r) => r.id === id)!;
+		expect(await dto(pcId)).toMatchObject({
+			kind: 'desktop',
+			priority: 10,
+			leaseSec: 60,
+			state: 'active',
+			protocol: 1,
+			updateAvailable: true
+		});
+		try {
+			// (1) Vorrang: der freie PC bekommt den Auftrag, Angebot mit Fencing-Token und kurzer Lease
+			const t = await createTask({ prompt: 'Langer Auftrag auf dem PC' });
+			const o1 = await offerFor(t.id, 'pc');
+			expect(o1).toMatchObject({ leaseSec: 60 });
+			expect(typeof o1.fence).toBe('number');
+			expect(o1.resumeWip).toBeUndefined();
+			ok(await call('pc', 'POST', `/runner/runs/${o1.runId}/accept`), 201);
+			const lease = await q<{ s: number }>(
+				sql`SELECT extract(epoch FROM lease_expires_at - now())::int AS s FROM run WHERE id = ${o1.runId}`
+			);
+			expect(lease[0]!.s).toBeGreaterThan(50);
+			expect(lease[0]!.s).toBeLessThanOrEqual(60);
+			const ev = (seq: number) => ({
+				events: [{ seq, ts: new Date().toISOString(), kind: 'text', payload: { text: '…' } }],
+				fence: o1.fence
+			});
+			ok(await call('pc', 'POST', `/runner/runs/${o1.runId}/events`, ev(0)), 201);
+			const leases = (who: string, runId: string, fence?: number) =>
+				call<{ valid: string[]; revoked: { runId: string; reason: string }[] }>(
+					who,
+					'POST',
+					'/runner/leases',
+					{ runs: [{ runId, fence }] }
+				);
+			expect(ok(await leases('pc', o1.runId, o1.fence), 201).valid).toEqual([o1.runId]);
+
+			// (2) Standby: Heartbeat mit handover → keine neuen Angebote, Anzeige „wird übergeben“
+			ok(
+				await call('pc', 'POST', '/runner/heartbeat', {
+					slotsUsed: 1,
+					runIds: [o1.runId],
+					handover: 'suspend'
+				}),
+				201
+			);
+			expect((await dto(pcId)).state).toBe('handover');
+			const wipRef = `refs/aidev/wip/${o1.runId}`;
+			const done = ok<{ taskStatus: string }>(
+				await finish(
+					o1.runId,
+					{
+						status: 'cancelled',
+						errorKind: 'cancelled',
+						errorMessage: 'Übergabe',
+						branch: o1.branch,
+						handoff: { reason: 'suspend', wipPushed: true, wipRef, headSha: sha('a'), note: null },
+						fence: o1.fence
+					},
+					'pc'
+				),
+				201
+			);
+			expect(done.taskStatus).toBe('queued');
+			const queued = (await task(t.id)).task;
+			expect(queued.attempts).toBe(0);
+			expect(queued.errorMessage).toBe(
+				'Übergeben von PC-Runner „Runner pc“ (Grund: Standby) – wird auf einem anderen Runner fortgesetzt'
+			);
+			// PC-Runner übergibt noch → nichts Neues für ihn; der Server übernimmt mit dem WIP-Stand
+			expect((await offers('pc')).some((o) => o.taskId === t.id)).toBe(false);
+			const o2 = await offerFor(t.id, 'runner');
+			expect(o2.resumeWip).toEqual({ ref: wipRef, sha: sha('a'), fromRunner: 'Runner pc' });
+			expect(o2.fence!).toBeGreaterThan(o1.fence!);
+			expect(o2.branch).toBe(o1.branch);
+			expect(o2.prompt).toContain('Continuation after handoff');
+
+			// (3) PC wacht auf: Lease ungültig, Ereignisse, Checkpoints und Abschluss mit altem Token → 409
+			const stale = ok(await leases('pc', o1.runId, o1.fence), 201);
+			expect(stale.valid).toEqual([]);
+			expect(stale.revoked[0]!.runId).toBe(o1.runId);
+			expect((await call('pc', 'POST', `/runner/runs/${o1.runId}/events`, ev(1))).status).toBe(409);
+			expect(
+				(
+					await call('pc', 'POST', `/runner/runs/${o1.runId}/checkpoint`, {
+						ref: wipRef,
+						sha: sha('b'),
+						fence: o1.fence
+					})
+				).status
+			).toBe(409);
+			expect(
+				(await finish(o1.runId, { status: 'succeeded', summary: 'doppelt', fence: o1.fence }, 'pc'))
+					.status
+			).toBe(409);
+			// fremder Lauf ist für den PC ungültig
+			expect(ok(await leases('pc', o2.runId, o2.fence), 201).valid).toEqual([]);
+
+			// (4) Server führt zu Ende, ein PR, Verlauf nennt die Übergabe
+			ok(await call('runner', 'POST', `/runner/runs/${o2.runId}/accept`), 201);
+			ok(
+				await finish(o2.runId, {
+					status: 'succeeded',
+					summary: 'fertig',
+					branch: o2.branch,
+					branchPushed: true,
+					pr: { number: 4711, url: 'https://github.com/acme/widgets/pull/4711' },
+					fence: o2.fence
+				}),
+				201
+			);
+			const detail = await task(t.id);
+			expect(detail.task.status).toBe('review');
+			const pcRun = detail.runs.find((r) => r.id === o1.runId)!;
+			expect(pcRun.handover).toMatchObject({
+				reason: 'suspend',
+				fromRunner: 'Runner pc',
+				fromKind: 'desktop',
+				toRunner: 'Runner runner',
+				toKind: 'server',
+				wipPushed: true
+			});
+			expect(detail.runs.find((r) => r.id === o2.runId)!.resumedFrom).toBe(o1.runId);
+			const pulls = await q(sql`SELECT 1 FROM pull_request WHERE task_id = ${t.id}`);
+			expect(pulls).toHaveLength(1);
+			expect((await dto(pcId)).handedOver).toBe(1);
+			expect((await dto(runnerId)).takenOver).toBeGreaterThanOrEqual(1);
+
+			// (5) PC zurück: Heartbeat ohne handover → „zurück“, neue Aufträge wieder zuerst an den PC
+			ok(await heartbeat('pc'), 201);
+			expect((await dto(pcId)).state).toBe('returned');
+			const t2 = await createTask({ prompt: 'Nach dem Aufwachen' });
+			const o3 = await offerFor(t2.id, 'pc');
+			ok(await call('pc', 'POST', `/runner/runs/${o3.runId}/accept`), 201);
+
+			// (6) harter Ausfall (Strom weg): Checkpoint, dann Heartbeat-Timeout → Server setzt am Checkpoint fort
+			ok(
+				await call('pc', 'POST', `/runner/runs/${o3.runId}/checkpoint`, {
+					ref: `refs/aidev/wip/${o3.runId}`,
+					sha: sha('c'),
+					fence: o3.fence
+				}),
+				201
+			);
+			// fremder Ref wird abgewiesen
+			expect(
+				(
+					await call('pc', 'POST', `/runner/runs/${o3.runId}/checkpoint`, {
+						ref: wipRef,
+						sha: sha('c'),
+						fence: o3.fence
+					})
+				).status
+			).toBe(400);
+			await expireLease(o3.runId);
+			expect((await runRow(o3.runId)).error_kind).toBe(CONNECTION_LOST);
+			const o4 = await offerFor(t2.id, 'runner');
+			expect(o4.resumeWip).toMatchObject({ ref: `refs/aidev/wip/${o3.runId}`, sha: sha('c') });
+			const lostRun = (await task(t2.id)).runs.find((r) => r.id === o3.runId)!;
+			expect(lostRun.handover).toMatchObject({ reason: 'connection', toRunner: 'Runner runner' });
+			ok(await call('admin', 'POST', `/tasks/${t2.id}/cancel`), 201);
+
+			// (7) Verwaltung: Art, Vorrang und Heartbeat-Zeitlimit festlegen bzw. zurücksetzen
+			const patched = ok<RunnerDto>(
+				await call('admin', 'PATCH', `/runners/${pcId}`, {
+					kind: 'server',
+					priority: 3,
+					leaseSec: 120
+				})
+			);
+			expect(patched).toMatchObject({
+				kind: 'server',
+				reportedKind: 'desktop',
+				kindOverride: 'server',
+				priority: 3,
+				priorityOverride: 3,
+				leaseSec: 120
+			});
+			const reset = ok<RunnerDto>(
+				await call('admin', 'PATCH', `/runners/${pcId}`, {
+					kind: null,
+					priority: null,
+					leaseSec: null
+				})
+			);
+			expect(reset).toMatchObject({
+				kind: 'desktop',
+				priority: 10,
+				leaseSec: 60,
+				kindOverride: null
+			});
+			expect((await call('admin', 'PATCH', `/runners/${pcId}`, { leaseSec: 5 })).status).toBe(422);
+		} finally {
+			ok(await call('admin', 'DELETE', `/runners/${pcId}`));
+			ok(await register('runner', ['fake-a', 'fake-b']), 201);
+		}
 	});
 });

@@ -20,7 +20,7 @@ export type { Row, Tx };
 
 export const mdb = () => moduleDb(MODULE_ID);
 
-/** Lease eines laufenden Laufs (Heartbeat verlängert) */
+/** Lease eines laufenden Laufs auf Server-Runnern (Heartbeat verlängert), PC-Runner siehe `DESKTOP_LEASE_SEC` */
 export const LEASE_SEC = 90;
 /** Frist, bis ein angebotener Lauf angenommen sein muss */
 export const OFFER_LEASE_SEC = 60;
@@ -33,6 +33,32 @@ export const RUNNER_STALE_SEC = 60;
  * Schützt vor einer Endlosschleife, wenn ein Auftrag den Runner wiederholt abstürzen lässt.
  */
 export const MAX_CONNECTION_RETRIES = 20;
+/**
+ * Heartbeat-Zeitlimit laufender Läufe auf PC-Runnern (`kind = desktop`): Geht der PC ohne Übergabe in den
+ * Standby (Strom weg, Absturz, WLAN weg), übernimmt ein Server-Runner nach höchstens dieser Zeit (vier verpasste
+ * Heartbeats). Je Runner in der Verwaltung einstellbar (`runner.lease_sec`, `MIN_LEASE_SEC`–`MAX_LEASE_SEC`).
+ */
+export const DESKTOP_LEASE_SEC = 60;
+export const MIN_LEASE_SEC = 30;
+export const MAX_LEASE_SEC = 900;
+/** Anzeige „zurück“ so lange nach der Rückkehr eines Runners (Standby/offline → online) */
+export const RETURNED_SHOW_SEC = 15 * 60;
+
+/** Wirksame Art eines Runners: Vorgabe der Verwaltung, sonst gemeldet (unbekannt → server) */
+export function runnerKindOf(r: Row | null | undefined): 'server' | 'desktop' {
+	const k = r?.kind_override ?? r?.kind;
+	return k === 'desktop' ? 'desktop' : 'server';
+}
+
+/** Wirksame Lease (Sekunden) laufender Läufe eines Runners: Vorgabe der Verwaltung, sonst nach Art */
+export function leaseSecOf(r: Row | null | undefined): number {
+	const v = r?.lease_sec;
+	if (v !== null && v !== undefined && Number.isFinite(Number(v))) {
+		return Math.min(MAX_LEASE_SEC, Math.max(MIN_LEASE_SEC, Number(v)));
+	}
+	return runnerKindOf(r) === 'desktop' ? DESKTOP_LEASE_SEC : LEASE_SEC;
+}
+
 /** Höchstzahl gleichzeitiger Live-Verbindungen je Person und Hub */
 export const MAX_STREAMS_PER_USER = 20;
 

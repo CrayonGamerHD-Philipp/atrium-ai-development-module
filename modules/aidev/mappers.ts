@@ -1,7 +1,16 @@
 /** Zeilen (`tx.execute`) → DTOs aus `schemas.ts`. Reine Abbildung, keine Datenbankzugriffe. */
 import { num, str, toIso, toIsoOrNull, type Row } from '$lib/sdk/server';
 import { storedActionsOf } from './actions';
-import { jsonOf, stringList } from './db';
+import { jsonOf, leaseSecOf, RETURNED_SHOW_SEC, runnerKindOf, stringList } from './db';
+import {
+	isUpdateAvailable,
+	runnerStateOf,
+	type HandoverRun,
+	type RunHandoverDto
+} from './handover';
+import { PROTOCOL_VERSION } from './protocol';
+import { RUNNER_RELEASE_VERSION } from './runner-release';
+import { runnerPriorityOf } from './scheduler';
 import type { AttachmentOffer, CommitPolicy, Provider, Role } from './protocol';
 import type {
 	AttachmentDto,
@@ -77,7 +86,26 @@ export function commitDto(r: Row): CommitDto {
 	};
 }
 
-export function runDto(r: Row, commits: CommitDto[]): RunDto {
+/** Lauf-Zeile (mit `runner_name`/`runner_kind` aus `RUN_SELECT`) für `handoversOf` */
+export function handoverRunOf(r: Row): HandoverRun {
+	return {
+		id: String(r.id),
+		status: String(r.status),
+		errorKind: str(r.error_kind),
+		runnerName: str(r.runner_name) ?? '',
+		runnerKind: r.runner_kind === 'desktop' ? 'desktop' : 'server',
+		startedAt: toIsoOrNull(r.started_at),
+		createdAt: toIso(r.created_at),
+		handoff: jsonOf<HandoverRun['handoff']>(r.handoff, null),
+		hasWip: !!str(r.wip_sha)
+	};
+}
+
+export function runDto(
+	r: Row,
+	commits: CommitDto[],
+	handover: RunHandoverDto | null = null
+): RunDto {
 	return {
 		...runSummaryDto(r),
 		taskId: String(r.task_id),
@@ -93,7 +121,9 @@ export function runDto(r: Row, commits: CommitDto[]): RunDto {
 		eventCount: num(r.event_count),
 		units: num(r.units),
 		createdAt: toIso(r.created_at),
-		commits
+		commits,
+		handover,
+		resumedFrom: str(r.resumed_from)
 	};
 }
 
@@ -180,7 +210,8 @@ export function runnerDto(r: Row, accounts: AccountDto[]): RunnerDto {
 		draining: r.draining === true,
 		capabilities: jsonOf<RunnerDto['capabilities']>(r.capabilities, {}),
 		createdAt: toIso(r.created_at),
-		accounts
+		accounts,
+		...runnerExtras(r)
 	};
 }
 
@@ -242,5 +273,49 @@ export function attachmentOffer(r: Row): AttachmentOffer {
 		mime: String(r.mime),
 		size: num(r.size),
 		sha256: String(r.sha256)
+	};
+}
+
+function handoverReasonOf(v: unknown): 'suspend' | 'shutdown' | 'manual' | null {
+	return v === 'suspend' || v === 'shutdown' || v === 'manual' ? v : null;
+}
+
+const optNum = (v: unknown): number | null => (v === null || v === undefined ? null : num(v));
+const optKind = (v: unknown): 'server' | 'desktop' | null =>
+	v === 'desktop' || v === 'server' ? v : null;
+
+/** Art, Vorrang, Übergabe, Version: zusätzliche Felder von `RunnerDto` (Migration 0012) */
+function runnerExtras(r: Row, now = Date.now()) {
+	const kind = runnerKindOf(r);
+	const priorityOverride = optNum(r.priority);
+	const handoverReason = r.handover_reason;
+	const returnedAt = toIsoOrNull(r.returned_at);
+	const version = String(r.version ?? '');
+	const protocol = optNum(r.protocol);
+	return {
+		kind,
+		reportedKind: r.kind === 'desktop' ? ('desktop' as const) : ('server' as const),
+		kindOverride: optKind(r.kind_override),
+		priority: runnerPriorityOf(kind, priorityOverride),
+		priorityOverride,
+		leaseSec: leaseSecOf(r),
+		leaseSecOverride: optNum(r.lease_sec),
+		protocol,
+		state: runnerStateOf({
+			status: String(r.status),
+			online: r.online === true,
+			handoverReason: str(handoverReason),
+			returnedAt: returnedAt ? Date.parse(returnedAt) : null,
+			now,
+			returnedShowMs: RETURNED_SHOW_SEC * 1000
+		}),
+		handoverReason: handoverReasonOf(handoverReason),
+		handoverAt: toIsoOrNull(r.handover_at),
+		returnedAt,
+		handedOver: num(r.handed_over),
+		takenOver: num(r.taken_over),
+		latestVersion: RUNNER_RELEASE_VERSION,
+		updateAvailable: isUpdateAvailable(version, RUNNER_RELEASE_VERSION),
+		protocolOutdated: protocol !== null && protocol < PROTOCOL_VERSION
 	};
 }

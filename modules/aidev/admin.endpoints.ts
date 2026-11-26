@@ -104,7 +104,7 @@ export const adminEndpoints: AnyApiEndpoint[] = [
 			if (result.changedStatus === 'disabled') {
 				runnerHub.closeObject(params.id, { type: 'revoked' });
 			}
-			const [dto] = await mdb().transaction((tx) => loadRunnerDtos(tx, sql`id = ${params.id}`));
+			const [dto] = await mdb().transaction((tx) => loadRunnerDtos(tx, sql`rn.id = ${params.id}`));
 			return dto!;
 		}
 	}),
