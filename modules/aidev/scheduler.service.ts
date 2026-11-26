@@ -51,7 +51,7 @@ import { loseRun } from './runs.service';
 import { planAssignments, type ProjectState, type TaskCandidate } from './scheduler';
 import { effectiveRole, getTask, planOf, resolveInfoOf, topBranchOf } from './tasks.service';
 import { loadAccountViews } from './usage.service';
-import { leaseSecOf, OFFER_LEASE_SEC, RUNNER_STALE_SEC } from './db';
+import { DESKTOP_STALE_SEC, leaseSecOf, OFFER_LEASE_SEC, RUNNER_STALE_SEC } from './db';
 
 // ---------------------------------------------------------------- Branches, Auslieferung, Prompt
 
@@ -567,8 +567,8 @@ export function startScheduler(): void {
 // ---------------------------------------------------------------- Sicherheitsnetz (Job)
 
 /**
- * Abgelaufene Leases → `lost` (bei PC-Runnern ohne Zählung des Versuchs), Runner ohne Heartbeat → offline,
- * danach Dispatch
+ * Abgelaufene Leases → `lost` (bei PC-Runnern ohne Zählung des Versuchs), Runner ohne Heartbeat → offline
+ * (PC-Runner nach `DESKTOP_STALE_SEC`, sonst nach `RUNNER_STALE_SEC`), danach Dispatch
  */
 export async function schedulerTick(): Promise<string> {
 	const fx = newEffects();
@@ -594,11 +594,14 @@ export async function schedulerTick(): Promise<string> {
 				run.status === 'running' && !desktop
 			);
 		}
+		// PC-Runner mit der Frist seiner Lease – sonst böte der Dispatch unten einen gerade wegen abgelaufener Lease
+		// verlorenen Lauf demselben schlafenden PC erneut an
 		const stale = await rowsOf(
 			tx,
 			sql`UPDATE runner SET online = false
 				WHERE online AND (last_seen_at IS NULL
-					OR last_seen_at < now() - ${RUNNER_STALE_SEC}::int * interval '1 second')
+					OR last_seen_at < now() - (CASE WHEN kind = 'desktop' THEN ${DESKTOP_STALE_SEC}::int
+						ELSE ${RUNNER_STALE_SEC}::int END) * interval '1 second')
 				RETURNING id`
 		);
 		if (stale.length) fx.overview = true;

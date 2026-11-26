@@ -42,6 +42,12 @@ export function leaseSecOf(kind: unknown): number {
 	return kind === 'desktop' ? DESKTOP_LEASE_SEC : LEASE_SEC;
 }
 
+/**
+ * Ohne Heartbeat seit dieser Zeit gilt ein PC-Runner als offline – so lang wie seine Lease: Läuft die Lease ab,
+ * wird der neu eingeplante Lauf nicht erneut dem (vermutlich schlafenden) PC angeboten.
+ */
+export const DESKTOP_STALE_SEC = DESKTOP_LEASE_SEC;
+
 /** Wert als `jsonb`-Parameter */
 export const jsonb = (v: unknown): SQL => sql`${JSON.stringify(v)}::jsonb`;
 
