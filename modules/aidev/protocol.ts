@@ -6,6 +6,19 @@
  * technischen Kontos mit Recht `aidev.runner.connect`):
  * - Runner → Atrium: JSON-POSTs (`/runner/...`), Antwort `{ data: … }` wie jede Atrium-API.
  * - Atrium → Runner: Server-Sent Events `GET /runner/stream` mit `RunnerCommand`-Ereignissen (`data: <json>`).
+ *
+ * Runner-Arten (`registerInput.kind`): `server` = dauerhafter Dienst, `desktop` = Runner auf dem PC eines Nutzers
+ * (Vorrang vor Server-Runnern). Vor Standby/Herunterfahren übergibt ein Desktop-Runner seine Läufe:
+ * 1. Heartbeat mit `handover` (keine neuen Angebote), 2. Agents stoppen, 3. Zwischenstand als WIP-Commit auf den
+ *    eigenen Ref `refs/aidev/wip/<runId>` pushen (nie auf einen Branch – PRs und Haupt-Branch bleiben sauber),
+ * 4. Abschluss als `cancelled` mit `finishInput.handoff`. Atrium plant sofort neu ein und nennt den WIP-Stand im
+ *    nächsten Angebot (`offer.resumeWip`); der Versuch zählt nicht.
+ *
+ * Fencing: Jedes Angebot trägt ein Fencing-Token (`offer.fence`, je Auftrag streng steigend). Runner mit
+ * `capabilities.fencing` senden es bei Ereignissen und Abschluss mit und prüfen ihre Leases vor jedem Push sowie
+ * nach dem Aufwachen (`POST /runner/leases`). Atrium lehnt Meldungen mit veraltetem Token ab (409) – ein PC, der
+ * nach dem Standby aufwacht, kann einen bereits übernommenen Lauf so weder fortsetzen noch pushen.
+ * Alle Felder dazu sind optional (ältere Runner bzw. ältere Atrium-Versionen arbeiten unverändert).
  */
 import { z } from 'zod';
 
@@ -68,6 +81,30 @@ export type LimitSnapshot = z.infer<typeof limitSnapshotSchema>;
 
 // ---------------------------------------------------------------- Registrierung / Heartbeat
 
+/**
+ * Art eines Runners: `server` = dauerhafter Dienst, `desktop` = Runner auf dem PC eines Nutzers, der in den Standby
+ * gehen oder heruntergefahren werden kann (Vorrang vor Server-Runnern, übergibt Läufe per `finishInput.handoff`).
+ */
+export const RUNNER_KINDS = ['server', 'desktop'] as const;
+export const runnerKindSchema = z.enum(RUNNER_KINDS);
+export type RunnerKind = z.infer<typeof runnerKindSchema>;
+
+/**
+ * Anlass einer Übergabe: `suspend` = Standby/Ruhezustand, `shutdown` = Herunterfahren, Abmelden bzw. Beenden des
+ * Runners, `manual` = „jetzt an Server übergeben“ (Befehl `handover`)
+ */
+export const HANDOFF_REASONS = ['suspend', 'shutdown', 'manual'] as const;
+export const handoffReasonSchema = z.enum(HANDOFF_REASONS);
+export type HandoffReason = z.infer<typeof handoffReasonSchema>;
+
+/** Präfix der WIP-Refs (`refs/aidev/wip/<runId>`): kein Branch, erscheint weder in PRs noch im Haupt-Branch */
+export const WIP_REF_PREFIX = 'refs/aidev/wip/';
+export const wipRefOf = (runId: string): string => `${WIP_REF_PREFIX}${runId}`;
+export const wipRefSchema = z.string().regex(/^refs\/aidev\/wip\/[0-9a-f-]{36}$/);
+const fullShaSchema = z.string().regex(/^[0-9a-f]{40,64}$/);
+/** Fencing-Token eines Laufs (je Auftrag streng steigend) */
+const fenceSchema = z.number().int().min(0);
+
 export const runnerAccountSchema = z.object({
 	/** Eindeutig je Runner, z. B. `claude-main` (Konfiguration des Runners) */
 	key: z
@@ -87,6 +124,8 @@ export const registerInput = z.object({
 	name: z.string().min(1).max(80),
 	version: shortText(40),
 	maxSlots: z.number().int().min(0).max(64),
+	/** Art des Runners; fehlt das Feld (ältere Runner), gilt `server`. */
+	kind: runnerKindSchema.optional(),
 	capabilities: z.object({
 		question: z.boolean().optional(),
 		/** Kann Anhänge für einen Lauf herunterladen und bereitstellen */
@@ -99,6 +138,15 @@ export const registerInput = z.object({
 		limitReport: z.boolean().optional(),
 		/** Versteht RPC `git.branch-delete` (Atrium sendet ihn nur an solche Runner) */
 		branchCleanup: z.boolean().optional(),
+		/**
+		 * Kann Läufe vor Standby/Herunterfahren mit Zwischenstand übergeben (`finishInput.handoff`, Heartbeat mit
+		 * `handover`); den WIP-Commit pusht er nur, wenn Atrium `registerResult.features.handoff` meldet.
+		 */
+		handoff: z.boolean().optional(),
+		/** Sendet `offer.fence` mit und prüft Leases vor jedem Push bzw. nach dem Aufwachen (`/runner/leases`) */
+		fencing: z.boolean().optional(),
+		/** Setzt einen Lauf auf einem WIP-Stand fort (`offer.resumeWip`) und meldet Checkpoints */
+		wip: z.boolean().optional(),
 		git: z.boolean(),
 		gh: z.boolean(),
 		pty: z.boolean(),
@@ -117,7 +165,25 @@ export type RegisterInput = z.infer<typeof registerInput>;
 export const registerResult = z.object({
 	runnerId: id,
 	status: z.enum(['pending', 'approved', 'disabled']),
-	heartbeatSec: z.number().int()
+	heartbeatSec: z.number().int(),
+	/**
+	 * Für diesen Runner wirksame Lease laufender Läufe (Sekunden), z. B. kürzer für Desktop-Runner. Fehlt das Feld
+	 * (älteres Atrium), gilt wie bisher `offer.leaseSec`.
+	 */
+	leaseSec: z.number().int().optional(),
+	/** Vom Atrium verstandene Protokoll-Erweiterungen; fehlt das Feld (älteres Atrium), gilt keine als verstanden. */
+	features: z
+		.object({
+			/** Atrium versteht `finishInput.handoff` – nur dann pusht der Runner einen Zwischenstand. */
+			handoff: z.boolean().optional(),
+			/** Atrium prüft Fencing-Token und beantwortet `POST /runner/leases`. */
+			fencing: z.boolean().optional(),
+			/** Atrium nimmt WIP-Checkpoints an (`POST /runner/runs/:id/checkpoint`). */
+			checkpoints: z.boolean().optional()
+		})
+		.optional(),
+	/** Art, unter der Atrium den Runner führt (Vorgabe der Verwaltung hat Vorrang vor `registerInput.kind`) */
+	kind: runnerKindSchema.optional()
 });
 export type RegisterResult = z.infer<typeof registerResult>;
 
@@ -130,6 +196,11 @@ export const heartbeatInput = z.object({
 	 * Fehlt das Feld (ältere Runner), gilt `false`.
 	 */
 	draining: z.boolean().optional(),
+	/**
+	 * Desktop-Runner übergibt gerade (Standby, Herunterfahren, „jetzt übergeben“): keine neuen Angebote, Anzeige
+	 * „wird übergeben“. Fehlt das Feld, läuft keine Übergabe.
+	 */
+	handover: handoffReasonSchema.optional(),
 	accounts: z
 		.array(
 			z.object({
@@ -305,6 +376,24 @@ export const runOfferSchema = z.object({
 	/** Anhänge dieses Laufs; ältere Angebote enthalten das Feld nicht. */
 	attachments: z.array(attachmentOfferSchema).max(10).optional(),
 	delivery: deliverySchema,
+	/**
+	 * Fencing-Token dieses Laufs (je Auftrag streng steigend). Runner mit `capabilities.fencing` senden es bei
+	 * Ereignissen, Checkpoints, Lease-Prüfung und Abschluss mit. Fehlt bei älterem Atrium.
+	 */
+	fence: fenceSchema.optional(),
+	/**
+	 * Zwischenstand eines übergebenen bzw. verlorenen Vorläufers: WIP-Commit `sha` unter `ref`
+	 * (`refs/aidev/wip/<runId>`). Der Runner setzt nur darauf fort, wenn der Commit den aktuellen Stand von
+	 * `origin/<branch>` enthält; sonst beginnt er wie üblich. Nur an Runner mit `capabilities.wip`.
+	 */
+	resumeWip: z
+		.object({
+			ref: wipRefSchema,
+			sha: fullShaSchema,
+			/** Name des Runners, der den Stand erzeugt hat (Anzeige) */
+			fromRunner: shortText(80).default('')
+		})
+		.optional(),
 	leaseSec: z.number().int(),
 	/** Harte Obergrenze für die Laufzeit des Agent-Prozesses */
 	timeoutSec: z.number().int()
@@ -442,7 +531,9 @@ export const MAX_EVENTS_PER_BATCH = 200;
 export const MAX_EVENT_TEXT = 16_000;
 
 export const eventsInput = z.object({
-	events: z.array(runEventSchema).min(1).max(MAX_EVENTS_PER_BATCH)
+	events: z.array(runEventSchema).min(1).max(MAX_EVENTS_PER_BATCH),
+	/** Fencing-Token aus dem Angebot (Runner mit `capabilities.fencing`); veraltet → 409 */
+	fence: fenceSchema.optional()
 });
 export type EventsInput = z.infer<typeof eventsInput>;
 
@@ -488,36 +579,100 @@ export const ERROR_KINDS = [
 	'internal'
 ] as const;
 
-export const finishInput = z.object({
-	status: z.enum(['succeeded', 'failed', 'limited', 'cancelled']),
-	sessionId: shortText(200).nullable().default(null),
-	headSha: z
-		.string()
-		.regex(/^[0-9a-f]{7,40}$/)
-		.nullable()
-		.default(null),
-	branch: shortText(200).nullable().default(null),
-	commits: z.array(commitInfoSchema).max(200).default([]),
-	pr: z
-		.object({ number: z.number().int().positive(), url: z.string().url().max(500) })
-		.nullable()
-		.default(null),
-	/** Direkt gepusht (`direct`) bzw. sofort gemergt */
-	merged: z.boolean().default(false),
-	/** Der Ergebnis-Branch wurde erfolgreich gepusht. */
-	branchPushed: z.boolean().default(false),
-	/** Letzte Antwort des Agents (Zusammenfassung, bei Recherche das Ergebnis) */
-	summary: shortText(40_000).nullable().default(null),
-	/** Nur bei `expectPlan`: geparster Plan (Atrium prüft erneut gegen `planSchema`) */
-	plan: z.unknown().optional(),
-	errorKind: z.enum(ERROR_KINDS).nullable().default(null),
-	errorMessage: shortText(4000).nullable().default(null),
-	/** Konflikt-Dateien (bei `errorKind: 'conflict'`) */
-	conflictFiles: z.array(shortText(500)).max(200).default([])
+const shaSchema = z.string().regex(/^[0-9a-f]{7,40}$/);
+
+/**
+ * Übergabe eines Laufs vor Standby/Herunterfahren (nur mit `status: 'cancelled'`). `wipPushed`: der Zwischenstand
+ * liegt als WIP-Commit `headSha` unter `wipRef` (`refs/aidev/wip/<runId>`, kein Branch); ein anderer Runner setzt
+ * dort fort (`offer.resumeWip`).
+ */
+export const handoffSchema = z.object({
+	reason: handoffReasonSchema,
+	wipPushed: z.boolean(),
+	/** WIP-Commit (nur mit `wipPushed`) */
+	headSha: fullShaSchema.nullable().default(null),
+	wipRef: wipRefSchema.nullable().default(null),
+	/** Kurzer Hinweis zum Zwischenstand (z. B. was zuletzt lief) */
+	note: shortText(4000).nullable().default(null)
 });
+export type Handoff = z.infer<typeof handoffSchema>;
+
+/**
+ * Abschluss eines Laufs. Die Regel „`handoff` nur mit `status: 'cancelled'`" prüft ein `superRefine` (Zod 4:
+ * bleibt ein `ZodObject`, `.shape` funktioniert weiter).
+ */
+export const finishInput = z
+	.object({
+		status: z.enum(['succeeded', 'failed', 'limited', 'cancelled']),
+		sessionId: shortText(200).nullable().default(null),
+		headSha: shaSchema.nullable().default(null),
+		branch: shortText(200).nullable().default(null),
+		commits: z.array(commitInfoSchema).max(200).default([]),
+		pr: z
+			.object({ number: z.number().int().positive(), url: z.string().url().max(500) })
+			.nullable()
+			.default(null),
+		/** Direkt gepusht (`direct`) bzw. sofort gemergt */
+		merged: z.boolean().default(false),
+		/** Der Ergebnis-Branch wurde erfolgreich gepusht. */
+		branchPushed: z.boolean().default(false),
+		/** Letzte Antwort des Agents (Zusammenfassung, bei Recherche das Ergebnis) */
+		summary: shortText(40_000).nullable().default(null),
+		/** Nur bei `expectPlan`: geparster Plan (Atrium prüft erneut gegen `planSchema`) */
+		plan: z.unknown().optional(),
+		errorKind: z.enum(ERROR_KINDS).nullable().default(null),
+		errorMessage: shortText(4000).nullable().default(null),
+		/** Konflikt-Dateien (bei `errorKind: 'conflict'`) */
+		conflictFiles: z.array(shortText(500)).max(200).default([]),
+		/**
+		 * Lauf wurde wegen Standby/Herunterfahren abgebrochen und übergeben (nur mit `status: 'cancelled'`, nur von
+		 * Runnern mit `capabilities.handoff`). Ältere Atrium-Versionen verwerfen das Feld und werten den Lauf als
+		 * gewöhnlichen Abbruch.
+		 */
+		handoff: handoffSchema.optional(),
+		/** Fencing-Token aus dem Angebot (Runner mit `capabilities.fencing`); veraltet → 409, nichts wird übernommen */
+		fence: fenceSchema.optional()
+	})
+	.superRefine((v, ctx) => {
+		if (v.handoff && v.status !== 'cancelled') {
+			ctx.addIssue({
+				code: 'custom',
+				path: ['handoff'],
+				message: "handoff nur zusammen mit status 'cancelled'"
+			});
+		}
+	});
 export type FinishInput = z.infer<typeof finishInput>;
 
 export const rejectInput = z.object({ reason: shortText(500) });
+
+/**
+ * WIP-Checkpoint eines laufenden Laufs (`POST /runner/runs/:id/checkpoint`, nur bei
+ * `registerResult.features.checkpoints`): Zwischenstand liegt als Commit `sha` unter `ref` (`refs/aidev/wip/<runId>`).
+ * Atrium merkt ihn sich für eine Fortsetzung nach einem harten Ausfall ohne Übergabe. Veraltetes `fence` → 409.
+ */
+export const checkpointInput = z.object({
+	ref: wipRefSchema,
+	sha: fullShaSchema,
+	fence: fenceSchema.optional()
+});
+export type CheckpointInput = z.infer<typeof checkpointInput>;
+
+/**
+ * Lease-Prüfung (`POST /runner/leases`, nur bei `registerResult.features.fencing`): nach dem Aufwachen und vor
+ * jedem Push. Ein Lauf ist gültig, solange er diesem Runner gehört, angeboten bzw. laufend ist, seine Lease nicht
+ * abgelaufen ist und `fence` dem aktuellen Token des Auftrags entspricht.
+ */
+export const leasesInput = z.object({
+	runs: z.array(z.object({ runId: id, fence: fenceSchema.optional() })).max(64)
+});
+export type LeasesInput = z.infer<typeof leasesInput>;
+export const leasesResult = z.object({
+	valid: z.array(id),
+	/** Nicht (mehr) gültig: verwerfen, nichts mehr pushen oder melden */
+	revoked: z.array(z.object({ runId: id, reason: shortText(200) }))
+});
+export type LeasesResult = z.infer<typeof leasesResult>;
 
 export const rpcResponseInput = z.object({
 	ok: z.boolean(),
