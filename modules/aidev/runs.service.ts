@@ -1,10 +1,16 @@
 /**
  * Rückmeldungen der Runner zu Läufen: annehmen, ablehnen, Ereignisse, Verbrauch, Limits, Abschluss – dazu
  * `loseRun` (Lease abgelaufen, Runner gesperrt). Folgezustände der Aufträge: siehe Kopf von `tasks.service.ts`.
+ *
+ * Verbindungsverlust (`loseRun(…, { connection: true })`: Lease eines laufenden Laufs abgelaufen oder Runner nach
+ * Neustart/Absturz ohne den Lauf angemeldet): `error_kind = CONNECTION_LOST` (`'connection'`), der Versuch wird
+ * zurückgebucht und der Auftrag wieder `queued` (`CONNECTION_LOST_MESSAGE`). Ab `MAX_CONNECTION_RETRIES`
+ * aufeinanderfolgenden Verlusten seit dem letzten Neustart (`connectionLossStreak`) → `failed`
+ * (`CONNECTION_LOST_FAILED_MESSAGE`). `connectionLossTargets` liefert dem Scheduler die betroffenen Runner/Konten.
  */
 import { sql } from 'drizzle-orm';
-import { errors, num, rowsOf, str, toIso, type Row } from '$lib/sdk/server';
-import { clip, jsonb, LEASE_SEC, oneOf, type Tx } from './db';
+import { errors, inList, num, rowsOf, str, toIso, type Row } from '$lib/sdk/server';
+import { clip, jsonb, LEASE_SEC, MAX_CONNECTION_RETRIES, oneOf, type Tx } from './db';
 import { sendCommand, type Effects } from './effects';
 import { storeLimitSnapshot } from './limits.service';
 import { extractPlan } from './prompts';
@@ -62,20 +68,97 @@ async function settleReservation(tx: Tx, run: Row, started: boolean): Promise<vo
 	}
 }
 
+/** `error_kind` eines Laufs, dessen Verbindung zum Runner verloren ging (Lease abgelaufen, Runner neu gestartet) */
+export const CONNECTION_LOST = 'connection';
+/** Meldung am Auftrag nach einem Verbindungsverlust (er wird automatisch neu eingeplant) */
+export const CONNECTION_LOST_MESSAGE =
+	'Verbindung zum Runner verloren – Auftrag wird automatisch neu gestartet';
+/** Meldung am Auftrag, wenn `MAX_CONNECTION_RETRIES` aufeinanderfolgende Verbindungsverluste erreicht sind */
+export const CONNECTION_LOST_FAILED_MESSAGE = `Verbindung zum Runner ${MAX_CONNECTION_RETRIES}-mal in Folge verloren – automatische Neustarts beendet. Bitte Runner prüfen und den Auftrag mit „Neu starten“ erneut einplanen.`;
+
+/**
+ * Läufe, die seit dem letzten Neustart des Auftrags tatsächlich liefen: `task.started_at` wird beim Neustart
+ * geleert und bei der ersten Annahme danach gesetzt (`acceptRun`), ältere Läufe zählen daher nicht mehr.
+ */
+const SINCE_RESTART = sql`r.started_at IS NOT NULL AND r.started_at >= t.started_at`;
+
+/**
+ * Aufeinanderfolgende jüngste Verbindungsverluste des Auftrags (nach `created_at` absteigend, bis zum ersten
+ * gestarteten Lauf mit anderem Ausgang) seit dem letzten Neustart. Nie gestartete Läufe (abgelehnt, Angebot
+ * verfallen) unterbrechen die Folge nicht – sonst setzte ein abstürzender Runner, der Angebote verfallen lässt,
+ * den Zähler immer wieder zurück.
+ */
+export async function connectionLossStreak(tx: Tx, taskId: string): Promise<number> {
+	const row = await oneOf(
+		tx,
+		sql`SELECT count(*)::int AS n FROM run r JOIN task t ON t.id = r.task_id
+			WHERE r.task_id = ${taskId} AND r.status = 'lost' AND r.error_kind = ${CONNECTION_LOST}
+				AND ${SINCE_RESTART}
+				AND r.created_at > COALESCE((
+					SELECT max(o.created_at) FROM run o
+					WHERE o.task_id = ${taskId} AND o.started_at IS NOT NULL
+						AND o.status NOT IN ('offered', 'running')
+						AND NOT (o.status = 'lost' AND o.error_kind = ${CONNECTION_LOST})
+				), '-infinity'::timestamptz)`
+	);
+	return num(row?.n);
+}
+
+/**
+ * Runner und Konten der Verbindungsverluste seit dem letzten Neustart je Auftrag – der Scheduler zieht sie weich
+ * ab (anderer Agent bevorzugt, der alte bleibt als Ausweg).
+ */
+export async function connectionLossTargets(
+	tx: Tx,
+	taskIds: string[]
+): Promise<Map<string, { runnerIds: string[]; accountIds: string[] }>> {
+	const out = new Map<string, { runnerIds: string[]; accountIds: string[] }>();
+	if (!taskIds.length) return out;
+	const rows = await rowsOf(
+		tx,
+		sql`SELECT r.task_id, array_agg(DISTINCT r.runner_id) FILTER (WHERE r.runner_id IS NOT NULL) AS runner_ids,
+				array_agg(DISTINCT r.account_id) FILTER (WHERE r.account_id IS NOT NULL) AS account_ids
+			FROM run r JOIN task t ON t.id = r.task_id
+			WHERE r.task_id IN (${inList(taskIds)}) AND r.status = 'lost'
+				AND r.error_kind = ${CONNECTION_LOST} AND ${SINCE_RESTART}
+			GROUP BY r.task_id`
+	);
+	for (const r of rows) {
+		out.set(String(r.task_id), {
+			runnerIds: ((r.runner_ids as unknown[] | null) ?? []).map(String),
+			accountIds: ((r.account_ids as unknown[] | null) ?? []).map(String)
+		});
+	}
+	return out;
+}
+
+/** Art des Verlusts für `loseRun` */
+export interface LoseRunOptions {
+	/**
+	 * Verbindung zum Runner verloren (Lease eines laufenden Laufs abgelaufen, Runner neu gestartet): `error_kind`
+	 * = `connection`, der Versuch zählt nicht, der Auftrag wird wieder `queued` – bis `MAX_CONNECTION_RETRIES`
+	 * aufeinanderfolgende Verluste erreicht sind (→ `failed`, Hinweis auf „Neu starten“).
+	 */
+	connection?: boolean;
+}
+
 /**
  * Lauf als verloren markieren und den Auftrag zurückstellen. `counted` = Versuch zählt (lief bereits);
- * sonst wird er zurückgebucht. Ohne verbleibende Versuche → `failed`.
+ * sonst wird er zurückgebucht. Ohne verbleibende Versuche → `failed`. `opts.connection`: Verbindungsverlust
+ * (siehe `LoseRunOptions`, `counted` wird dann ignoriert).
  */
 export async function loseRun(
 	tx: Tx,
 	fx: Effects,
 	run: Row,
 	message: string,
-	counted: boolean
+	counted: boolean,
+	opts: LoseRunOptions = {}
 ): Promise<void> {
+	const kind = opts.connection ? sql`${CONNECTION_LOST}` : sql`COALESCE(error_kind, 'internal')`;
 	await tx.execute(
 		sql`UPDATE run SET status = 'lost', finished_at = now(), lease_expires_at = NULL,
-				error_kind = COALESCE(error_kind, 'internal'), error_message = ${message}
+				error_kind = ${kind}, error_message = ${message}
 			WHERE id = ${run.id}`
 	);
 	await settleReservation(tx, run, run.status === 'running');
@@ -85,6 +168,17 @@ export async function loseRun(
 	fx.dispatch = true;
 	const task = await getTask(tx, String(run.task_id), true);
 	if (!task || (task.status !== 'queued' && task.status !== 'running')) return;
+	if (opts.connection) {
+		await tx.execute(
+			sql`UPDATE task SET attempts = GREATEST(attempts - 1, 0) WHERE id = ${task.id}`
+		);
+		const streak = await connectionLossStreak(tx, String(task.id));
+		const exhausted = streak >= MAX_CONNECTION_RETRIES;
+		await transition(tx, fx, String(task.id), exhausted ? 'failed' : 'queued', {
+			error: exhausted ? CONNECTION_LOST_FAILED_MESSAGE : CONNECTION_LOST_MESSAGE
+		});
+		return;
+	}
 	if (!counted) {
 		await tx.execute(
 			sql`UPDATE task SET attempts = GREATEST(attempts - 1, 0) WHERE id = ${task.id}`

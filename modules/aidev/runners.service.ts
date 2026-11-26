@@ -122,9 +122,11 @@ export async function registerRunner(
 
 /**
  * Anmeldung mit `runIds`: laufende Läufe dieses Runners, die er nicht mehr ausführt (Neustart, Absturz), sofort
- * als `lost` freigeben, statt bis zum Ende der Lease zu warten. Der Versuch zählt wie beim Lease-Ablauf (ein
- * Auftrag, der den Runner wiederholt abstürzen lässt, endet so nach `max_attempts`); ein geordnetes Beenden meldet
- * seine Läufe vorher selbst als `cancelled`. Angebotene Läufe holt der Runner nach der Anmeldung erneut ab.
+ * als `lost` freigeben, statt bis zum Ende der Lease zu warten. Das gilt als Verbindungsverlust (`loseRun` mit
+ * `connection`): der Versuch zählt nicht, der Auftrag wird automatisch neu eingeplant (andere Runner/Konten
+ * bevorzugt). Ein Auftrag, der den Runner wiederholt abstürzen lässt, endet nach `MAX_CONNECTION_RETRIES`
+ * Verlusten in Folge als `failed`. Ein geordnetes Beenden meldet seine Läufe vorher selbst als `cancelled`. Angebotene
+ * Läufe holt der Runner nach der Anmeldung erneut ab.
  */
 async function releaseOrphanedRuns(
 	tx: Tx,
@@ -141,7 +143,9 @@ async function releaseOrphanedRuns(
 					ORDER BY created_at FOR UPDATE`
 	);
 	for (const run of runs) {
-		await loseRun(tx, fx, run, 'Runner wurde neu gestartet – Lauf wird neu eingeplant', true);
+		await loseRun(tx, fx, run, 'Runner wurde neu gestartet – Lauf wird neu eingeplant', false, {
+			connection: true
+		});
 	}
 	return runs.length;
 }
