@@ -201,13 +201,16 @@ den Runner in Atrium freigeben. Logs und Hinweise je Plattform stehen in [`deskt
 - **Herunterfahren** (Ereignis des Systems oder erstes `SIGTERM`/`SIGINT`): Übergabe wie beim Standby, statt mit
   `DRAIN_SEC` zu warten; danach beendet sich der Runner. Das zweite Signal bricht die Übergabe ab, das dritte beendet
   sofort.
-- **Aufwachen** (Ereignis oder Uhrsprung): Zuerst sperrt der Runner jede Auslieferung (kein Push). Dann meldet er sich
-  neu an (`runIds`) und sendet einen Heartbeat; inzwischen übernommene Läufe kommen als `cancel` zurück und enden ohne
-  Push. Erst danach gibt er die Auslieferung frei, nimmt wieder Angebote an und verbindet den Befehlsstrom neu. Ein
+- **Aufwachen** (Ereignis oder Uhrsprung): Zuerst sperrt der Runner jede Auslieferung (kein Push); bereits laufende
+  Pushes, Merges und PR-Aktionen werden abgebrochen. Dann meldet er sich neu an (`runIds`), verbindet den Befehlsstrom
+  neu und sendet einen Heartbeat; inzwischen übernommene Läufe kommen als `cancel` zurück und enden ohne Push. Erst nach
+  einem erfolgreichen Heartbeat gibt er die Auslieferung frei (unterbrochene Aktionen werden wiederholt) und nimmt
+  wieder Angebote an; schlägt der Heartbeat fehl, bleibt die Sperre bestehen und er wird mit Backoff wiederholt. Ein
   verspäteter Abschluss eines schon übergebenen Laufs ändert in Atrium nichts.
 - **Lease**: Für PC-Runner gilt 45 s statt 90 s (`registerResult.leaseSec`; der Heartbeat wird auf höchstens ein
   Drittel davon verkürzt). Läuft sie ab oder meldet sich der PC neu an, zählt der Versuch nicht („PC-Runner nicht
-  erreichbar (Standby?) – Lauf wird neu eingeplant“).
+  erreichbar (Standby?) – Lauf wird neu eingeplant“). Ohne Heartbeat seit 45 s gilt ein PC-Runner als offline (Server:
+  60 s), damit der neu eingeplante Lauf an einen Server-Runner geht.
 
 **Vorrang**: automatisch PC 10, Server 0; höher bekommt Aufträge zuerst. Unter **Administration → Runner & Konten**
 lässt sich der Vorrang je Runner setzen (−100 bis 100, „automatisch“ = nach Art). Je Auftrag wählt der Scheduler die
