@@ -33,6 +33,7 @@ import {
 	syncPullBranch,
 	type PullContext
 } from './git/delivery.ts';
+import { abortMerge, concludeMerge, mergeInProgress, startMerge, unresolvedFiles } from './git/conflicts.ts';
 import { assertRefName, GitError } from './git/git.ts';
 import { deleteWip, fetchWip, pushWip, restoreWip, snapshotWip, wipUsable } from './git/wip.ts';
 import type { Workspace } from './git/workspace.ts';
@@ -40,11 +41,30 @@ import type { Logger } from './log.ts';
 import { silentLogger } from './log.ts';
 import { extractPlan } from './plan.ts';
 import type { AdapterRegistry } from './providers/index.ts';
+import {
+	ResearchBridge,
+	RESEARCH_DIR,
+	researchPromptSection,
+	researchSystemPrompt,
+	researchTaskPrompt,
+	TOOLS_DIR,
+	type ResearchRequest
+} from './research.ts';
+import {
+	addUsage,
+	conflictRepairPrompt,
+	isTransientAgentError,
+	resumeAfterErrorPrompt,
+	tailText,
+	testRepairPrompt,
+	TRANSIENT_RETRIES,
+	unresolvedPrompt
+} from './selfheal.ts';
 import { LimitStore, limitHitWindow } from './providers/limit-snapshot.ts';
 import type { AgentLimit, AgentResult, AgentUsage } from './providers/types.ts';
 import type { FinishInput, HandoffReason, RunEventKind, RunOffer } from './protocol.ts';
 import type { Redactor } from './redact.ts';
-import { errorMessage } from './util/async.ts';
+import { backoffMs, errorMessage, sleep } from './util/async.ts';
 import { exec } from './util/proc.ts';
 
 type ErrorKind = NonNullable<FinishInput['errorKind']>;
@@ -75,6 +95,19 @@ interface ActiveRun {
 	done: Promise<void>;
 	/** Übergabe: Anlass und Frist (ms seit Epoch) */
 	handover?: { reason: HandoffReason; deadline: number };
+	/** Pfade, die nie committet werden (Anhänge, Recherche-Dateien) */
+	exclude?: string[];
+}
+
+/** Limit des Anbieters im Agent-Aufruf erreicht (kein Fehler des Laufs: `finish.status = limited`) */
+class LimitStop extends Error {
+	constructor(
+		readonly limit: AgentLimit,
+		readonly lastText: string
+	) {
+		super(`Limit erreicht (${limit.limitKind})`);
+		this.name = 'LimitStop';
+	}
 }
 
 /** Lease des Laufs verloren (Fencing): nichts pushen, nichts mehr melden */
@@ -114,6 +147,16 @@ export interface ExecutorOptions {
 	batcherFlushMs?: number;
 	/** Fähigkeiten von Atrium (Standard: keine Erweiterung bekannt) */
 	features?: () => AtriumFeatures;
+	/** Grundwartezeit vor einem neuen Versuch nach vorübergehenden Agent-Fehlern (ms, Standard 5000; Tests kürzer) */
+	retryBaseMs?: number;
+	/** Abfrageintervall der Recherche-Schnittstelle (ms, Standard 500) */
+	researchPollMs?: number;
+}
+
+/** Ausgabe eines Projektbefehls (Exit-Code und Ende der Ausgabe für Reparaturaufträge) */
+interface ShellResult {
+	code: number | null;
+	output: string;
 }
 
 const NO_CHANGES = 'Keine Änderungen – der Agent hat nichts geändert, daher kein Commit und kein PR.';
@@ -402,6 +445,7 @@ export class Executor {
 
 		let wtDir: string | null = null;
 		let pull: PullContext | null = null;
+		let research: ResearchBridge | null = null;
 		let stopCheckpoints = () => undefined as void;
 		try {
 			emit('status', { text: 'Repository wird vorbereitet' });
@@ -431,66 +475,204 @@ export class Executor {
 				emit('status', { text: 'Projekt wird eingerichtet (setupCmd)' });
 				const r = await this.shell(offer.project.setupCmd, wtDir, publicEnv(baseEnv), signal, timeoutMs, emit);
 				checkAbort();
-				if (r !== 0) throw new RunError('setup', `setupCmd fehlgeschlagen (Exit-Code ${r ?? 'unbekannt'})`);
+				if (r.code !== 0) throw new RunError('setup', `setupCmd fehlgeschlagen (Exit-Code ${r.code ?? 'unbekannt'})`);
 			}
 
 			// 2b. Anhänge nach `.aidev/attachments/` (nie committet, siehe `excludeAidevDir`)
 			const hint = await this.prepareAttachments(offer, wtDir, signal, emit);
 			checkAbort();
 
+			// 2c. Recherche-Schnittstelle (`.aidev/bin/research.mjs`, nie committet)
+			const dir = wtDir;
+			const researchMax = this.o.config.researchMax ?? 3;
+			if (this.o.config.research !== false && researchMax > 0 && !offer.question && offer.role !== 'research') {
+				try {
+					await ws.withRepo(repo, () => excludeAidevDir(ws, dir));
+					const bridge = new ResearchBridge({
+						worktree: dir,
+						max: researchMax,
+						pollMs: this.o.researchPollMs,
+						handle: (req, s) =>
+							this.research(offer, acct, dir, req, AbortSignal.any([signal, s]), emit, (u) => {
+								usage = addUsage(usage, u);
+							}),
+						onError: (m) => emit('error', { text: `Recherche fehlgeschlagen: ${m}` })
+					});
+					await bridge.start();
+					research = bridge;
+				} catch (e) {
+					log.warn('Recherche-Schnittstelle nicht verfügbar', errorMessage(e));
+				}
+			}
+			const exclude = [
+				...(offer.attachments?.length ? [ATTACHMENTS_DIR] : []),
+				...(research ? [RESEARCH_DIR, TOOLS_DIR] : [])
+			];
+			run.exclude = exclude;
+
 			// 3. Agent
 			emit('status', { text: `Agent startet (${offer.account.provider}${offer.model ? `, ${offer.model}` : ''})` });
 			await mkdir(tmpDir, { recursive: true });
 			const adapter = this.o.adapters[acct.provider];
 			const prompt = [offer.prompt, hint, pull?.markdown].filter((p): p is string => !!p).join('\n\n');
-			const proc = adapter.start({
-				cwd: wtDir,
-				prompt,
-				systemPrompt: offer.systemPrompt,
-				model: offer.model ?? (acct.provider === 'openai-api' ? (acct.model ?? null) : null),
-				resumeSessionId: offer.resumeSessionId,
-				env: baseEnv,
-				readOnly: offer.readOnly,
-				question: offer.question === true,
-				signal,
-				account: acct,
-				tmpDir
-			});
-			let limit: AgentLimit | null = null;
-			for await (const ev of proc.events) {
-				if (ev.kind === 'usage') usage = ev.usage;
-				else if (ev.kind === 'session') sessionId = ev.id;
-				else if (ev.kind === 'limits') {
-					streamLimits = true;
-					this.limits.update(acct.key, ev.windows, 'stream');
-				} else if (ev.kind === 'limit') {
-					if (!limit) {
-						limit = { limitKind: ev.limitKind, resetsAt: ev.resetsAt, raw: ev.raw };
-						emit('error', { text: `Limit erreicht (${ev.limitKind})${ev.resetsAt ? `, zurückgesetzt ${ev.resetsAt}` : ''}` });
-						await postLimit(limit);
-						if (!run.reason) run.reason = 'limit';
-						proc.kill();
+			const systemPrompt = research
+				? `${offer.systemPrompt}\n${researchPromptSection({ max: researchMax })}`
+				: offer.systemPrompt;
+			const model = offer.model ?? (acct.provider === 'openai-api' ? (acct.model ?? null) : null);
+			const repairRounds = this.o.config.autoRepairRounds ?? 2;
+			const repairNotes: string[] = [];
+			let turnNo = 0;
+
+			/** Ein Aufruf des Agents; Limit → `LimitStop`, Abbruch/Zeitlimit → `RunError` */
+			const turn = async (text: string, resume: string | null): Promise<AgentResult> => {
+				turnNo++;
+				const proc = adapter.start({
+					cwd: dir,
+					prompt: text,
+					systemPrompt,
+					model,
+					resumeSessionId: resume,
+					env: baseEnv,
+					readOnly: offer.readOnly,
+					question: offer.question === true,
+					signal,
+					account: acct,
+					tmpDir: turnNo === 1 ? tmpDir : path.join(tmpDir, `turn-${turnNo}`)
+				});
+				let limit: AgentLimit | null = null;
+				let turnUsage: AgentUsage | null = null;
+				for await (const ev of proc.events) {
+					if (ev.kind === 'usage') turnUsage = ev.usage;
+					else if (ev.kind === 'session') sessionId = ev.id;
+					else if (ev.kind === 'limits') {
+						streamLimits = true;
+						this.limits.update(acct.key, ev.windows, 'stream');
+					} else if (ev.kind === 'limit') {
+						if (!limit) {
+							limit = { limitKind: ev.limitKind, resetsAt: ev.resetsAt, raw: ev.raw };
+							emit('error', { text: `Limit erreicht (${ev.limitKind})${ev.resetsAt ? `, zurückgesetzt ${ev.resetsAt}` : ''}` });
+							await postLimit(limit);
+							if (!run.reason) run.reason = 'limit';
+							proc.kill();
+						}
+					} else emit(ev.kind, ev.payload);
+				}
+				const result: AgentResult = await proc.done;
+				usage = addUsage(usage, result.usage ?? turnUsage);
+				if (result.sessionId) sessionId = result.sessionId;
+				limit = limit ?? result.limit;
+				if (limit) {
+					await postLimit(limit);
+					if (limit.limitKind === 'auth') throw new RunError('auth', 'Konto nicht (mehr) angemeldet');
+					throw new LimitStop(limit, result.lastText);
+				}
+				if (run.reason === 'timeout') throw new RunError('timeout', `Zeitlimit von ${offer.timeoutSec} s überschritten`);
+				if (run.reason) throw new RunError('cancelled', run.cancelMessage || 'Abgebrochen');
+				return result;
+			};
+			const canResume = () => adapter.resumable === true && !!sessionId;
+
+			/** Agent-Aufruf mit Wiederholung bei vorübergehenden Fehlern (Überlastung, 5xx, Netzwerk) */
+			const agentTurn = async (text: string, resume: string | null): Promise<AgentResult> => {
+				let r = await turn(text, resume);
+				for (let retry = 1; r.exitCode !== 0 && retry <= TRANSIENT_RETRIES && repairRounds > 0; retry++) {
+					if (!isTransientAgentError(`${r.error ?? ''}\n${r.lastText}`)) break;
+					emit('status', { text: `Vorübergehender Fehler des Agents – neuer Versuch ${retry}/${TRANSIENT_RETRIES}` });
+					await sleep(backoffMs(retry, this.o.retryBaseMs ?? 5000, 60_000), signal);
+					checkAbort();
+					r = canResume()
+						? await turn(resumeAfterErrorPrompt(r.error ?? r.lastText), sessionId)
+						: await turn(text, resume);
+					if (r.exitCode === 0)
+						repairNotes.push(`Vorübergehender Fehler des Agents nach ${retry} Wiederholung(en) überbrückt.`);
+				}
+				if (r.exitCode !== 0)
+					throw new RunError('agent', r.error ?? `Agent beendet mit Exit-Code ${r.exitCode ?? 'unbekannt'}`);
+				return r;
+			};
+			/** Reparaturauftrag im selben Worktree: Sitzung fortsetzen (sonst ursprünglicher Auftrag + Reparatur) */
+			const repairTurn = (text: string): Promise<AgentResult> =>
+				canResume() ? agentTurn(text, sessionId) : agentTurn(`${prompt}\n\n${text}`, null);
+
+			const d = offer.delivery;
+			const mergeBase = d.mode === 'integrate' ? d.integrationBranch : offer.project.defaultBranch;
+			const mergeMessage = (label: string) => `Merge ${label} (Konfliktlösung)\n\nAidev-Task: ${offer.taskId}`;
+			const resolveDone = async (label: string, files: string[], round: number, text: string) => {
+				await concludeMerge(ws, dir, mergeMessage(label), exclude);
+				emit('git', { action: 'merge', detail: `Konflikt mit ${label} vom Agent gelöst (Runde ${round})` });
+				repairNotes.push(
+					`Merge-Konflikt mit ${label} eigenständig gelöst (${files.join(', ')})` +
+						(text ? `:\n  ${tailText(text, 1500).replace(/\n/g, '\n  ')}` : '')
+				);
+			};
+			/**
+			 * `target` (SHA) in den Worktree mergen und Konflikte vom Agent lösen lassen (bis zu `repairRounds`
+			 * Aufrufe). Mit `pending` läuft der Merge schon (der Agent hat einen Versuch hinter sich). Ungelöst →
+			 * `RunError('conflict')` (Atrium plant dann eine Konfliktlösung bzw. fragt nach).
+			 */
+			const resolveConflicts = async (target: string, label: string, pending?: { files: string[]; text: string }): Promise<void> => {
+				let files: string[];
+				if (pending) {
+					files = await unresolvedFiles(ws, dir, pending.files);
+					if (!files.length) {
+						if (await mergeInProgress(ws, dir)) await resolveDone(label, pending.files, 0, pending.text);
+						return;
 					}
-				} else emit(ev.kind, ev.payload);
+				} else {
+					const started = await startMerge(ws, dir, target, mergeMessage(label));
+					if (started.clean) {
+						emit('git', { action: 'merge', detail: `${label} ohne Konflikt hineingemergt` });
+						return;
+					}
+					files = started.files;
+					emit('git', {
+						action: 'conflict',
+						detail: `Konflikt mit ${label} in ${files.length} Datei(en) – Agent löst ihn: ${files.slice(0, 10).join(', ')}`
+					});
+				}
+				const all = pending?.files ?? files;
+				for (let round = 1; round <= repairRounds; round++) {
+					const text =
+						round === 1 && !pending
+							? conflictRepairPrompt({ files, target: label, round, rounds: repairRounds, testCmd: offer.project.testCmd })
+							: unresolvedPrompt(files);
+					const r = await repairTurn(text);
+					checkAbort();
+					const left = await unresolvedFiles(ws, dir, all);
+					if (!left.length) {
+						await resolveDone(label, all, round, r.lastText);
+						return;
+					}
+					files = left;
+				}
+				await abortMerge(ws, dir);
+				throw new RunError('conflict', `Konflikt mit ${label} konnte im Lauf nicht gelöst werden`, files);
+			};
+
+			// 3a. Konfliktlösung (Rolle `resolve`): Ziel vor dem ersten Aufruf hineinmergen, damit die Konflikte
+			// wirklich im Worktree stehen und der Agent sie gleich im ersten Durchgang löst
+			let resolvePending: { target: string; label: string; files: string[] } | null = null;
+			let firstPrompt = prompt;
+			if (offer.role === 'resolve' && !offer.readOnly && repairRounds > 0) {
+				await ws.ensureCache(repo, signal);
+				const sha = await ws.revParse(dir, `refs/remotes/origin/${mergeBase}`);
+				const label = `origin/${mergeBase}`;
+				if (sha) {
+					const started = await startMerge(ws, dir, sha, mergeMessage(label));
+					if (started.clean) emit('git', { action: 'merge', detail: `${label} ohne Konflikt hineingemergt` });
+					else {
+						resolvePending = { target: sha, label, files: started.files };
+						emit('git', {
+							action: 'conflict',
+							detail: `Konflikt mit ${label} in ${started.files.length} Datei(en): ${started.files.slice(0, 10).join(', ')}`
+						});
+						firstPrompt = `${prompt}\n\n${conflictRepairPrompt({ files: started.files, target: label, round: 1, rounds: repairRounds, testCmd: offer.project.testCmd })}`;
+					}
+				}
 			}
-			const result: AgentResult = await proc.done;
-			if (result.usage) usage = result.usage;
-			if (result.sessionId) sessionId = result.sessionId;
-			limit = limit ?? result.limit;
-			if (limit) {
-				await postLimit(limit);
-				if (limit.limitKind === 'auth') throw new RunError('auth', 'Konto nicht (mehr) angemeldet');
-				finish.status = 'limited';
-				finish.errorKind = 'limit';
-				finish.errorMessage = `Limit erreicht (${limit.limitKind})`;
-				finish.summary = result.lastText || null;
-				return;
-			}
-			if (run.reason === 'timeout') throw new RunError('timeout', `Zeitlimit von ${offer.timeoutSec} s überschritten`);
-			if (run.reason) throw new RunError('cancelled', run.cancelMessage || 'Abgebrochen');
-			if (result.exitCode !== 0)
-				throw new RunError('agent', result.error ?? `Agent beendet mit Exit-Code ${result.exitCode ?? 'unbekannt'}`);
-			const summary = result.lastText || null;
+
+			const first = await agentTurn(firstPrompt, offer.resumeSessionId);
+			const summary = first.lastText || null;
 			finish.summary = summary;
 
 			// 4. Nur lesen
@@ -506,9 +688,15 @@ export class Executor {
 				return;
 			}
 
+			// 4b. Konfliktlösung: Ergebnis des ersten Durchgangs prüfen, ggf. nachbessern lassen
+			if (resolvePending)
+				await resolveConflicts(resolvePending.target, resolvePending.label, {
+					files: resolvePending.files,
+					text: first.lastText
+				});
+
 			// 5. Schreibend: Commit
-			// Anhangsablage nie in den Index aufnehmen (zusätzlich zu `info/exclude`)
-			const exclude = offer.attachments?.length ? [ATTACHMENTS_DIR] : [];
+			// Anhangsablage und Recherche-Dateien nie in den Index aufnehmen (zusätzlich zu `info/exclude`)
 			const committed = await commitAll(ws, wtDir, offer.title, offer.taskId, exclude);
 			if (committed) emit('git', { action: 'commit', detail: 'Änderungen committet' });
 			const newCommits = await countCommits(ws, wtDir, prepared.startSha);
@@ -530,103 +718,114 @@ export class Executor {
 			}
 			checkAbort();
 
-			// Tests vor dem Push
-			const dir = wtDir;
-			const runTests = async (label: string, failure: string) => {
+			// Tests vor dem Push; schlagen sie fehl, bessert der Agent im selben Lauf nach (bis zu `repairRounds`)
+			let testRounds = 0;
+			const runTests = async (label: string, failure: string): Promise<void> => {
 				if (!offer.project.testCmd.trim()) return;
-				emit('status', { text: label });
-				const r = await this.shell(offer.project.testCmd, dir, publicEnv(baseEnv), signal, timeoutMs, emit);
-				checkAbort();
-				if (r !== 0) {
-					finish.commits = await commitInfos(ws, dir, prepared.startSha);
-					throw new RunError('tests', `${failure} (Exit-Code ${r ?? 'unbekannt'}) – nichts gepusht`);
+				for (;;) {
+					emit('status', { text: label });
+					const r = await this.shell(offer.project.testCmd, dir, publicEnv(baseEnv), signal, timeoutMs, emit);
+					checkAbort();
+					if (r.code === 0) {
+						if (testRounds) repairNotes.push(`Fehlgeschlagene Tests nach ${testRounds} Nachbesserung(en) behoben.`);
+						return;
+					}
+					if (testRounds >= repairRounds) {
+						finish.commits = await commitInfos(ws, dir, prepared.startSha);
+						throw new RunError(
+							'tests',
+							`${failure} (Exit-Code ${r.code ?? 'unbekannt'})${testRounds ? ` – auch nach ${testRounds} Nachbesserung(en)` : ''} – nichts gepusht`
+						);
+					}
+					testRounds++;
+					emit('status', { text: `Tests fehlgeschlagen – Agent bessert nach (Runde ${testRounds}/${repairRounds})` });
+					await repairTurn(
+						testRepairPrompt({
+							testCmd: offer.project.testCmd.trim(),
+							exitCode: r.code,
+							output: r.output,
+							round: testRounds,
+							rounds: repairRounds
+						})
+					);
+					checkAbort();
+					if (await commitAll(ws, dir, `${offer.title} (Nachbesserung Tests)`, offer.taskId, exclude))
+						emit('git', { action: 'commit', detail: 'Nachbesserung committet' });
 				}
 			};
 			await runTests('Tests laufen (testCmd)', 'Tests fehlgeschlagen');
 
-			// Auslieferung – nur mit gültiger Lease (Fencing: ein aufgewachter PC pusht nie einen übernommenen Lauf)
-			stopCheckpoints();
-			await this.assertLease(offer);
-			checkAbort();
-			let commitBase = prepared.startSha;
-			const d = offer.delivery;
-			const gitEmit = (k: RunEventKind, p: Record<string, unknown>) => emit(k, p);
-			if (d.mode === 'branch') {
-				await pushBranch(ws, repo, wtDir, offer.branch, prepared.remoteSha, gitEmit);
-				finish.branchPushed = true;
-			} else if (d.mode === 'pr') {
-				await pushBranch(ws, repo, wtDir, offer.branch, prepared.remoteSha, gitEmit);
-				const pr = await ensurePullRequest(
-					ws,
-					repo,
-					{ branch: offer.branch, base: offer.project.defaultBranch, title: d.title || offer.title, body: d.body },
-					gitEmit
-				);
-				finish.pr = pr;
-				if (d.autoMerge) await enableAutoMerge(ws, repo, pr.number, gitEmit);
-			} else if (d.mode === 'pr-update') {
-				if (!integratedOnly) {
-					// Kein Force-Push: parallel gepushte Commits werden per Rebase übernommen
-					const synced = await syncPullBranch(
-						ws,
-						repo,
-						{ dir: wtDir, branch: offer.branch, number: d.number, expectedRemote: prepared.remoteSha },
-						gitEmit
-					);
-					commitBase = synced.base;
-					// Der getestete Stand ist nach dem Rebase nicht mehr der auszuliefernde → erneut testen
-					if (synced.rebased)
-						await runTests(
-							'Tests laufen erneut (testCmd, nach Rebase auf parallel gepushte Commits)',
-							'Tests nach Rebase auf parallel gepushte Commits fehlgeschlagen'
-						);
-					await pushBranch(ws, repo, wtDir, offer.branch, commitBase, gitEmit, { allowForce: false });
+			// PR/Branch: Konflikte mit dem Haupt-Branch vorab lösen, damit der PR mergebar bleibt
+			if ((d.mode === 'pr' || d.mode === 'branch') && repairRounds > 0) {
+				await ws.ensureCache(repo, signal);
+				const sha = await ws.revParse(dir, `refs/remotes/origin/${mergeBase}`);
+				if (sha && (await wouldConflict(ws, dir, sha))) {
+					// Best effort: Gelingt es nicht, wird wie bisher ausgeliefert (PR zeigt den Konflikt)
+					try {
+						await resolveConflicts(sha, `origin/${mergeBase}`);
+						await runTests('Tests laufen erneut (testCmd, nach Konfliktlösung)', 'Tests nach Konfliktlösung fehlgeschlagen');
+					} catch (e) {
+						if (!(e instanceof RunError) || e.kind !== 'conflict') throw e;
+						emit('error', { text: `${e.message} – ${d.mode === 'pr' ? 'PR' : 'Branch'} wird trotzdem ausgeliefert` });
+					}
 				}
-				// Bei `integratedOnly` liegen die Änderungen der Teilaufträge bereits auf dem PR-Branch
-				finish.branchPushed = true;
-				const url =
-					pull?.url || (await pullUrl(ws, repo, d.number)) ||
-					`https://github.com/${repo.repoOwner}/${repo.repoName}/pull/${d.number}`;
-				finish.pr = { number: d.number, url };
-				emit('git', { action: 'pr', detail: `PR #${d.number} aktualisiert`, url });
-				const commits = await commitInfos(ws, wtDir, commitBase);
-				const body = pullCommentBody({
-					summary: summary ? redactor.redact(summary) : null,
-					commits,
-					taskId: offer.taskId,
-					note: d.integrated
-						? 'Die Änderungen der Teilaufträge wurden bereits einzeln in den PR-Branch gemergt.'
-						: undefined
-				});
-				await commentOnPull(ws, repo, d.number, redactor.redact(body), gitEmit);
-			} else if (d.mode === 'direct') {
-				commitBase = await deliverDirect(ws, repo, wtDir, offer.project.defaultBranch, gitEmit);
-				finish.merged = true;
-				finish.branch = offer.project.defaultBranch;
-			} else if (d.mode === 'integrate') {
-				await pushBranch(ws, repo, wtDir, offer.branch, prepared.remoteSha, gitEmit);
-				await deliverIntegrate(
-					ws,
-					repo,
-					{
-						dir: wtDir,
-						branch: offer.branch,
-						integrationBranch: d.integrationBranch,
-						defaultBranch: offer.project.defaultBranch,
-						runId: offer.runId,
-						taskId: offer.taskId,
-						pullNumber: d.pullNumber
-					},
-					gitEmit
-				);
-				finish.merged = true;
+			}
+			/** Endgültiger Konflikt bei „direkt“: Arbeitsstand auf dem Auftrags-Branch sichern (für die Konfliktlösung) */
+			const keepWork = async () => {
+				if (d.mode !== 'direct' || offer.branch === offer.project.defaultBranch) return;
+				try {
+					await abortMerge(ws, dir);
+					await pushBranch(ws, repo, dir, offer.branch, prepared.remoteSha, emit);
+					emit('git', { action: 'push', detail: `Arbeitsstand für die Konfliktlösung auf ${offer.branch} gesichert` });
+				} catch (e) {
+					log.warn('Arbeitsstand konnte nicht gesichert werden', errorMessage(e));
+				}
+			};
+
+			// Auslieferung – nur mit gültiger Lease (Fencing: ein aufgewachter PC pusht nie einen übernommenen Lauf).
+			// Konflikte beim Ausliefern löst der Agent im selben Lauf; danach wird erneut getestet und ausgeliefert.
+			stopCheckpoints();
+			let commitBase = prepared.startSha;
+			for (let conflictRound = 0; ; conflictRound++) {
+				await this.assertLease(offer);
+				checkAbort();
+				try {
+					commitBase = await this.deliver(offer, dir, prepared, { summary, integratedOnly, pull, finish, runTests, emit });
+					break;
+				} catch (e) {
+					if (!(e instanceof DeliveryError) || e.kind !== 'conflict' || !e.target) throw e;
+					if (conflictRound >= repairRounds) {
+						await keepWork();
+						throw e;
+					}
+					emit('status', {
+						text: `Konflikt beim Ausliefern – Agent löst ihn (Runde ${conflictRound + 1}/${repairRounds})`
+					});
+					const label = d.mode === 'pr-update' ? `origin/${offer.branch}` : `origin/${mergeBase}`;
+					try {
+						await resolveConflicts(e.target, label);
+					} catch (re) {
+						if (re instanceof RunError && re.kind === 'conflict') await keepWork();
+						throw re;
+					}
+					await runTests('Tests laufen erneut (testCmd, nach Konfliktlösung)', 'Tests nach Konfliktlösung fehlgeschlagen');
+				}
 			}
 			finish.headSha = await headSha(ws, wtDir);
 			finish.commits = await commitInfos(ws, wtDir, commitBase);
 			finish.status = 'succeeded';
+			if (repairNotes.length)
+				finish.summary = `${finish.summary ?? ''}\n\n---\n**Automatisch im selben Lauf nachgebessert:**\n${repairNotes.map((n) => `- ${n}`).join('\n')}`.trim();
 			// fortgesetzten Zwischenstand aufräumen (best effort; der eigene Ref wird nicht mehr gebraucht)
 			if (prepared.resumedWip) await deleteWip(ws, repo, wtDir, prepared.resumedWip).catch(() => false);
 		} catch (e) {
+			if (e instanceof LimitStop) {
+				finish.status = 'limited';
+				finish.errorKind = 'limit';
+				finish.errorMessage = e.message;
+				finish.summary = finish.summary ?? (e.lastText || null);
+				return;
+			}
 			const err = toRunError(e, run);
 			finish.status = err.kind === 'cancelled' ? 'cancelled' : 'failed';
 			finish.errorKind = err.kind;
@@ -646,6 +845,7 @@ export class Executor {
 		} finally {
 			clearTimeout(timer);
 			stopCheckpoints();
+			await research?.stop().catch(() => undefined);
 			await rm(tmpDir, { recursive: true, force: true }).catch(() => undefined);
 			finish.sessionId = sessionId ? sessionId.slice(0, 200) : null;
 			if (finish.summary) finish.summary = redactor.redact(finish.summary).slice(0, 40_000);
@@ -730,7 +930,7 @@ export class Executor {
 		const timer = setTimeout(() => ctrl.abort(), budget);
 		timer.unref();
 		try {
-			const exclude = offer.attachments?.length ? [ATTACHMENTS_DIR] : [];
+			const exclude = run.exclude ?? (offer.attachments?.length ? [ATTACHMENTS_DIR] : []);
 			const snap = await snapshotWip(ws, dir, { runId: offer.runId, taskId: offer.taskId, reason, exclude, signal: ctrl.signal });
 			await pushWip(ws, repo, dir, snap, { timeoutMs: Math.max(1000, budget), signal: ctrl.signal });
 			out.wipPushed = true;
@@ -767,7 +967,7 @@ export class Executor {
 			if (busy || run.reason) return;
 			busy = true;
 			try {
-				const exclude = offer.attachments?.length ? [ATTACHMENTS_DIR] : [];
+				const exclude = run.exclude ?? (offer.attachments?.length ? [ATTACHMENTS_DIR] : []);
 				const snap = await snapshotWip(ws, dir, { runId: offer.runId, taskId: offer.taskId, reason: 'checkpoint', exclude });
 				const tree = (await ws.run(dir, ['rev-parse', `${snap.sha}^{tree}`])).stdout.trim() + snap.parent;
 				if (tree === last || run.reason) return;
@@ -923,8 +1123,13 @@ export class Executor {
 		signal: AbortSignal,
 		timeoutMs: number,
 		emit: (k: RunEventKind, p: Record<string, unknown>) => void
-	): Promise<number | null> {
+	): Promise<ShellResult> {
 		emit('system', { text: `$ ${cmd}` });
+		// Ende der Ausgabe für einen Reparaturauftrag merken (stdout und stderr in Reihenfolge)
+		let tail = '';
+		const keep = (t: string) => {
+			tail = (tail + t).slice(-40_000);
+		};
 		const out = new ChunkEmitter((t) => emit('system', { text: t }));
 		const err = new ChunkEmitter((t) => emit('stderr', { text: t }));
 		const r = await exec(cmd, [], {
@@ -934,15 +1139,225 @@ export class Executor {
 			signal,
 			timeoutMs,
 			maxStdoutBytes: 50_000_000,
-			onStdout: (s) => out.push(s),
-			onStderr: (s) => err.push(s)
+			onStdout: (s) => {
+				keep(s);
+				out.push(s);
+			},
+			onStderr: (s) => {
+				keep(s);
+				err.push(s);
+			}
 		});
 		out.end();
 		err.end();
-		if (r.spawnError) emit('stderr', { text: `Befehl konnte nicht gestartet werden: ${r.spawnError}` });
-		if (r.timedOut) return -1;
-		return r.code;
+		if (r.spawnError) {
+			emit('stderr', { text: `Befehl konnte nicht gestartet werden: ${r.spawnError}` });
+			keep(`\nBefehl konnte nicht gestartet werden: ${r.spawnError}`);
+		}
+		if (r.timedOut) return { code: -1, output: `${tail}\n(Zeitlimit überschritten)` };
+		return { code: r.code, output: tail };
 	}
+
+	/**
+	 * Auslieferung nach `offer.delivery` (Push, PR, PR-Update, direkt, Integrations-Branch). Setzt die Felder von
+	 * `finish` und liefert die Basis der ausgelieferten Commits. Konflikte werfen `DeliveryError('conflict')` mit
+	 * `target` – die eigenständige Konfliktlösung übernimmt der Aufrufer.
+	 */
+	private async deliver(
+		offer: RunOffer,
+		dir: string,
+		prepared: { startSha: string; remoteSha: string | null },
+		c: {
+			summary: string | null;
+			integratedOnly: boolean;
+			pull: PullContext | null;
+			finish: FinishInput;
+			runTests: (label: string, failure: string) => Promise<void>;
+			emit: (k: RunEventKind, p: Record<string, unknown>) => void;
+		}
+	): Promise<string> {
+		const ws = this.o.workspace;
+		const redactor = this.o.redactor;
+		const repo = { repoOwner: offer.project.repoOwner, repoName: offer.project.repoName };
+		const { finish } = c;
+		const gitEmit = (k: RunEventKind, p: Record<string, unknown>) => c.emit(k, p);
+		let commitBase = prepared.startSha;
+		const d = offer.delivery;
+		if (d.mode === 'branch') {
+			await pushBranch(ws, repo, dir, offer.branch, prepared.remoteSha, gitEmit);
+			finish.branchPushed = true;
+		} else if (d.mode === 'pr') {
+			await pushBranch(ws, repo, dir, offer.branch, prepared.remoteSha, gitEmit);
+			const pr = await ensurePullRequest(
+				ws,
+				repo,
+				{ branch: offer.branch, base: offer.project.defaultBranch, title: d.title || offer.title, body: d.body },
+				gitEmit
+			);
+			finish.pr = pr;
+			if (d.autoMerge) await enableAutoMerge(ws, repo, pr.number, gitEmit);
+		} else if (d.mode === 'pr-update') {
+			if (!c.integratedOnly) {
+				// Kein Force-Push: parallel gepushte Commits werden per Rebase übernommen
+				const synced = await syncPullBranch(
+					ws,
+					repo,
+					{ dir, branch: offer.branch, number: d.number, expectedRemote: prepared.remoteSha },
+					gitEmit
+				);
+				commitBase = synced.base;
+				// Der getestete Stand ist nach dem Rebase nicht mehr der auszuliefernde → erneut testen
+				if (synced.rebased)
+					await c.runTests(
+						'Tests laufen erneut (testCmd, nach Rebase auf parallel gepushte Commits)',
+						'Tests nach Rebase auf parallel gepushte Commits fehlgeschlagen'
+					);
+				await pushBranch(ws, repo, dir, offer.branch, commitBase, gitEmit, { allowForce: false });
+			}
+			// Bei `integratedOnly` liegen die Änderungen der Teilaufträge bereits auf dem PR-Branch
+			finish.branchPushed = true;
+			const url =
+				c.pull?.url ||
+				(await pullUrl(ws, repo, d.number)) ||
+				`https://github.com/${repo.repoOwner}/${repo.repoName}/pull/${d.number}`;
+			finish.pr = { number: d.number, url };
+			c.emit('git', { action: 'pr', detail: `PR #${d.number} aktualisiert`, url });
+			const commits = await commitInfos(ws, dir, commitBase);
+			const body = pullCommentBody({
+				summary: c.summary ? redactor.redact(c.summary) : null,
+				commits,
+				taskId: offer.taskId,
+				note: d.integrated ? 'Die Änderungen der Teilaufträge wurden bereits einzeln in den PR-Branch gemergt.' : undefined
+			});
+			await commentOnPull(ws, repo, d.number, redactor.redact(body), gitEmit);
+		} else if (d.mode === 'direct') {
+			commitBase = await deliverDirect(ws, repo, dir, offer.project.defaultBranch, gitEmit);
+			finish.merged = true;
+			finish.branch = offer.project.defaultBranch;
+		} else if (d.mode === 'integrate') {
+			await pushBranch(ws, repo, dir, offer.branch, prepared.remoteSha, gitEmit);
+			await deliverIntegrate(
+				ws,
+				repo,
+				{
+					dir,
+					branch: offer.branch,
+					integrationBranch: d.integrationBranch,
+					defaultBranch: offer.project.defaultBranch,
+					runId: offer.runId,
+					taskId: offer.taskId,
+					pullNumber: d.pullNumber
+				},
+				gitEmit
+			);
+			finish.merged = true;
+		}
+		return commitBase;
+	}
+
+	/**
+	 * Recherche für einen laufenden Agent (Recherche-Schnittstelle): eigener, nur lesender Agent-Aufruf im selben
+	 * Worktree. Konto: `researchAccounts` (in Reihenfolge), sonst ein anderes freies Konto, sonst dasselbe. Stößt ein
+	 * Konto an sein Limit, wird das nächste versucht. Verbrauch desselben Kontos zählt zum Lauf (`onUsage`).
+	 */
+	private async research(
+		offer: RunOffer,
+		acct: AccountConfig,
+		dir: string,
+		req: ResearchRequest,
+		signal: AbortSignal,
+		emit: (k: RunEventKind, p: Record<string, unknown>) => void,
+		onUsage: (u: AgentUsage) => void
+	): Promise<string> {
+		const candidates = this.researchAccounts(acct);
+		if (!candidates.length) throw new Error('Kein angemeldetes Konto für Recherchen verfügbar');
+		const q = req.question.replace(/\s+/g, ' ').trim();
+		const errors: string[] = [];
+		for (const cand of candidates.slice(0, 3)) {
+			if (signal.aborted) throw new Error('Abgebrochen');
+			emit('status', { text: `Recherche über ${cand.key} (${cand.provider}): ${q.slice(0, 200)}` });
+			const tmp = path.join(this.o.workspace.tmpRoot, offer.runId, `research-${Date.now().toString(36)}`);
+			await mkdir(tmp, { recursive: true });
+			const ctrl = new AbortController();
+			const timer = setTimeout(() => ctrl.abort(), 15 * 60_000);
+			timer.unref();
+			try {
+				const proc = this.o.adapters[cand.provider].start({
+					cwd: dir,
+					prompt: researchTaskPrompt(req, { title: offer.title }),
+					systemPrompt: researchSystemPrompt({
+						repo: `${offer.project.repoOwner}/${offer.project.repoName}`,
+						defaultBranch: offer.project.defaultBranch
+					}),
+					model: cand.provider === 'openai-api' ? (cand.model ?? null) : null,
+					resumeSessionId: null,
+					env: accountEnv(cand, process.env, { AIDEV_RUN_ID: offer.runId, AIDEV_TASK_ID: offer.taskId }),
+					readOnly: true,
+					question: true,
+					research: true,
+					signal: AbortSignal.any([signal, ctrl.signal]),
+					account: cand,
+					tmpDir: tmp
+				});
+				let limit: AgentLimit | null = null;
+				let u: AgentUsage | null = null;
+				for await (const ev of proc.events) {
+					if (ev.kind === 'usage') u = ev.usage;
+					else if (ev.kind === 'limits') this.limits.update(cand.key, ev.windows, 'stream');
+					else if (ev.kind === 'limit') {
+						if (!limit) {
+							limit = { limitKind: ev.limitKind, resetsAt: ev.resetsAt, raw: ev.raw };
+							proc.kill();
+						}
+					} else if (ev.kind === 'tool') {
+						const name = typeof ev.payload.name === 'string' ? ev.payload.name : 'tool';
+						emit('system', { text: `Recherche (${cand.key}): ${name}` });
+					}
+				}
+				const r = await proc.done;
+				u = r.usage ?? u;
+				if (u && cand.key === acct.key) onUsage(u);
+				limit = limit ?? r.limit;
+				if (limit) {
+					const w = limitHitWindow(limit.limitKind, limit.resetsAt);
+					if (w) this.limits.update(cand.key, [w], 'error');
+					errors.push(`${cand.key}: Limit erreicht (${limit.limitKind})`);
+					continue;
+				}
+				if (signal.aborted) throw new Error('Abgebrochen');
+				if (r.exitCode !== 0 || !r.lastText.trim()) {
+					errors.push(`${cand.key}: ${r.error ?? 'keine Antwort'}`);
+					continue;
+				}
+				const answer = this.o.redactor.redact(r.lastText.trim());
+				emit('system', { text: `Recherche-Ergebnis (${cand.key}):\n${tailText(answer, 4000)}` });
+				return answer;
+			} finally {
+				clearTimeout(timer);
+				await rm(tmp, { recursive: true, force: true }).catch(() => undefined);
+			}
+		}
+		throw new Error(errors.join('; ').slice(0, 2000) || 'Recherche fehlgeschlagen');
+	}
+
+	/** Konten für Recherchen in Reihenfolge der Eignung (angemeldet, verfügbar, nicht am Limit) */
+	private researchAccounts(current: AccountConfig): AccountConfig[] {
+		const all = [...this.o.accounts().values()].filter((a) => a.ok && a.loggedIn).map((a) => a.config);
+		const now = Date.now();
+		const limited = (key: string) =>
+			(this.limits.snapshot(key)?.windows ?? []).some(
+				(w) => w.status === 'rejected' && (!w.resetsAt || Date.parse(w.resetsAt) > now)
+			);
+		// Fake-Konten nur, wenn der Lauf selbst ein Fake-Konto nutzt (Tests/Vorführung)
+		const usable = all.filter((a) => (a.provider !== 'fake' || current.provider === 'fake') && !limited(a.key));
+		const preferred = (this.o.config.researchAccounts ?? [])
+			.map((k) => usable.find((a) => a.key === k))
+			.filter((a): a is AccountConfig => !!a);
+		const others = usable.filter((a) => a.key !== current.key && !preferred.includes(a));
+		const self = usable.filter((a) => a.key === current.key && !preferred.includes(a));
+		return [...preferred, ...others, ...self];
+	}
+
 }
 
 /** Fasst Ausgabe zu Ereignissen zusammen (je ~4 KB bzw. 200 ms) */
@@ -966,6 +1381,17 @@ class ChunkEmitter {
 	end(): void {
 		this.flush();
 	}
+}
+
+/**
+ * Würde ein Merge von `target` in HEAD Konflikte erzeugen? Prüfung ohne Änderung am Worktree
+ * (`git merge-tree --write-tree`, git ≥ 2.38). Unbekannt (älteres git) → false.
+ */
+async function wouldConflict(ws: Workspace, dir: string, target: string): Promise<boolean> {
+	const anc = await ws.run(dir, ['merge-base', '--is-ancestor', target, 'HEAD'], { allowFail: true });
+	if (anc.code === 0) return false;
+	const r = await ws.run(dir, ['merge-tree', '--write-tree', '--name-only', 'HEAD', target], { allowFail: true });
+	return r.code === 1;
 }
 
 function toRunError(e: unknown, run: ActiveRun): RunError {

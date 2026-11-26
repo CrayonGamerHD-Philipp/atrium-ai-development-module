@@ -231,6 +231,7 @@ function credentialDir(env: NodeJS.ProcessEnv): string {
 
 export const claudeAdapter: ProviderAdapter = {
 	id: 'claude',
+	resumable: true,
 	async probe(acct: AccountConfig, env: NodeJS.ProcessEnv): Promise<ProbeResult> {
 		const cmd = acct.command ?? 'claude';
 		const v = await probeVersion(cmd, env);
@@ -257,7 +258,9 @@ export const claudeAdapter: ProviderAdapter = {
 			'--output-format',
 			'stream-json',
 			'--verbose',
-			...(o.question ? ['--tools', 'Read,Glob,Grep'] : ['--dangerously-skip-permissions'])
+			...(o.question
+				? ['--tools', o.research ? 'Read,Glob,Grep,WebSearch,WebFetch' : 'Read,Glob,Grep']
+				: ['--dangerously-skip-permissions'])
 		];
 		if (o.systemPrompt) args.push('--append-system-prompt-file', sysFile);
 		if (o.model) args.push('--model', o.model);

@@ -274,9 +274,10 @@ function roleSection(c: PromptContext): string[] {
 		case 'resolve':
 			return [
 				'## Your role: conflict resolution',
-				'- Resolve the merge/rebase conflicts in the listed files, preserving the intent of both sides.',
+				`- The runner merges the target branch (e.g. \`origin/${base}\`) into this branch before you start; the listed files may contain conflict markers.`,
+				'- Resolve the merge/rebase conflicts in the listed files, preserving the intent of both sides. Do not abort the merge, rebase or reset.',
 				testLine,
-				'- Commit the resolution (continue the merge/rebase if one is in progress). Do NOT push.',
+				'- Commit the resolution (`git add -A && git commit --no-edit` if a merge is in progress). Do NOT push.',
 				...prUpdateLines(c),
 				'- Finish with a short summary of how you resolved each conflict.'
 			];

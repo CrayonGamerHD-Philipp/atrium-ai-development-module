@@ -52,6 +52,8 @@ export interface StartOptions {
 	env: NodeJS.ProcessEnv;
 	readOnly: boolean;
 	question?: boolean;
+	/** Recherche für einen anderen Agent: nur lesen wie `question`, aber mit Web-Werkzeugen (soweit verfügbar) */
+	research?: boolean;
 	signal: AbortSignal;
 	account: AccountConfig;
 	/** Verzeichnis für temporäre Dateien dieses Laufs (außerhalb des Worktrees) */
@@ -67,6 +69,8 @@ export interface ProbeResult {
 
 export interface ProviderAdapter {
 	id: string;
+	/** Kann eine Sitzung fortsetzen (`resumeSessionId`) – nötig für Reparaturrunden mit vollem Kontext */
+	resumable?: boolean;
 	probe(acct: AccountConfig, env: NodeJS.ProcessEnv): Promise<ProbeResult>;
 	start(opts: StartOptions): AgentProcess;
 }

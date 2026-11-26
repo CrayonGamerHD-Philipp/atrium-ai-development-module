@@ -183,7 +183,9 @@ export const geminiAdapter: ProviderAdapter = {
 		return { ok: true, loggedIn, version: v.version };
 	},
 	start(o: StartOptions): AgentProcess {
-		const args = ['-p', GEMINI_STDIN_HINT, '--output-format', 'stream-json', ...(o.question ? ['--allowed-tools', 'read_file', 'list_directory', 'glob', 'search_file_content'] : ['--yolo'])];
+		const args = ['-p', GEMINI_STDIN_HINT, '--output-format', 'stream-json', ...(o.question
+				? ['--allowed-tools', 'read_file', 'list_directory', 'glob', 'search_file_content', ...(o.research ? ['google_web_search', 'web_fetch'] : [])]
+				: ['--yolo'])];
 		if (o.model) args.push('-m', o.model);
 		return runCliAgent({
 			command: o.account.command ?? 'gemini',

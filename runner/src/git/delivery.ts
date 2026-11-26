@@ -10,7 +10,9 @@ export class DeliveryError extends Error {
 	constructor(
 		readonly kind: 'git' | 'conflict',
 		message: string,
-		readonly conflictFiles: string[] = []
+		readonly conflictFiles: string[] = [],
+		/** Konflikt: Stand (SHA), mit dem HEAD zusammengeführt werden muss – für die eigenständige Konfliktlösung */
+		readonly target: string | null = null
 	) {
 		super(message);
 		this.name = 'DeliveryError';
@@ -437,7 +439,7 @@ export async function syncPullBranch(
 	if (rb.code !== 0) {
 		const files = await conflictFiles(ws, o.dir);
 		await ws.run(o.dir, ['rebase', '--abort'], { allowFail: true });
-		if (files.length) throw new DeliveryError('conflict', `Konflikt beim Rebase auf origin/${o.branch}`, files);
+		if (files.length) throw new DeliveryError('conflict', `Konflikt beim Rebase auf origin/${o.branch}`, files, current);
 		throw new DeliveryError('git', `Rebase auf origin/${o.branch} fehlgeschlagen:\n${(rb.stderr || rb.stdout).trim().slice(-2000)}`);
 	}
 	emit('git', { action: 'rebase', detail: `Auf neuen Stand von origin/${o.branch} rebased (parallel gepusht)` });
@@ -493,15 +495,20 @@ export async function deliverDirect(
 		await fetchRepo(ws, repo);
 		const onto = await ws.revParse(dir, `refs/remotes/origin/${defaultBranch}`);
 		if (!onto) throw new DeliveryError('git', `Branch „${defaultBranch}“ existiert im Repository nicht`);
-		const rb = await ws.run(dir, ['rebase', '--quiet', onto], { allowFail: true, config: ws.noHooks });
-		if (rb.code !== 0) {
-			const files = await conflictFiles(ws, dir);
-			await ws.run(dir, ['rebase', '--abort'], { allowFail: true });
-			if (files.length)
-				throw new DeliveryError('conflict', `Konflikt beim Rebase auf ${defaultBranch}`, files);
-			throw new DeliveryError('git', `Rebase auf ${defaultBranch} fehlgeschlagen:\n${(rb.stderr || rb.stdout).trim().slice(-2000)}`);
+		// Bereits enthalten (z. B. nach eigenständiger Konfliktlösung per Merge) → ohne Rebase vorspulen; ein Rebase
+		// würde den Merge auflösen und dieselben Konflikte erneut erzeugen
+		const contained = await ws.run(dir, ['merge-base', '--is-ancestor', onto, 'HEAD'], { allowFail: true });
+		if (contained.code !== 0) {
+			const rb = await ws.run(dir, ['rebase', '--quiet', onto], { allowFail: true, config: ws.noHooks });
+			if (rb.code !== 0) {
+				const files = await conflictFiles(ws, dir);
+				await ws.run(dir, ['rebase', '--abort'], { allowFail: true });
+				if (files.length)
+					throw new DeliveryError('conflict', `Konflikt beim Rebase auf ${defaultBranch}`, files, onto);
+				throw new DeliveryError('git', `Rebase auf ${defaultBranch} fehlgeschlagen:\n${(rb.stderr || rb.stdout).trim().slice(-2000)}`);
+			}
+			emit('git', { action: 'rebase', detail: `Auf origin/${defaultBranch} rebased (Versuch ${attempt})` });
 		}
-		emit('git', { action: 'rebase', detail: `Auf origin/${defaultBranch} rebased (Versuch ${attempt})` });
 		const pushed = await ws.withRepo(repo, () =>
 			ws.run(dir, ['push', '--porcelain', 'origin', `HEAD:refs/heads/${defaultBranch}`], {
 				allowFail: true,
@@ -563,7 +570,7 @@ export async function deliverIntegrate(
 				const files = await conflictFiles(ws, tmp);
 				await ws.run(tmp, ['merge', '--abort'], { allowFail: true });
 				if (files.length)
-					throw new DeliveryError('conflict', `Konflikt beim Mergen in ${o.integrationBranch}`, files);
+					throw new DeliveryError('conflict', `Konflikt beim Mergen in ${o.integrationBranch}`, files, target);
 				throw new DeliveryError('git', `Merge in ${o.integrationBranch} fehlgeschlagen:\n${(merge.stderr || merge.stdout).trim().slice(-2000)}`);
 			}
 			const pushed = await ws.withRepo(repo, () =>

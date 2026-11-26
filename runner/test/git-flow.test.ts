@@ -60,7 +60,9 @@ beforeAll(async () => {
 		adapters: defaultAdapters,
 		redactor: new Redactor([atrium.apiKey]),
 		accounts: () => accounts,
-		batcherFlushMs: 20
+		batcherFlushMs: 20,
+		retryBaseMs: 5,
+		researchPollMs: 50
 	});
 });
 
@@ -191,18 +193,69 @@ describe('Auslieferung', () => {
 		expect(remote.sha(o.branch)).toBeNull();
 	});
 
-	it('direct: Konflikt → failed conflict mit Dateiliste', async () => {
+	it('direct: Konflikt, den der Agent nicht löst → failed conflict mit Dateiliste', async () => {
 		// main hat AIDEV_FAKE.md (vorheriger Test); Branch startet von `old` ohne diese Datei
-		const o = offer({ delivery: { mode: 'direct' }, baseRef: 'old', prompt: 'Konflikt erzeugen' });
+		const o = offer({ delivery: { mode: 'direct' }, baseRef: 'old', prompt: 'Konflikt erzeugen [fake:keep-conflict]' });
 		const mainBefore = remote.sha('main');
 		const fin = await runOffer(o);
 		expect(fin.status).toBe('failed');
 		expect(fin.errorKind).toBe('conflict');
 		expect(fin.conflictFiles).toEqual(['AIDEV_FAKE.md']);
 		expect(remote.sha('main')).toBe(mainBefore);
-		// Rebase wurde abgebrochen, Worktree sauber
+		// Merge wurde abgebrochen, Worktree sauber
 		const wt = path.join(env.workDir, 'wt', o.runId);
 		expect(git(wt, 'status', '--porcelain')).toBe('');
+		// Arbeitsstand liegt auf dem Auftrags-Branch → die Konfliktlösung (Rolle resolve) setzt dort fort
+		expect(remote.read(o.branch, 'AIDEV_FAKE.md')).toContain('Konflikt erzeugen');
+		const resolve = offer({
+			taskId: o.taskId,
+			role: 'resolve',
+			branch: o.branch,
+			baseRef: 'old',
+			delivery: { mode: 'direct' },
+			prompt: 'Konflikte lösen'
+		});
+		const fixed = await runOffer(resolve);
+		expect(fixed).toMatchObject({ status: 'succeeded', merged: true });
+		const content = remote.read('main', 'AIDEV_FAKE.md') ?? '';
+		expect(content).toContain('Konflikt erzeugen');
+		expect(content).not.toMatch(/^(<{7}|>{7}|={7})/m);
+		expect(git(remote.bare, 'merge-base', '--is-ancestor', mainBefore!, 'main')).toBe('');
+	});
+
+	it('direct: Konflikt wird im selben Lauf vom Agent gelöst und ausgeliefert', async () => {
+		const o = offer({ delivery: { mode: 'direct' }, baseRef: 'old', prompt: 'Konflikt selbst lösen' });
+		const mainBefore = remote.sha('main');
+		const fin = await runOffer(o);
+		expect(fin).toMatchObject({ status: 'succeeded', merged: true, errorKind: null });
+		expect(remote.sha('main')).not.toBe(mainBefore);
+		// beide Seiten sind enthalten, keine Konfliktmarker
+		const content = remote.read('main', 'AIDEV_FAKE.md') ?? '';
+		expect(content).toContain('Konflikt selbst lösen');
+		expect(content).not.toMatch(/^(<{7}|>{7}|={7})/m);
+		// main vor dem Lauf ist Vorfahre (kein Rebase über den Merge, kein Force-Push)
+		expect(git(remote.bare, 'merge-base', '--is-ancestor', mainBefore!, 'main')).toBe('');
+		expect(fin.summary).toContain('Merge-Konflikt mit origin/main eigenständig gelöst');
+		const events = eventsOf(o.runId);
+		expect(events.some((e) => e.kind === 'git' && e.payload.detail?.includes('vom Agent gelöst'))).toBe(true);
+	});
+
+	it('pr: Konflikt mit main wird vor dem Push gelöst (PR bleibt mergebar)', async () => {
+		const o = offer({ baseRef: 'old', prompt: 'PR mit Konflikt' });
+		const fin = await runOffer(o);
+		expect(fin.status).toBe('succeeded');
+		expect(fin.pr).not.toBeNull();
+		expect(git(remote.bare, 'merge-base', '--is-ancestor', 'main', o.branch)).toBe('');
+		expect(remote.read(o.branch, 'AIDEV_FAKE.md')).not.toMatch(/^(<{7}|>{7}|={7})/m);
+	});
+
+	it('pr: ungelöster Konflikt verhindert den PR nicht', async () => {
+		const o = offer({ baseRef: 'old', prompt: 'PR mit Konflikt [fake:keep-conflict]' });
+		const fin = await runOffer(o);
+		expect(fin.status).toBe('succeeded');
+		expect(fin.pr).not.toBeNull();
+		expect(remote.read(o.branch, 'AIDEV_FAKE.md')).toContain('PR mit Konflikt');
+		expect(eventsOf(o.runId).some((e) => e.kind === 'error' && e.payload.text?.includes('trotzdem ausgeliefert'))).toBe(true);
 	});
 
 	it('integrate: Integrations-Branch anlegen, mergen, Konflikt beim zweiten Teilauftrag', async () => {
@@ -235,7 +288,7 @@ describe('Auslieferung', () => {
 		const b = offer({
 			branch: `aidev/${short}/2-b`,
 			baseRef: 'old',
-			prompt: 'Teil B',
+			prompt: 'Teil B [fake:keep-conflict]',
 			delivery: { mode: 'integrate', integrationBranch: parent }
 		});
 		const finB = await runOffer(b);
@@ -245,6 +298,20 @@ describe('Auslieferung', () => {
 		expect(remote.read(parent, 'AIDEV_FAKE.md')).toContain('Teil A');
 		// Temporärer Merge-Worktree wurde entfernt
 		expect(existsSync(path.join(env.workDir, 'tmp', `${b.runId}-integrate`))).toBe(false);
+
+		// Teil C hat denselben Konflikt, der Agent löst ihn im selben Lauf
+		const c = offer({
+			branch: `aidev/${short}/3-c`,
+			baseRef: 'old',
+			prompt: 'Teil C',
+			delivery: { mode: 'integrate', integrationBranch: parent }
+		});
+		const finC = await runOffer(c);
+		expect(finC).toMatchObject({ status: 'succeeded', merged: true });
+		const merged = remote.read(parent, 'AIDEV_FAKE.md') ?? '';
+		expect(merged).toContain('Teil A');
+		expect(merged).toContain('Teil C');
+		expect(merged).not.toMatch(/^(<{7}|>{7}|={7})/m);
 	});
 });
 
@@ -518,13 +585,47 @@ describe('Sonderfälle', () => {
 		expect(remote.sha(o.branch)).toBeNull();
 	});
 
-	it('testCmd schlägt fehl → failed tests, nichts gepusht', async () => {
-		const o = offer({ project: { ...offer().project, testCmd: 'node -e "process.exit(3)"' } });
+	it('testCmd schlägt fehl, Agent behebt es nicht → failed tests nach Nachbesserungen, nichts gepusht', async () => {
+		const o = offer({ prompt: 'Tests [fake:no-fix]', project: { ...offer().project, testCmd: 'node -e "process.exit(3)"' } });
 		const fin = await runOffer(o);
 		expect(fin.status).toBe('failed');
 		expect(fin.errorKind).toBe('tests');
+		expect(fin.errorMessage).toContain('auch nach 2 Nachbesserung(en)');
 		expect(fin.commits).toHaveLength(1);
 		expect(remote.sha(o.branch)).toBeNull();
+	});
+
+	it('testCmd schlägt fehl, Agent repariert im selben Lauf → ausgeliefert', async () => {
+		const testCmd = `node -e "process.exit(require('fs').existsSync('AIDEV_FIXED.md') ? 0 : 3)"`;
+		const o = offer({ prompt: 'Mit Testfehler', project: { ...offer().project, testCmd } });
+		const fin = await runOffer(o);
+		expect(fin).toMatchObject({ status: 'succeeded', errorKind: null });
+		expect(remote.read(o.branch, 'AIDEV_FIXED.md')).toContain('Tests repariert');
+		expect(fin.commits.map((c) => c.message.split('\n')[0])).toEqual(['README ergänzen', 'README ergänzen (Nachbesserung Tests)']);
+		expect(fin.summary).toContain('Fehlgeschlagene Tests nach 1 Nachbesserung(en) behoben');
+		// Der Reparaturauftrag enthält die Testausgabe und setzt dieselbe Sitzung fort
+		expect(eventsOf(o.runId).some((e) => e.kind === 'status' && e.payload.text?.includes('Agent bessert nach (Runde 1/2)'))).toBe(true);
+	});
+
+	it('vorübergehender Agent-Fehler (529) → neuer Versuch im selben Lauf', async () => {
+		const o = offer({ prompt: 'Überlastet [fake:transient]' });
+		const fin = await runOffer(o);
+		expect(fin).toMatchObject({ status: 'succeeded', errorKind: null });
+		expect(fin.summary).toContain('Vorübergehender Fehler des Agents nach 1 Wiederholung(en) überbrückt');
+		expect(remote.sha(o.branch)).not.toBeNull();
+	});
+
+	it('Recherche-Schnittstelle: Agent fordert mitten im Lauf eine Recherche an', async () => {
+		const o = offer({ prompt: 'Mit Recherche [fake:research]' });
+		const fin = await runOffer(o);
+		expect(fin.status).toBe('succeeded');
+		expect(fin.summary).toContain('Recherche-Ergebnis zu „Welche Version nutzt das Projekt?“');
+		const content = remote.read(o.branch, 'AIDEV_FAKE.md') ?? '';
+		expect(content).toContain('Version 4.2');
+		// Hilfsskript und Anfragen werden nie committet
+		expect(fin.commits.flatMap((c) => c.files)).toEqual(['AIDEV_FAKE.md']);
+		const events = eventsOf(o.runId);
+		expect(events.some((e) => e.kind === 'status' && e.payload.text?.startsWith('Recherche über fake-1'))).toBe(true);
 	});
 
 	it('setupCmd schlägt fehl → failed setup, Ausgabe als Ereignis', async () => {
