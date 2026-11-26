@@ -39,6 +39,7 @@ import { closeAllLive } from '$modules/aidev/live';
 import { MAX_CONNECTION_RETRIES } from '$modules/aidev/db';
 import {
 	dispatch,
+	expireLeases,
 	expireRunLease,
 	startScheduler,
 	whenDispatchIdle
@@ -69,6 +70,9 @@ import { inList } from '$lib/sdk/server';
 import type { RequestContext } from '$lib/sdk/types';
 
 type RunnerRpcCmd = Extract<RunnerCommand, { type: 'rpc' }>;
+
+// Leases laufen hier gezielt ab (`expireLease`); die 10-s-Prüfung des Scheduler-Jobs bleibt aus
+process.env.AIDEV_LEASE_WATCH = '0';
 
 const M = '/modules/aidev';
 const keys: Record<string, string> = {};
@@ -3056,6 +3060,100 @@ describe('aidev', () => {
 				kindOverride: null
 			});
 			expect((await call('admin', 'PATCH', `/runners/${pcId}`, { leaseSec: 5 })).status).toBe(422);
+		} finally {
+			ok(await call('admin', 'DELETE', `/runners/${pcId}`));
+			ok(await register('runner', ['fake-a', 'fake-b']), 201);
+		}
+	});
+	it('PC-Runner: Übergabe ohne Abschlussmeldung (verkürzte Lease) und API-Key einer zweiten Installation', async () => {
+		const pcCaps = { handoff: true, fencing: true, wip: true };
+		const pcReg = (instanceId?: string, name?: string) =>
+			call<{ runnerId: string }>('pc', 'POST', '/runner/register', {
+				protocol: 1,
+				name: name ?? 'Runner pc',
+				version: '0.5.0',
+				maxSlots: 2,
+				kind: 'desktop',
+				capabilities: { git: true, gh: true, pty: false, os: 'win32-x64', ...pcCaps },
+				accounts: [
+					{ key: 'fake-pc', provider: 'fake', label: 'fake-pc', loggedIn: true, models: [] }
+				],
+				runIds: [],
+				...(instanceId ? { instanceId } : {})
+			});
+		const pcId = ok(await pcReg('pc-install-0001'), 201).runnerId;
+		ok(await call('admin', 'PATCH', `/runners/${pcId}`, { status: 'approved' }));
+		ok(await heartbeat('pc'), 201);
+		ok(await register('runner', ['fake-a', 'fake-b'], 4, pcCaps), 201);
+		const runner2 = await q<{ id: string }>(
+			sql`SELECT id FROM runner WHERE name = 'Runner runner2'`
+		);
+		for (const r of runner2) ok(await call('admin', 'PATCH', `/runners/${r.id}`, { maxSlots: 0 }));
+		const dto = async (id: string) =>
+			ok<RunnerDto[]>(await call('admin', 'GET', '/runners')).find((r) => r.id === id)!;
+		try {
+			// (1) Standby mit 2 s Frist: Lease sofort auf Frist + Puffer verkürzt (statt 60 s)
+			const t = await createTask({ prompt: 'Standby ohne Abschlussmeldung' });
+			const o1 = await offerFor(t.id, 'pc');
+			ok(await call('pc', 'POST', `/runner/runs/${o1.runId}/accept`), 201);
+			ok(
+				await call('pc', 'POST', '/runner/heartbeat', {
+					slotsUsed: 1,
+					runIds: [o1.runId],
+					handover: 'suspend',
+					handoverGraceSec: 2
+				}),
+				201
+			);
+			const lease = await q<{ s: number }>(
+				sql`SELECT extract(epoch FROM lease_expires_at - now())::int AS s FROM run WHERE id = ${o1.runId}`
+			);
+			expect(lease[0]!.s).toBeLessThanOrEqual(7);
+			expect(lease[0]!.s).toBeGreaterThan(0);
+
+			// (2) Abschlussmeldung kommt nicht mehr an → nach Ablauf als Übergabe (nicht Verbindungsverlust) neu eingeplant
+			await q(
+				sql`UPDATE run SET lease_expires_at = now() - interval '1 second' WHERE id = ${o1.runId}`
+			);
+			expect(await expireLeases()).toBe(1);
+			const lost = await runRow(o1.runId);
+			expect(lost.status).toBe('lost');
+			expect(lost.error_kind).not.toBe(CONNECTION_LOST);
+			const queued = (await task(t.id)).task;
+			expect(queued.attempts).toBe(0);
+			expect(queued.errorMessage).toBe(
+				'Übergeben von PC-Runner „Runner pc“ (Grund: Standby) – wird auf einem anderen Runner fortgesetzt'
+			);
+			const o2 = await offerFor(t.id, 'runner');
+			expect(o2.fence!).toBeGreaterThan(o1.fence!);
+			const detail = await task(t.id);
+			expect(detail.runs.find((r) => r.id === o1.runId)!.handover).toMatchObject({
+				reason: 'suspend',
+				fromRunner: 'Runner pc',
+				wipPushed: false
+			});
+			ok(await call('admin', 'POST', `/tasks/${t.id}/cancel`), 201);
+
+			// (3) zweite Installation unter demselben API-Key, während der PC aktiv ist → 409, Hinweis in der Verwaltung
+			ok(await heartbeat('pc'), 201);
+			const clash = await pcReg('server-install-0002', 'Runner server-mit-pc-key');
+			expect(clash.status).toBe(409);
+			expect(JSON.stringify(clash.body)).toContain('eigenem API-Key');
+			const flagged = await dto(pcId);
+			expect(flagged.name).toBe('Runner pc');
+			expect(flagged.instanceConflict).toMatchObject({ name: 'Runner server-mit-pc-key' });
+			// dieselbe Installation (Neustart) und Runner ohne Kennung (ältere Version) sind erlaubt
+			ok(await pcReg('pc-install-0001'), 201);
+			ok(await pcReg(), 201);
+			// bisherige Installation länger still (aus, Standby) → die andere darf sich anmelden
+			await q(
+				sql`UPDATE runner SET last_seen_at = now() - interval '2 minutes' WHERE id = ${pcId}`
+			);
+			ok(await pcReg('server-install-0002'), 201);
+			const row = await q<{ instance_id: string }>(
+				sql`SELECT instance_id FROM runner WHERE id = ${pcId}`
+			);
+			expect(row[0]!.instance_id).toBe('server-install-0002');
 		} finally {
 			ok(await call('admin', 'DELETE', `/runners/${pcId}`));
 			ok(await register('runner', ['fake-a', 'fake-b']), 201);

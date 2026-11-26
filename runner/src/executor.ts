@@ -99,6 +99,10 @@ interface ActiveRun {
 	handover?: { reason: HandoffReason; deadline: number };
 	/** Pfade, die nie committet werden (Anhänge, Recherche-Dateien) */
 	exclude?: string[];
+	/** Annahme (ms seit Epoch) */
+	startedAt: number;
+	/** Letzte Tätigkeit (bereinigt, eine Zeile) für die PC-Oberfläche */
+	activity: { kind: RunEventKind; text: string; at: number } | null;
 }
 
 /** Limit des Anbieters im Agent-Aufruf erreicht (kein Fehler des Laufs: `finish.status = limited`) */
@@ -110,6 +114,48 @@ class LimitStop extends Error {
 		super(`Limit erreicht (${limit.limitKind})`);
 		this.name = 'LimitStop';
 	}
+}
+
+/** Laufender Lauf für Zustandsdatei und PC-Oberfläche (keine Geheimnisse, Texte bereinigt) */
+export interface RunSummary {
+	runId: string;
+	taskId: string;
+	title: string;
+	role: string;
+	repo: string;
+	branch: string;
+	account: string;
+	provider: string;
+	model: string | null;
+	startedAt: string;
+	handover: HandoffReason | null;
+	activity: { kind: string; text: string; at: string } | null;
+}
+
+/** Ein Ereignis als kurze Tätigkeitszeile (Text, Werkzeug, git-Schritt); `null` = nicht anzeigen */
+export function activityText(kind: RunEventKind, payload: Record<string, unknown>): string | null {
+	const pick = (...keys: string[]) => {
+		for (const k of keys) {
+			const v = payload[k];
+			if (typeof v === 'string' && v.trim()) return v;
+		}
+		return null;
+	};
+	let text: string | null;
+	if (kind === 'tool') {
+		const name = pick('name', 'tool');
+		const detail = pick('summary', 'input', 'detail', 'text');
+		text = name ? `${name}${detail ? `: ${detail}` : ''}` : detail;
+	} else if (kind === 'git') {
+		const action = pick('action');
+		const detail = pick('detail', 'text');
+		text = action ? `git ${action}${detail ? `: ${detail}` : ''}` : detail;
+	} else {
+		text = pick('text', 'detail', 'message');
+	}
+	if (!text) return null;
+	const line = text.replace(/\s+/g, ' ').trim();
+	return line ? line.slice(0, 200) : null;
 }
 
 /** Lease des Laufs verloren (Fencing): nichts pushen, nichts mehr melden */
@@ -187,6 +233,26 @@ export class Executor {
 		return [...this.running.keys()];
 	}
 
+	/** Laufende Läufe für Zustandsdatei und PC-Oberfläche */
+	runSummaries(): RunSummary[] {
+		return [...this.running.values()].map((r) => ({
+			runId: r.offer.runId,
+			taskId: r.offer.taskId,
+			title: r.offer.title,
+			role: r.offer.role,
+			repo: `${r.offer.project.repoOwner}/${r.offer.project.repoName}`,
+			branch: r.offer.branch,
+			account: r.offer.account.key,
+			provider: r.offer.account.provider,
+			model: r.offer.model,
+			startedAt: new Date(r.startedAt).toISOString(),
+			handover: r.handover?.reason ?? null,
+			activity: r.activity
+				? { kind: r.activity.kind, text: r.activity.text, at: new Date(r.activity.at).toISOString() }
+				: null
+		}));
+	}
+
 	isRunning(runId: string): boolean {
 		return this.running.has(runId);
 	}
@@ -229,7 +295,7 @@ export class Executor {
 
 		// Slot vor dem (asynchronen) accept reservieren
 		const ctrl = new AbortController();
-		const run: ActiveRun = { offer, ctrl, reason: null, cancelMessage: '', done: Promise.resolve() };
+		const run: ActiveRun = { offer, ctrl, reason: null, cancelMessage: '', done: Promise.resolve(), startedAt: Date.now(), activity: null };
 		this.running.set(offer.runId, run);
 		try {
 			await this.o.api.accept(offer.runId);
@@ -388,7 +454,11 @@ export class Executor {
 			flushMs: this.o.batcherFlushMs,
 			fence: offer.fence
 		});
-		const emit = (kind: RunEventKind, payload: Record<string, unknown>) => batcher.push(kind, payload);
+		const emit = (kind: RunEventKind, payload: Record<string, unknown>) => {
+			batcher.push(kind, payload);
+			const text = activityText(kind, payload);
+			if (text) run.activity = { kind, text: redactor.redact(text), at: Date.now() };
+		};
 		const repo = { repoOwner: offer.project.repoOwner, repoName: offer.project.repoName };
 		const tmpDir = path.join(ws.tmpRoot, offer.runId);
 

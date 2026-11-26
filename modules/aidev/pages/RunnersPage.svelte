@@ -267,6 +267,13 @@
 								>Wird beendet</Badge
 							>
 						{/if}
+						{#if r.instanceConflict}
+							<Badge
+								variant="destructive"
+								title={`Ein zweiter Runner („${r.instanceConflict.name}“) wollte sich mit demselben API-Key anmelden und wurde abgelehnt. Jeder Runner braucht einen eigenen technischen Benutzer mit eigenem API-Key.`}
+								>API-Key doppelt</Badge
+							>
+						{/if}
 					</span>
 				</Table.Cell>
 				<Table.Cell class="text-xs text-muted-foreground">

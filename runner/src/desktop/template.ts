@@ -10,6 +10,11 @@ export function desktopConfigTemplate(o: { name: string; workDir: string }): str
 		maxSlots: 2,
 		handoverSec: 20,
 		wipCheckpointMin: 10,
+		// eigenständige Läufe (0.5.0): Selbstreparatur, Recherche-Schnittstelle, Repository-Übersicht
+		autoRepairRounds: 2,
+		research: true,
+		researchMax: 3,
+		repoMap: true,
 		accounts: [
 			{ key: 'claude-pc', provider: 'claude', label: 'Claude (PC)' },
 			{ key: 'codex-pc', provider: 'codex', label: 'Codex (PC)' }

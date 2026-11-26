@@ -87,7 +87,8 @@ export const aidevJobs: ModuleJob[] = [
 		summary:
 			'Abgelaufene Läufe zurückstellen, Runner ohne Lebenszeichen offline setzen, Aufträge verteilen',
 		schedule: { everyMinutes: 1 },
-		run: async () => schedulerTick()
+		// startet zusätzlich die Lease-Prüfung alle 10 s (zwischen den Ticks)
+		run: async () => schedulerTick({ leaseWatch: true })
 	},
 	{
 		id: 'pr-sync',

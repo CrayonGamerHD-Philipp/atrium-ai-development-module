@@ -20,6 +20,12 @@ Der verbindliche Vertrag steht in [`modules/aidev/protocol.ts`](../modules/aidev
 2. Diesem Benutzer **nur** die Berechtigung `aidev.runner.connect` geben.
 3. Für diesen Benutzer einen API-Key erzeugen. Er wird nur einmal angezeigt – sicher aufbewahren.
 
+**Je Runner ein eigener API-Key** (PC und Server getrennt): Atrium erkennt einen Runner an seinem Key. Meldet sich
+unter demselben Key eine zweite Installation an, während die erste aktiv ist, lehnt Atrium sie ab (409, Log: „API-Key
+wird schon von einem anderen Runner verwendet“), und die Runner-Seite zeigt **API-Key doppelt**. Jede Installation
+hat dazu eine dauerhafte Kennung (`instance-id` im Arbeitsverzeichnis); ein Neustart derselben Installation ist
+kein Konflikt, und nach etwa 35 s ohne Lebenszeichen der ersten darf sich die zweite anmelden.
+
 ### 2. Konfiguration
 
 Umgebungsvariablen (Vorrang) und/oder eine JSON-Datei (`RUNNER_CONFIG`, Standard `./runner.config.json`,
@@ -235,23 +241,24 @@ nennt fehlende Programme mit Installationshinweis.
 
 | System | Download | Installation |
 |---|---|---|
-| Windows 10/11 (x64, arm64) | `atrium-runner-<v>-windows-x64-setup.exe` (oder `.zip`) | Installer ausführen (pro Benutzer, keine Administratorrechte). Er legt das Programm nach `%LOCALAPPDATA%\Programs\AtriumRunner`, ergänzt den `PATH`, legt die Konfigurationsvorlage `%APPDATA%\AtriumRunner\runner.config.json` an und richtet den Autostart ein (Aufgabe „AtriumRunner“ bei Anmeldung, ohne Berechtigung über `HKCU\…\Run`). Startmenü: Status, „Jetzt an Server übergeben“, Pausieren, Fortsetzen, Konfiguration. |
-| macOS (Apple Silicon, Intel) | `atrium-runner-<v>-macos-arm64.pkg` bzw. `-macos-x64.pkg` (oder `.tar.gz`) | `.pkg` öffnen: Programm nach `/usr/local/lib/atrium-runner`, Befehl `/usr/local/bin/atrium-runner`, LaunchAgent `~/Library/LaunchAgents/de.kalypzo.atrium-runner.plist` (ohne Start). Konfiguration: `~/Library/Application Support/AtriumRunner/runner.config.json`, Logs: `~/Library/Logs/AtriumRunner/runner.log`. |
-| Linux (x64, arm64, systemd) | `atrium-runner-<v>-linux-x64.tar.gz` (oder `.deb`) | `tar xzf …tar.gz && ./atrium-runner-<v>-linux-x64/install.sh` (als normaler Benutzer): Programm nach `~/.local/lib/atrium-runner`, Befehl `~/.local/bin/atrium-runner`, systemd-User-Unit `~/.config/systemd/user/atrium-runner.service`. Konfiguration: `~/.config/atrium-runner/runner.config.json`, Daten: `~/.local/share/atrium-runner/`. Das `.deb` installiert nach `/opt/atrium-runner`; den Autostart richtet danach jeder Benutzer mit `atrium-runner install` ein. Damit der Runner auch ohne Anmeldung läuft: `loginctl enable-linger`. |
+| Windows 10/11 (x64, arm64) | `atrium-runner-<v>-windows-x64-setup.exe` (oder `.zip`) | Installer ausführen (pro Benutzer, keine Administratorrechte). Er legt das Programm nach `%LOCALAPPDATA%\Programs\AtriumRunner`, ergänzt den `PATH`, legt die Konfigurationsvorlage `%APPDATA%\AtriumRunner\runner.config.json` an und richtet den Autostart ein (Aufgabe „AtriumRunner“ bei Anmeldung, ohne Berechtigung über `HKCU\…\Run`). Startmenü: **Atrium Runner** (Oberfläche), dazu Status, „Jetzt an Server übergeben“, Pausieren, Fortsetzen, Konfiguration. Beim Anmelden erscheint das Tray-Symbol. |
+| macOS (Apple Silicon, Intel) | `atrium-runner-<v>-macos-arm64.pkg` bzw. `-macos-x64.pkg` (oder `.tar.gz`) | `.pkg` öffnen: Programm nach `/usr/local/lib/atrium-runner`, Befehl `/usr/local/bin/atrium-runner`, LaunchAgent `~/Library/LaunchAgents/de.kalypzo.atrium-runner.plist` (ohne Start), dazu `de.kalypzo.atrium-runner.ui.plist` für das Menüleisten-Symbol. Konfiguration: `~/Library/Application Support/AtriumRunner/runner.config.json`, Logs: `~/Library/Logs/AtriumRunner/runner.log`. |
+| Linux (x64, arm64, systemd) | `atrium-runner-<v>-linux-x64.tar.gz` (oder `.deb`) | `tar xzf …tar.gz && ./atrium-runner-<v>-linux-x64/install.sh` (als normaler Benutzer): Programm nach `~/.local/lib/atrium-runner`, Befehl `~/.local/bin/atrium-runner`, systemd-User-Unit `~/.config/systemd/user/atrium-runner.service`, Starter „Atrium Runner“ im Anwendungsmenü. Konfiguration: `~/.config/atrium-runner/runner.config.json`, Daten: `~/.local/share/atrium-runner/`. Das `.deb` installiert nach `/opt/atrium-runner`; den Autostart richtet danach jeder Benutzer mit `atrium-runner install` ein. Damit der Runner auch ohne Anmeldung läuft: `loginctl enable-linger`. |
 
-Danach:
+Danach – am einfachsten in der **Oberfläche** (`atrium-runner app`, Startmenü bzw. Anwendungsmenü „Atrium Runner“):
 
 1. In der Konfiguration `atriumUrl` und `apiKey` eintragen (technischer Benutzer, siehe Schritt 1) und die Konten
    anpassen. Die Datei hat die Rechte `0600`; der API-Key verlässt den PC nie in Richtung der Agents.
-2. Bei den CLIs anmelden: `atrium-runner login <konto>` (wie beim Server-Runner).
-3. `atrium-runner probe` – prüft Konfiguration, git, gh, CLIs und Logins.
-4. `atrium-runner service-start` (bzw. `atrium-runner install`, falls der Autostart noch fehlt).
+2. Bei den CLIs anmelden: `atrium-runner login <konto>` bzw. „Anmelden“ in der Oberfläche (öffnet ein Terminal).
+3. `atrium-runner probe` bzw. „Jetzt prüfen“ – prüft Konfiguration, git, gh, CLIs und Logins.
+4. „Starten“ bzw. `atrium-runner service-start` (oder `atrium-runner install`, falls der Autostart noch fehlt).
 5. In Atrium unter **Administration → Runner & Konten** freigeben. Der Runner erscheint als **PC-Runner** mit Vorrang 10.
 
 ### Befehle
 
 | Befehl | Wirkung |
 |---|---|
+| `atrium-runner app [--background]` | Oberfläche öffnen (siehe unten); `--background`: nur Tray-Symbol |
 | `atrium-runner install [--no-start]` | Konfigurationsvorlage anlegen (falls fehlend), Autostart einrichten, starten |
 | `atrium-runner uninstall [--purge]` | geordnet beenden, Autostart entfernen; `--purge` löscht auch Konfiguration und Arbeitsverzeichnis |
 | `atrium-runner service-start` / `stop` / `restart` | über den Autostart starten, geordnet beenden (Übergabe laufender Läufe), neu starten |
@@ -261,8 +268,37 @@ Danach:
 | `atrium-runner login <konto>`, `probe`, `start`, `init` | wie beim Server-Runner; `start` läuft im Vordergrund, `init` legt nur die Vorlage an |
 
 `stop`, `handover` und `pause` wirken über Steuerdateien im Arbeitsverzeichnis (`<WORK_DIR>/control/`) auf den laufenden
-Runner – plattformunabhängig, auch unter Windows. Ein Tray-Icon gibt es (noch) nicht; unter Windows decken die
-Startmenü-Einträge dieselben Aktionen ab.
+Runner – plattformunabhängig, auch unter Windows.
+
+### Oberfläche
+
+`atrium-runner app` öffnet die Oberfläche des PC-Runners als eigenes App-Fenster (Edge, Chrome oder Chromium im
+App-Modus, sonst der Standardbrowser):
+
+- **Übersicht**: Zustand (aktiv, wartet auf Freigabe, pausiert, wird übergeben, keine Verbindung, gestoppt),
+  Atrium-Adresse, letzter Heartbeat, Prozess, Standby-Erkennung, Autostart; **Starten, Stoppen, Neu starten,
+  Pausieren/Fortsetzen, Jetzt an Server übergeben**; laufende Aufträge mit Titel, Repository, Branch, Rolle, Konto und
+  der **letzten Tätigkeit des Agents** (Werkzeug, git-Schritt, Text); Konten mit Anmeldezustand und „Anmelden“
+  (öffnet ein Terminal mit `atrium-runner login <konto>`); „Jetzt prüfen“ (`probe`); Sicherheitshinweis zu
+  persönlichen Daten im Konto.
+- **Konfiguration**: die Datei bearbeiten (der API-Key bleibt verdeckt und erhalten), vor dem Speichern wie beim
+  Start geprüft; „Speichern und neu starten“; Autostart an/aus; Ordner öffnen; Oberfläche beenden.
+- **Protokoll**: `runner.log` live mitlesen.
+
+Tray-Symbol: Windows im Infobereich, macOS in der Menüleiste (Öffnen, Jetzt an Server übergeben, Pausieren,
+Fortsetzen). Der Autostart startet es beim Anmelden ohne Fenster. Linux hat kein Tray, dafür den Starter im
+Anwendungsmenü.
+
+Die Oberfläche ist ein **eigener Prozess** und steuert den Runner über dieselben Steuerdateien und den Autostart wie die
+Befehle oben. Schließt man sie, läuft der Runner weiter. Der Runner schreibt dafür alle paar Sekunden seinen Zustand nach
+`<WORK_DIR>/state.json` (laufende Aufträge, letzte Tätigkeit, Konten, Atrium-Verbindung).
+
+Zugriffsschutz: Der Server lauscht nur auf `127.0.0.1` (zufälliger Port). Jede API-Anfrage braucht ein zufälliges
+Token, und der `Host`-Kopf muss die eigene Adresse sein (Schutz gegen DNS-Rebinding). Andere Webseiten können die
+Schnittstelle weder lesen noch aufrufen. Das Fenster bekommt nur einen **Einmal-Code** (60 s gültig, verfällt beim
+ersten Tausch), weil die Adresse in der Kommandozeile des Browsers für andere Benutzer sichtbar sein kann. Adresse und
+Token der laufenden Oberfläche stehen in `app.json` im Datenverzeichnis (Rechte `0600`); ein zweiter Aufruf öffnet
+nur ein weiteres Fenster. Inhalte aus Läufen werden nur als Text dargestellt.
 
 PC-spezifische Einstellungen (Datei bzw. Umgebung):
 
@@ -311,8 +347,19 @@ wieder her. Ausgeliefert wird wie immer ein normaler Commit; nach Erfolg löscht
 Reicht die Zeit nicht für den Push, wird ohne Zwischenstand übergeben; dann zählt der letzte gepushte Stand bzw. der
 letzte Checkpoint.
 
+Schon der erste Heartbeat mit `handover` nennt die Frist (`handoverGraceSec`). Atrium verkürzt die Lease der Läufe
+auf Frist + 5 s: Kommt die Abschlussmeldung nicht mehr an (Windows lässt beim Standby nur etwa 2 s), plant Atrium
+sie danach trotzdem als **Übergabe** neu ein – nicht als Verbindungsverlust und ohne die volle Lease abzuwarten.
+
+| Fall | bis der Server übernimmt |
+|---|---|
+| Übergabe gemeldet (Standby/Herunterfahren mit Ereignis, `handover`, `pause`) | sofort (wenige Sekunden) |
+| Übergabe angekündigt, Abschluss kam nicht an | Frist + 5 s, geprüft alle 10 s → meist unter 20 s |
+| ungeordneter Ausfall | Heartbeat-Zeitlimit (PC 60 s, einstellbar ab 30 s), geprüft alle 10 s |
+
 **Ungeordneter Ausfall** (Strom weg, Absturz, WLAN weg, Standby ohne Ereignis): Atrium erkennt ihn am Heartbeat-Zeitlimit
-(Lease; PC-Runner **60 s**, Server-Runner 90 s, je Runner einstellbar 30–900 s) und plant den Lauf als
+(Lease; PC-Runner **60 s**, Server-Runner 90 s, je Runner einstellbar 30–900 s; Atrium prüft abgelaufene Leases
+alle 10 s) und plant den Lauf als
 Verbindungsverlust neu ein – ab dem letzten gepushten Stand bzw. dem letzten **Checkpoint**: Während langer Läufe
 sichert der PC-Runner alle `WIP_CHECKPOINT_MIN` Minuten einen WIP-Commit auf seinen Ref und meldet ihn
 (`POST /runner/runs/:id/checkpoint`).
@@ -387,7 +434,7 @@ einige Minuten dauert.
 
 1. Version in `runner/package.json` **und** `modules/aidev/runner-release.ts` erhöhen (ein Test prüft die Gleichheit;
    `runner-release.ts` steuert den Hinweis „Update verfügbar“ auf der Runner-Seite).
-2. Commit auf `main`, dann Tag setzen und pushen: `git tag runner-v0.5.0 && git push origin runner-v0.5.0`.
+2. Commit auf `main`, dann Tag setzen und pushen: `git tag runner-v0.6.0 && git push origin runner-v0.6.0`.
    Tags mit `-beta`/`-rc` (z. B. `runner-v0.5.0-rc.1`) werden als Pre-Release veröffentlicht.
 3. `.github/workflows/release-runner.yml` läuft: CI (Lint, Typen, Tests von Modul und Runner) → Versionsprüfung (Tag ↔
    `package.json` ↔ `runner-release.ts`, sonst Abbruch) → Build auf nativen Runnern (Linux x64/arm64, macOS arm64/x64,

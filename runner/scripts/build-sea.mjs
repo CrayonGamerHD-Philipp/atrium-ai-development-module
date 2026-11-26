@@ -117,6 +117,8 @@ if (platform === 'linux') {
 	cpSync(join(root, 'packaging', 'linux', 'install.sh'), join(outDir, 'install.sh'));
 	chmodSync(join(outDir, 'install.sh'), 0o755);
 }
+// Oberfläche ohne Konsolenfenster öffnen (Startmenü-Eintrag des Installers)
+if (platform === 'win32') cpSync(join(root, 'packaging', 'windows', 'open-ui.vbs'), join(outDir, 'open-ui.vbs'));
 cpSync(join(root, 'README.md'), join(outDir, 'README.md'));
 writeFileSync(
 	join(outDir, 'LICENSE-NOTICE.txt'),

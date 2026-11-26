@@ -237,13 +237,22 @@ describe('Fencing: aufgewachter PC', () => {
 		// verworfener Lauf: kein finish, kein Push; Worktree bleibt bis zum Aufräumen
 		expect(atrium.requests.some((r) => r.path === `/runner/runs/${stale.runId}/finish`)).toBe(false);
 		expect(existsSync(path.join(workDir, 'wt', stale.runId))).toBe(true);
-		// Neuanmeldung nach dem Aufwachen
-		expect(atrium.requests.filter((r) => r.path === '/runner/register').length).toBeGreaterThanOrEqual(2);
+		// Neuanmeldung nach dem Aufwachen – mit derselben dauerhaften Installations-Kennung
+		const regs = atrium.requests.filter((r) => r.path === '/runner/register').map((r) => r.body as { instanceId?: string });
+		expect(regs.length).toBeGreaterThanOrEqual(2);
+		const instanceId = readFileSync(path.join(workDir, 'instance-id'), 'utf8').trim();
+		expect(instanceId).toMatch(/^[A-Za-z0-9_-]{8,64}$/);
+		expect(regs.every((b) => b.instanceId === instanceId)).toBe(true);
 
 		// danach: Standby mit Ereignis → Heartbeat mit handover, gültiger Lauf wird übergeben
 		await power.emit('suspend');
-		const hb = atrium.requests.filter((r) => r.path === '/runner/heartbeat').map((r) => r.body as { handover?: string });
-		expect(hb.some((b) => b.handover === 'suspend')).toBe(true);
+		const hb = atrium.requests
+			.filter((r) => r.path === '/runner/heartbeat')
+			.map((r) => r.body as { handover?: string; handoverGraceSec?: number });
+		// Frist des Systems (FakePowerMonitor: 10 s) geht mit, damit Atrium die Lease darauf verkürzt
+		const announce = hb.find((b) => b.handover === 'suspend');
+		expect(announce?.handoverGraceSec).toBeGreaterThanOrEqual(1);
+		expect(announce?.handoverGraceSec).toBeLessThanOrEqual(10);
 		const fin = await finishOf(fresh.runId);
 		expect(fin.handoff).toMatchObject({ reason: 'suspend', wipPushed: true });
 		// Zustandsdatei für `status`

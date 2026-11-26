@@ -45,6 +45,10 @@ export interface ServiceManager {
 }
 
 export const SERVICE_LABEL = 'de.kalypzo.atrium-runner';
+/** LaunchAgent der Oberfläche (Menüleisten-Symbol, macOS) */
+export const UI_LABEL = 'de.kalypzo.atrium-runner.ui';
+/** Starter im Anwendungsmenü (Linux) */
+export const DESKTOP_ENTRY = 'atrium-runner.desktop';
 export const SERVICE_NAME = 'atrium-runner';
 export const WINDOWS_TASK = 'AtriumRunner';
 
@@ -83,6 +87,9 @@ export function systemdUnit(spec: ServiceSpec): string {
 		'Environment=RUNNER_KIND=desktop',
 		'Restart=on-failure',
 		'RestartSec=10',
+		// Protokoll wie unter Windows/macOS in runner.log (Reiter „Protokoll“ der Oberfläche)
+		`StandardOutput=append:${path.posix.join(spec.logDir, 'runner.log')}`,
+		`StandardError=append:${path.posix.join(spec.logDir, 'runner.log')}`,
 		// SIGTERM beim Abmelden/Herunterfahren → Übergabe; danach höchstens 30 s
 		'KillSignal=SIGTERM',
 		'TimeoutStopSec=30',
@@ -137,15 +144,67 @@ ${args.map((a) => `		<string>${xml(a)}</string>`).join('\n')}
 `;
 }
 
-/** Unsichtbares Startskript für Windows (startet bei Absturz nach 10 s neu, endet bei Exit-Code 0) */
+/** LaunchAgent der Oberfläche: beim Anmelden nur das Menüleisten-Symbol (`app --background`), kein Neustart */
+export function uiLaunchAgentPlist(spec: ServiceSpec): string {
+	const args = [spec.exe, ...spec.baseArgs, 'app', '--background', '--config', spec.configFile];
+	return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>${UI_LABEL}</string>
+	<key>ProgramArguments</key>
+	<array>
+${args.map((a) => `		<string>${xml(a)}</string>`).join('\n')}
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>${xml(spec.pathEnv)}</string>
+	</dict>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>ProcessType</key>
+	<string>Interactive</string>
+</dict>
+</plist>
+`;
+}
+
+/** Argument für `Exec=` einer .desktop-Datei (Anführungszeichen, `"`, `` ` ``, `$`, `\` maskiert) */
+export function desktopEntryQuote(s: string): string {
+	return /[\s"'\\$`]/.test(s) ? `"${s.replace(/(["`$\\])/g, '\\$1')}"` : s;
+}
+
+/** Starter im Anwendungsmenü (Linux, `~/.local/share/applications`) */
+export function desktopEntry(spec: ServiceSpec): string {
+	const exec = [spec.exe, ...spec.baseArgs, 'app', '--config', spec.configFile].map(desktopEntryQuote).join(' ');
+	return [
+		'[Desktop Entry]',
+		'Type=Application',
+		'Name=Atrium Runner',
+		'Comment=PC-Runner für Atrium: Zustand, Aufträge, Starten/Stoppen',
+		`Exec=${exec}`,
+		'Terminal=false',
+		'Categories=Development;',
+		''
+	].join('\n');
+}
+
+/**
+ * Unsichtbares Startskript für Windows: startet die Oberfläche (nur Tray-Symbol, kein Fenster) und den Runner;
+ * den Runner bei Absturz nach 10 s neu, Ende bei Exit-Code 0.
+ */
 export function windowsLauncher(spec: ServiceSpec): string {
 	const q = (s: string) => `""${s.replace(/"/g, '')}""`;
-	const cmd = [spec.exe, ...spec.baseArgs].map(q).join(' ') + ` start --config ${q(spec.configFile)}`;
+	const self = [spec.exe, ...spec.baseArgs].map(q).join(' ');
+	const cmd = `${self} start --config ${q(spec.configFile)}`;
 	const log = path.win32.join(spec.logDir, 'runner.log');
 	return [
-		"' Atrium aidev-Runner (PC): unsichtbar starten, bei Absturz neu starten",
+		"' Atrium aidev-Runner (PC): Tray-Symbol und Runner unsichtbar starten, Runner bei Absturz neu starten",
 		'Set sh = CreateObject("WScript.Shell")',
 		'sh.Environment("PROCESS")("RUNNER_KIND") = "desktop"',
+		`sh.Run "${self} app --background --config ${q(spec.configFile)}", 0, False`,
 		'Do',
 		`  code = sh.Run("cmd.exe /c ""${cmd} >> ${q(log)} 2>&1""", 0, True)`,
 		'  If code = 0 Then Exit Do',
@@ -163,9 +222,16 @@ class SystemdUserService implements ServiceManager {
 	constructor(private readonly home: string) {
 		this.location = path.join(home, '.config', 'systemd', 'user', `${SERVICE_NAME}.service`);
 	}
+	private get entryLocation(): string {
+		return path.join(this.home, '.local', 'share', 'applications', DESKTOP_ENTRY);
+	}
 	async install(spec: ServiceSpec): Promise<void> {
 		await mkdir(path.dirname(this.location), { recursive: true });
+		await mkdir(spec.logDir, { recursive: true });
 		await writeFile(this.location, systemdUnit(spec));
+		// Starter „Atrium Runner“ im Anwendungsmenü (Oberfläche; unter Linux ohne Tray)
+		await mkdir(path.dirname(this.entryLocation), { recursive: true });
+		await writeFile(this.entryLocation, desktopEntry(spec));
 		try {
 			await run('systemctl', ['--user', 'daemon-reload']);
 			await run('systemctl', ['--user', 'enable', SERVICE_NAME]);
@@ -179,6 +245,7 @@ class SystemdUserService implements ServiceManager {
 	async uninstall(): Promise<void> {
 		await run('systemctl', ['--user', 'disable', '--now', SERVICE_NAME], true);
 		await rm(this.location, { force: true });
+		await rm(this.entryLocation, { force: true });
 		await run('systemctl', ['--user', 'daemon-reload'], true);
 	}
 	async start(): Promise<void> {
@@ -204,15 +271,24 @@ class LaunchAgentService implements ServiceManager {
 	constructor(home: string) {
 		this.location = path.join(home, 'Library', 'LaunchAgents', `${SERVICE_LABEL}.plist`);
 	}
+	private get uiLocation(): string {
+		return path.join(path.dirname(this.location), `${UI_LABEL}.plist`);
+	}
 	async install(spec: ServiceSpec): Promise<void> {
 		await mkdir(path.dirname(this.location), { recursive: true });
 		await mkdir(spec.logDir, { recursive: true });
 		await run('launchctl', ['bootout', `${this.domain}/${SERVICE_LABEL}`], true);
 		await writeFile(this.location, launchAgentPlist(spec));
+		// Menüleisten-Symbol: beim Anmelden; jetzt schon laden (startet ohne Fenster)
+		await run('launchctl', ['bootout', `${this.domain}/${UI_LABEL}`], true);
+		await writeFile(this.uiLocation, uiLaunchAgentPlist(spec));
+		await run('launchctl', ['bootstrap', this.domain, this.uiLocation], true);
 	}
 	async uninstall(): Promise<void> {
 		await run('launchctl', ['bootout', `${this.domain}/${SERVICE_LABEL}`], true);
 		await rm(this.location, { force: true });
+		await run('launchctl', ['bootout', `${this.domain}/${UI_LABEL}`], true);
+		await rm(this.uiLocation, { force: true });
 	}
 	async start(): Promise<void> {
 		const loaded = await run('launchctl', ['print', `${this.domain}/${SERVICE_LABEL}`], true);

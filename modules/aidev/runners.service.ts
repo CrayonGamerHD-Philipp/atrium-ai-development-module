@@ -19,7 +19,13 @@ import { publish } from './publish.service';
 import { rejectAllRpc } from './rpc.service';
 import { loseRun } from './runs.service';
 import { storeLimitSnapshot } from './limits.service';
-import { HEARTBEAT_SEC, RUNNER_STALE_SEC } from './db';
+import {
+	HANDOVER_DEFAULT_GRACE_SEC,
+	HANDOVER_LEASE_MARGIN_SEC,
+	HEARTBEAT_SEC,
+	INSTANCE_ACTIVE_SEC,
+	RUNNER_STALE_SEC
+} from './db';
 import { leaseProblem } from './leases';
 
 /** API-Key des aufrufenden Runners (nur technische Konten per API-Key) */
@@ -65,14 +71,18 @@ export async function registerRunner(
 	// ältere Runner melden keine Art → Server-Runner
 	const kind = input.kind ?? 'server';
 	let runner = await oneOf(tx, sql`SELECT * FROM runner WHERE api_key_id = ${key} FOR UPDATE`);
+	const instanceId = input.instanceId ?? null;
+	if (runner && instanceConflict(runner, instanceId)) {
+		throw new InstanceConflictError(String(runner.id), String(runner.name), input.name);
+	}
 	if (!runner) {
 		const id = crypto.randomUUID();
 		runner = await oneOf(
 			tx,
 			sql`INSERT INTO runner (id, name, api_key_id, status, version, capabilities, max_slots,
-					reported_max_slots, last_seen_at, kind, protocol)
+					reported_max_slots, last_seen_at, kind, protocol, instance_id)
 				VALUES (${id}, ${input.name}, ${key}, 'pending', ${input.version}, ${jsonb(input.capabilities)},
-					${input.maxSlots}, ${input.maxSlots}, now(), ${kind}, ${input.protocol})
+					${input.maxSlots}, ${input.maxSlots}, now(), ${kind}, ${input.protocol}, ${instanceId})
 				ON CONFLICT (api_key_id) DO NOTHING
 				RETURNING *`
 		);
@@ -98,6 +108,7 @@ export async function registerRunner(
 			sql`UPDATE runner SET name = ${input.name}, version = ${input.version},
 					capabilities = ${jsonb(input.capabilities)}, last_seen_at = now(), draining = false,
 					kind = ${kind}, protocol = ${input.protocol},
+					instance_id = COALESCE(${instanceId}, instance_id),
 					returned_at = CASE WHEN handover_reason IS NOT NULL OR last_seen_at < now() - ${RUNNER_STALE_SEC}::int * interval '1 second'
 						THEN now() ELSE returned_at END,
 					handover_reason = NULL,
@@ -135,6 +146,55 @@ export async function registerRunner(
 		features: { handoff: true, fencing: true, checkpoints: true },
 		kind: runnerKindOf(runner)
 	};
+}
+
+/**
+ * Zweite Installation unter demselben API-Key: Die bisherige ist noch verbunden und hat sich in den letzten
+ * `INSTANCE_ACTIVE_SEC` gemeldet, die neue meldet eine andere `instanceId`. Ohne Kennung (ältere Runner) auf einer
+ * der beiden Seiten wird nicht geprüft. Eine Installation, die gerade übergibt oder offline ist, blockiert nicht.
+ */
+export function instanceConflict(
+	runner: Row,
+	instanceId: string | null,
+	now: number = Date.now()
+): boolean {
+	const current = str(runner.instance_id);
+	if (!instanceId || !current || current === instanceId) return false;
+	if (runner.online !== true) return false;
+	const seen = runner.last_seen_at ? new Date(String(runner.last_seen_at)).getTime() : 0;
+	return now - seen < INSTANCE_ACTIVE_SEC * 1000;
+}
+
+/** Abgelehnte Anmeldung einer zweiten Installation (Endpunkt vermerkt sie und antwortet 409) */
+export class InstanceConflictError extends Error {
+	constructor(
+		readonly runnerId: string,
+		readonly runnerName: string,
+		readonly otherName: string
+	) {
+		super(
+			`Dieser API-Key wird bereits vom aktiven Runner „${runnerName}“ verwendet. Jeder Runner (PC und Server) ` +
+				'braucht einen eigenen technischen Benutzer mit eigenem API-Key.'
+		);
+	}
+}
+
+/** Abgelehnte zweite Installation festhalten (eigene Transaktion – die Anmeldung selbst wurde zurückgerollt) */
+export async function recordInstanceConflict(e: InstanceConflictError): Promise<void> {
+	await mdb().transaction((tx) =>
+		tx.execute(
+			sql`UPDATE runner SET instance_conflict_at = now(), instance_conflict_name = ${e.otherName.slice(0, 80)}
+				WHERE id = ${e.runnerId}`
+		)
+	);
+	const fx = newEffects();
+	fx.overview = true;
+	fx.audits.push({
+		action: 'aidev.runner.instance_conflict',
+		target: e.runnerId,
+		metadata: { name: e.runnerName, other: e.otherName }
+	});
+	await publish(null, fx);
 }
 
 /**
@@ -207,10 +267,18 @@ export async function heartbeat(
 	}
 	const reported = [...new Set(input.runIds)];
 	let keep = new Set<string>();
+	// Übergabe: Lease nur bis zur Frist des Runners (+ Puffer) – fehlt danach die Abschlussmeldung, plant Atrium
+	// sofort neu ein (`expireRunLease`), statt die volle Lease abzuwarten
+	const leaseSec = handover
+		? Math.min(
+				leaseSecOf(runner),
+				(input.handoverGraceSec ?? HANDOVER_DEFAULT_GRACE_SEC) + HANDOVER_LEASE_MARGIN_SEC
+			)
+		: leaseSecOf(runner);
 	if (reported.length && status !== 'disabled') {
 		const rows = await rowsOf(
 			tx,
-			sql`UPDATE run r SET lease_expires_at = now() + ${leaseSecOf(runner)}::int * interval '1 second'
+			sql`UPDATE run r SET lease_expires_at = now() + ${leaseSec}::int * interval '1 second'
 				FROM task t
 				WHERE r.task_id = t.id AND r.id IN (${inList(reported)}) AND r.runner_id = ${runnerId}
 					AND r.status = 'running' AND t.status NOT IN ('cancelled', 'done', 'failed')

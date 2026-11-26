@@ -33,6 +33,7 @@ import m0010 from './migrations/0010_chat_actions.sql?raw';
 import m0011 from './migrations/0011_attachments.sql?raw';
 import m0012 from './migrations/0012_desktop_runner_handover.sql?raw';
 import m0013 from './migrations/0013_project_knowledge.sql?raw';
+import m0014 from './migrations/0014_runner_instance.sql?raw';
 
 export default defineModule({
 	package: pkg,
@@ -122,7 +123,8 @@ export default defineModule({
 		{ name: '0010_chat_actions', sql: m0010 },
 		{ name: '0011_attachments', sql: m0011 },
 		{ name: '0012_desktop_runner_handover', sql: m0012 },
-		{ name: '0013_project_knowledge', sql: m0013 }
+		{ name: '0013_project_knowledge', sql: m0013 },
+		{ name: '0014_runner_instance', sql: m0014 }
 	],
 	jobs: aidevJobs,
 	onUserDeleted,

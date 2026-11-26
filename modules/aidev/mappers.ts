@@ -1,7 +1,14 @@
 /** Zeilen (`tx.execute`) → DTOs aus `schemas.ts`. Reine Abbildung, keine Datenbankzugriffe. */
 import { num, str, toIso, toIsoOrNull, type Row } from '$lib/sdk/server';
 import { storedActionsOf } from './actions';
-import { jsonOf, leaseSecOf, RETURNED_SHOW_SEC, runnerKindOf, stringList } from './db';
+import {
+	INSTANCE_CONFLICT_SHOW_SEC,
+	jsonOf,
+	leaseSecOf,
+	RETURNED_SHOW_SEC,
+	runnerKindOf,
+	stringList
+} from './db';
 import {
 	isUpdateAvailable,
 	runnerStateOf,
@@ -286,6 +293,13 @@ const optNum = (v: unknown): number | null => (v === null || v === undefined ? n
 const optKind = (v: unknown): 'server' | 'desktop' | null =>
 	v === 'desktop' || v === 'server' ? v : null;
 
+/** Abgelehnte zweite Installation unter demselben API-Key, solange `INSTANCE_CONFLICT_SHOW_SEC` nicht vorbei */
+function instanceConflictOf(r: Row, now: number): { at: string; name: string } | null {
+	const at = toIsoOrNull(r.instance_conflict_at);
+	if (!at || now - Date.parse(at) > INSTANCE_CONFLICT_SHOW_SEC * 1000) return null;
+	return { at, name: String(r.instance_conflict_name ?? '') };
+}
+
 /** Art, Vorrang, Übergabe, Version: zusätzliche Felder von `RunnerDto` (Migration 0012) */
 function runnerExtras(r: Row, now = Date.now()) {
 	const kind = runnerKindOf(r);
@@ -318,6 +332,7 @@ function runnerExtras(r: Row, now = Date.now()) {
 		takenOver: num(r.taken_over),
 		latestVersion: RUNNER_RELEASE_VERSION,
 		updateAvailable: isUpdateAvailable(version, RUNNER_RELEASE_VERSION),
-		protocolOutdated: protocol !== null && protocol < PROTOCOL_VERSION
+		protocolOutdated: protocol !== null && protocol < PROTOCOL_VERSION,
+		instanceConflict: instanceConflictOf(r, now)
 	};
 }

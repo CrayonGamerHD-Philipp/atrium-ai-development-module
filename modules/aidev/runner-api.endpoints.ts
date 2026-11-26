@@ -36,6 +36,8 @@ import { resolveRpc } from './rpc.service';
 import {
 	checkLeases,
 	heartbeat,
+	InstanceConflictError,
+	recordInstanceConflict,
 	registerRunner,
 	requireRunner,
 	runnerOnline
@@ -96,9 +98,15 @@ export const runnerApiEndpoints: AnyApiEndpoint[] = [
 		body: registerInput,
 		handler: async ({ ctx, body }) => {
 			const fx = newEffects();
-			const result = await mdb().transaction((tx) => registerRunner(tx, fx, ctx, body));
-			await publish(ctx, fx);
-			return result;
+			try {
+				const result = await mdb().transaction((tx) => registerRunner(tx, fx, ctx, body));
+				await publish(ctx, fx);
+				return result;
+			} catch (e) {
+				if (!(e instanceof InstanceConflictError)) throw e;
+				await recordInstanceConflict(e);
+				throw errors.conflict(e.message);
+			}
 		}
 	}),
 	defineEndpoint({

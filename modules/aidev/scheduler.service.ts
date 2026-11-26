@@ -41,11 +41,18 @@ import {
 	type RunOffer
 } from './protocol';
 import { publish } from './publish.service';
-import { connectionLossTargets, loseRun } from './runs.service';
+import { connectionLossTargets, handoffMessage, loseRun } from './runs.service';
 import { planAssignments, type ProjectState, type TaskCandidate } from './scheduler';
 import { effectiveRole, getTask, planOf, resolveInfoOf, topBranchOf } from './tasks.service';
 import { loadAccountViews } from './usage.service';
-import { leaseSecOf, OFFER_LEASE_SEC, RUNNER_STALE_SEC } from './db';
+import {
+	jsonb,
+	leaseSecOf,
+	LEASE_WATCH_SEC,
+	OFFER_LEASE_SEC,
+	runnerKindOf,
+	RUNNER_STALE_SEC
+} from './db';
 
 // ---------------------------------------------------------------- Branches, Auslieferung, Prompt
 
@@ -596,6 +603,7 @@ export function stopScheduler(): void {
 	if (timer) clearTimeout(timer);
 	timer = null;
 	stopped = true;
+	stopLeaseWatch();
 }
 
 /** Nach `stopScheduler` wieder erlauben (Modul an, Tests) */
@@ -627,17 +635,38 @@ export async function expireRunLease(runId: string, taskId: string): Promise<boo
 		// nie angenommen → ungezählt zurück; lief bereits → Verbindungsverlust (automatisch neu eingeplant)
 		if (run.status === 'offered') {
 			await loseRun(tx, fx, run, 'Angebot nicht rechtzeitig angenommen', false);
-		} else {
-			await loseRun(tx, fx, run, LEASE_EXPIRED_MESSAGE, false, { connection: true });
+			return true;
 		}
+		// Übergabe angekündigt (Heartbeat mit `handover`), Abschlussmeldung kam nicht mehr an (Standby war
+		// schneller): als Übergabe ohne Zwischenstand festhalten – zählt nicht, kein Verbindungsverlust
+		const runner = run.runner_id
+			? await oneOf(
+					tx,
+					sql`SELECT name, kind, kind_override, handover_reason FROM runner WHERE id = ${run.runner_id}`
+				)
+			: null;
+		const reason = str(runner?.handover_reason);
+		if (reason === 'suspend' || reason === 'shutdown' || reason === 'manual') {
+			const info = {
+				reason,
+				wipPushed: false,
+				note: 'Keine Abschlussmeldung vor dem Standby bzw. Herunterfahren',
+				runnerName: str(runner?.name) ?? '',
+				runnerKind: runnerKindOf(runner)
+			};
+			await tx.execute(sql`UPDATE run SET handoff = ${jsonb(info)} WHERE id = ${run.id}`);
+			await loseRun(tx, fx, run, handoffMessage(info.runnerName, info.runnerKind, reason), false);
+			return true;
+		}
+		await loseRun(tx, fx, run, LEASE_EXPIRED_MESSAGE, false, { connection: true });
 		return true;
 	});
 	await publish(null, fx);
 	return lost;
 }
 
-/** Abgelaufene Leases → `lost`, Runner ohne Heartbeat → offline, danach Dispatch */
-export async function schedulerTick(): Promise<string> {
+/** Abgelaufene Leases → `lost` (jeder Verlust plant über `publish` sofort neu ein); liefert die Anzahl */
+export async function expireLeases(): Promise<number> {
 	const expired = await mdb().transaction((tx) =>
 		rowsOf(
 			tx,
@@ -654,6 +683,41 @@ export async function schedulerTick(): Promise<string> {
 			logBestEffort('aidev.scheduler.lease', e, { target: String(run.id) });
 		}
 	}
+	return lost;
+}
+
+let leaseWatch: ReturnType<typeof setInterval> | null = null;
+let leaseWatchBusy = false;
+
+/**
+ * Zwischen den Minuten-Ticks alle `LEASE_WATCH_SEC` abgelaufene Leases prüfen: Ein PC im Standby (Lease 60 s bzw.
+ * verkürzt bei angekündigter Übergabe) wird so nach Ablauf + höchstens 10 s übernommen statt bis zu 60 s später.
+ * Startet mit dem ersten Tick des Scheduler-Jobs (idempotent). `AIDEV_LEASE_WATCH=0` schaltet sie ab (Tests, die
+ * Leases gezielt ablaufen lassen); dann gilt nur der Minuten-Tick.
+ */
+export function startLeaseWatch(intervalSec: number = LEASE_WATCH_SEC): void {
+	if (leaseWatch || process.env.AIDEV_LEASE_WATCH === '0') return;
+	leaseWatch = setInterval(() => {
+		if (leaseWatchBusy || stopped) return;
+		leaseWatchBusy = true;
+		expireLeases()
+			.catch((e) => logBestEffort('aidev.scheduler.lease-watch', e))
+			.finally(() => {
+				leaseWatchBusy = false;
+			});
+	}, intervalSec * 1000);
+	leaseWatch.unref?.();
+}
+
+export function stopLeaseWatch(): void {
+	if (leaseWatch) clearInterval(leaseWatch);
+	leaseWatch = null;
+}
+
+/** Abgelaufene Leases → `lost`, Runner ohne Heartbeat → offline, danach Dispatch */
+export async function schedulerTick(opts: { leaseWatch?: boolean } = {}): Promise<string> {
+	if (opts.leaseWatch) startLeaseWatch();
+	const lost = await expireLeases();
 	const fx = newEffects();
 	const offline = await mdb().transaction(async (tx) => {
 		const stale = await rowsOf(

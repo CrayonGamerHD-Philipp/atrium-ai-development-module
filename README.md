@@ -275,8 +275,16 @@ Optional läuft ein Runner auf deinem PC – ohne Node und ohne Docker, als Prog
   sauber) und meldet die Läufe als übergeben. Atrium plant sie sofort auf einem Server-Runner neu ein, der den
   Zwischenstand übernimmt – auch mit anderem Konto oder Anbieter, unter Beachtung von Routing und Limits. Die Übergabe
   zählt nicht als Fehlversuch; der Verlauf zeigt „Übergeben von PC-Runner X an Server-Runner Y (Grund: Standby)“.
-- **Ungeordneter Ausfall:** Ohne Heartbeat übernimmt ein Server-Runner nach dem Zeitlimit (PC-Runner 60 s), ab dem letzten
-  gepushten Stand bzw. dem letzten Checkpoint (PC-Runner sichern laufende Arbeit alle 10 min).
+  Kommt die Abschlussmeldung nicht mehr an (Windows lässt beim Standby nur ~2 s), plant Atrium nach der angekündigten
+  Frist + 5 s trotzdem als Übergabe neu ein.
+- **Ungeordneter Ausfall:** Ohne Heartbeat übernimmt ein Server-Runner nach dem Zeitlimit (PC-Runner 60 s, einstellbar ab
+  30 s; Atrium prüft alle 10 s), ab dem letzten gepushten Stand bzw. dem letzten Checkpoint (PC-Runner sichern laufende
+  Arbeit alle 10 min).
+- **Je Runner ein eigener API-Key:** Meldet sich unter demselben Key eine zweite Installation an, während die erste aktiv
+  ist, lehnt Atrium sie ab, und die Runner-Seite zeigt „API-Key doppelt“.
+- **Oberfläche:** `atrium-runner app` (Startmenü bzw. Anwendungsmenü „Atrium Runner“, Tray-Symbol unter Windows und
+  macOS) zeigt Zustand, laufende Aufträge mit der aktuellen Tätigkeit des Agents, Konten und Protokoll. Dort lässt sich
+  der Runner starten, stoppen, pausieren und an einen Server übergeben, und die Konfiguration bearbeiten.
 - **Keine doppelte Ausführung:** Jeder Lauf trägt ein Fencing-Token. Atrium lehnt Meldungen mit veraltetem Token ab, und der
   Runner prüft seine Lease vor jedem Push sowie nach dem Aufwachen – ein aufgewachter PC verwirft übernommene Läufe und
   bekommt danach nur neue Aufträge. Laufende Server-Läufe werden nie zurückverschoben.

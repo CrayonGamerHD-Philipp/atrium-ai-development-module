@@ -158,7 +158,18 @@ export const registerInput = z.object({
 	 * die hier fehlen, gibt Atrium sofort frei, statt auf das Ende der Lease zu warten. Fehlt das Feld (ältere
 	 * Runner), bleibt es beim Lease-Ablauf.
 	 */
-	runIds: z.array(id).max(64).optional()
+	runIds: z.array(id).max(64).optional(),
+	/**
+	 * Dauerhafte Kennung dieser Runner-Installation (bleibt über Neustarts gleich). Meldet sich unter demselben
+	 * API-Key eine andere Installation an, während die bisherige noch aktiv ist, lehnt Atrium mit 409 ab
+	 * (je Runner ein eigener API-Key). Fehlt das Feld (ältere Runner), wird nicht geprüft.
+	 */
+	instanceId: z
+		.string()
+		.min(8)
+		.max(64)
+		.regex(/^[A-Za-z0-9_-]+$/)
+		.optional()
 });
 export type RegisterInput = z.infer<typeof registerInput>;
 
@@ -201,6 +212,12 @@ export const heartbeatInput = z.object({
 	 * „wird übergeben“. Fehlt das Feld, läuft keine Übergabe.
 	 */
 	handover: handoffReasonSchema.optional(),
+	/**
+	 * Zu `handover`: Sekunden, bis der Runner seine Läufe spätestens als übergeben meldet (Frist des
+	 * Betriebssystems). Atrium verkürzt die Lease dieser Läufe darauf (plus Puffer), damit sie auch ohne
+	 * Abschlussmeldung (Standby kam zu schnell) sofort neu eingeplant werden. Fehlt das Feld, bleibt die Lease.
+	 */
+	handoverGraceSec: z.number().int().min(1).max(300).optional(),
 	accounts: z
 		.array(
 			z.object({

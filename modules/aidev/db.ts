@@ -41,6 +41,22 @@ export const MAX_CONNECTION_RETRIES = 20;
 export const DESKTOP_LEASE_SEC = 60;
 export const MIN_LEASE_SEC = 30;
 export const MAX_LEASE_SEC = 900;
+/**
+ * Übergabe mit Frist (`heartbeatInput.handoverGraceSec`): Lease der Läufe auf Frist + Puffer verkürzen. Kommt die
+ * Abschlussmeldung nicht mehr an (Standby war schneller), plant Atrium danach neu ein statt nach der vollen Lease.
+ */
+export const HANDOVER_LEASE_MARGIN_SEC = 5;
+/** Frist ohne Angabe des Runners (`handover` ohne `handoverGraceSec`) */
+export const HANDOVER_DEFAULT_GRACE_SEC = 20;
+/** Abstand, in dem Atrium zwischen den Minuten-Ticks abgelaufene Leases prüft */
+export const LEASE_WATCH_SEC = 10;
+/**
+ * Eine Runner-Installation gilt für die Prüfung „API-Key doppelt verwendet“ als aktiv, solange sie verbunden ist und
+ * sich in dieser Zeit gemeldet hat (zwei Heartbeats). Danach darf sich eine andere Installation anmelden.
+ */
+export const INSTANCE_ACTIVE_SEC = 35;
+/** Anzeige „API-Key doppelt verwendet“ so lange nach der letzten abgelehnten Anmeldung */
+export const INSTANCE_CONFLICT_SHOW_SEC = 10 * 60;
 /** Anzeige „zurück“ so lange nach der Rückkehr eines Runners (Standby/offline → online) */
 export const RETURNED_SHOW_SEC = 15 * 60;
 

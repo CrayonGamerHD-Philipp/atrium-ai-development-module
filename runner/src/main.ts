@@ -5,6 +5,7 @@
  *   probe                Konfiguration, Programme (git, gh, Agent-CLIs) und Konten prüfen und beenden
  *   login <konto>        Anmelde-Befehl der CLI mit der Umgebung des Kontos starten (HOME/Config-Verzeichnis)
  *   install, uninstall, stop, restart, status, handover, pause, resume, init   PC-Betrieb (siehe desktop/cli.ts)
+ *   app [--background]   PC-Oberfläche (Fenster + Tray, siehe app/index.ts)
  *   --config <datei>     Konfigurationsdatei (sonst RUNNER_CONFIG bzw. ./runner.config.json)
  *   --help, --version
  */
@@ -15,6 +16,7 @@ import { accountEnv, collectSecrets, ConfigError, defaultCommand, loadConfig, ty
 import { createLogger, setLogRedactor } from './log.ts';
 import { defaultAdapters } from './providers/index.ts';
 import { Redactor } from './redact.ts';
+import { runApp } from './app/index.ts';
 import { DESKTOP_COMMANDS, runDesktopCommand } from './desktop/cli.ts';
 import { desktopPaths } from './desktop/paths.ts';
 import { isolationHint, personalDataFindings } from './desktop/isolation.ts';
@@ -33,6 +35,8 @@ Befehle:
   help             Diese Hilfe
 
 PC-Betrieb (Autostart im eigenen Benutzerkonto, ohne Administratorrechte):
+  app              Oberfläche öffnen: Zustand, laufende Aufträge, Starten/Stoppen, Konfiguration, Protokoll
+                   (--background: nur Tray-Symbol, ohne Fenster)
   init             Konfigurationsvorlage anlegen (überschreibt nichts)
   install          Vorlage anlegen, Autostart einrichten und starten (--no-start: nur einrichten)
   uninstall        Autostart entfernen (--purge: auch Konfiguration und Arbeitsverzeichnis löschen)
@@ -118,6 +122,10 @@ async function main(): Promise<void> {
 	}
 	if (args.command === 'version') {
 		process.stdout.write(`${RUNNER_VERSION}\n`);
+		return;
+	}
+	if (args.command === 'app') {
+		process.exitCode = await runApp(args.rest, args.configPath);
 		return;
 	}
 	if (DESKTOP_COMMANDS.includes(args.command)) {

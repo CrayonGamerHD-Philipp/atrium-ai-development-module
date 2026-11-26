@@ -592,6 +592,11 @@ export interface RunnerDto {
 	updateAvailable: boolean;
 	/** Protokoll des Runners passt nicht (älter als das von Atrium) */
 	protocolOutdated: boolean;
+	/**
+	 * Eine zweite Installation hat sich kürzlich unter demselben API-Key anmelden wollen und wurde abgelehnt
+	 * (`INSTANCE_CONFLICT_SHOW_SEC`); `null` = kein Konflikt
+	 */
+	instanceConflict: { at: string; name: string } | null;
 }
 
 /**

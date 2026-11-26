@@ -55,7 +55,9 @@ Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: recursesubdirs ignoreversion
 Root: HKCU; Subkey: "Environment"; ValueType: expandsz; ValueName: "Path"; ValueData: "{olddata};{app}"; Check: NeedsAddPath(ExpandConstant('{app}'))
 
 [Icons]
-Name: "{group}\Atrium Runner – Status"; Filename: "{cmd}"; Parameters: "/k ""{app}\atrium-runner.exe"" status"
+; Oberfläche über ein unsichtbares Startskript (das Programm ist ein Konsolenprogramm – sonst bliebe ein Konsolenfenster offen)
+Name: "{group}\Atrium Runner"; Filename: "{sys}\wscript.exe"; Parameters: """{app}\open-ui.vbs"""; IconFilename: "{app}\atrium-runner.exe"; Comment: "Zustand, laufende Aufträge, Starten/Stoppen, Konfiguration und Protokoll"
+Name: "{group}\Atrium Runner – Status (Konsole)"; Filename: "{cmd}"; Parameters: "/k ""{app}\atrium-runner.exe"" status"
 Name: "{group}\Atrium Runner – Jetzt an Server übergeben"; Filename: "{app}\atrium-runner.exe"; Parameters: "handover"
 Name: "{group}\Atrium Runner – Pausieren"; Filename: "{app}\atrium-runner.exe"; Parameters: "pause"
 Name: "{group}\Atrium Runner – Fortsetzen"; Filename: "{app}\atrium-runner.exe"; Parameters: "resume"
@@ -65,7 +67,7 @@ Name: "{group}\Atrium Runner – Konfiguration"; Filename: "notepad.exe"; Parame
 Filename: "{app}\atrium-runner.exe"; Parameters: "init"; Flags: runhidden waituntilterminated
 Filename: "{app}\atrium-runner.exe"; Parameters: "install --no-start"; Flags: runhidden waituntilterminated; Tasks: autostart
 Filename: "{app}\atrium-runner.exe"; Parameters: "service-start"; Flags: runhidden nowait; Tasks: autostart and startnow
-Filename: "notepad.exe"; Parameters: """{userappdata}\AtriumRunner\runner.config.json"""; Description: "Konfiguration öffnen (Atrium-Adresse und API-Key eintragen)"; Flags: postinstall nowait skipifsilent
+Filename: "{sys}\wscript.exe"; Parameters: """{app}\open-ui.vbs"""; Description: "Atrium Runner öffnen (Atrium-Adresse und API-Key eintragen)"; Flags: postinstall nowait skipifsilent
 
 [UninstallRun]
 Filename: "{app}\atrium-runner.exe"; Parameters: "uninstall"; Flags: runhidden waituntilterminated; RunOnceId: "AtriumRunnerUninstall"

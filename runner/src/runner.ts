@@ -2,12 +2,13 @@
  * Der Runner als Ganzes: Konten prüfen, bei Atrium anmelden, Heartbeat, SSE-Befehlsstrom, Befehle verteilen
  * (Angebote → Executor, RPC, Terminals), Aufräumen, geordnetes Beenden.
  */
+import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { accountEnv, publicEnv, type RunnerConfig } from './config.ts';
 import { ApiError, AtriumClient, RunnerApi, runCommandStream, type FetchFn } from './client.ts';
-import { Executor, type AccountState, type AtriumFeatures } from './executor.ts';
+import { Executor, type AccountState, type AtriumFeatures, type RunSummary } from './executor.ts';
 import { LimitProber, type ProbeFetch } from './limit-probe.ts';
 import { Workspace } from './git/workspace.ts';
 import type { Logger } from './log.ts';
@@ -48,6 +49,8 @@ export interface RunnerOptions {
 	 * Zeitsprung-Erkennung, sonst keine; `null` = aus (Tests: `FakePowerMonitor`).
 	 */
 	powerMonitor?: PowerMonitor | null;
+	/** Zustandsdatei bei Änderungen höchstens so oft schreiben (ms, Standard 3000) */
+	stateWriteMs?: number;
 	/** Abfrage der Steuerdateien (`handover`, `pause`, `stop`) in ms (Standard 2000) */
 	controlPollMs?: number;
 	/** Steuerdatei `stop` (geordnetes Beenden, z. B. `atrium-runner stop` unter Windows) */
@@ -77,6 +80,37 @@ export interface RunnerStateFile {
 	startedAt: string;
 	power: string;
 	updatedAt: string;
+	/** Ab 0.5.0 (PC-Oberfläche); ältere Runner schreiben die Felder nicht */
+	/** Atrium-Adresse (ohne Zugangsdaten) */
+	atriumUrl?: string;
+	/** Letzter Heartbeat erfolgreich? Fehlermeldung des letzten Fehlschlags */
+	atrium?: { ok: boolean; error: string | null; at: string | null };
+	/** Laufende Läufe mit letzter Tätigkeit */
+	details?: RunSummary[];
+	/** Konten: CLI vorhanden, angemeldet */
+	accounts?: { key: string; provider: string; label: string; ok: boolean; loggedIn: boolean; version: string; message: string }[];
+	/** Pausiert über die Steuerdatei `pause` (statt nur Übergabe) */
+	pausedByUser?: boolean;
+	/** Anzahl gleichzeitiger Läufe */
+	maxSlots?: number;
+}
+
+/**
+ * Dauerhafte Kennung dieser Installation (Datei `instance-id` im Arbeitsverzeichnis, beim ersten Start angelegt).
+ * Bleibt über Neustarts gleich; Atrium erkennt daran zwei Installationen unter demselben API-Key.
+ */
+export async function loadInstanceId(workDir: string): Promise<string> {
+	const file = path.join(workDir, 'instance-id');
+	try {
+		const v = (await readFile(file, 'utf8')).trim();
+		if (/^[A-Za-z0-9_-]{8,64}$/.test(v)) return v;
+	} catch {
+		// noch keine Kennung
+	}
+	const id = randomUUID();
+	await writeFile(file, `${id}
+`);
+	return id;
 }
 
 /** Konten prüfen (CLI vorhanden, angemeldet) */
@@ -147,6 +181,14 @@ export class Runner {
 	private needsRegister = false;
 	/** Beenden mit Frist läuft: keine neuen Angebote (`heartbeat.draining`) */
 	private draining = false;
+	/** Dauerhafte Kennung dieser Installation (`registerInput.instanceId`, Datei `instance-id` im Arbeitsverzeichnis) */
+	private instanceId: string | null = null;
+	/** Frist der laufenden Übergabe (für `heartbeat.handoverGraceSec`) */
+	private handoverDeadline: number | null = null;
+	/** Ergebnis des letzten Heartbeats (PC-Oberfläche) */
+	private atriumState: { ok: boolean; error: string | null; at: string | null } = { ok: false, error: null, at: null };
+	/** Zuletzt geschriebene Zustandsdatei ohne Zeitstempel (nur bei Änderungen neu schreiben) */
+	private lastStateSig = '';
 
 	constructor(private readonly o: RunnerOptions) {
 		this.log = o.log ?? silentLogger;
@@ -211,7 +253,8 @@ export class Runner {
 				};
 			}),
 			// Nach einem Neustart leer: Atrium gibt verwaiste Läufe sofort frei
-			runIds: this.executor.runIds()
+			runIds: this.executor.runIds(),
+			...(this.instanceId ? { instanceId: this.instanceId } : {})
 		};
 	}
 
@@ -229,19 +272,30 @@ export class Runner {
 				if (r.kind && r.kind !== this.kind)
 					this.log.info(`Atrium führt diesen Runner als ${r.kind === 'desktop' ? 'PC-Runner' : 'Server-Runner'}`);
 				this.log.info(`Bei Atrium angemeldet (Runner ${r.runnerId}, Status ${r.status})`);
+				this.atriumState = { ok: true, error: null, at: new Date().toISOString() };
 				if (r.status === 'pending')
 					this.log.info('Runner wartet auf Freigabe in Atrium (Administration → Runner & Konten)');
 				if (r.status === 'disabled') this.log.warn('Runner ist in Atrium deaktiviert');
 				return true;
 			} catch (e) {
 				const auth = e instanceof ApiError && (e.status === 401 || e.status === 403);
-				const wait = auth ? 60_000 : backoffMs(attempt, 1000, 60_000);
+				// 409: derselbe API-Key wird von einer anderen, noch aktiven Installation benutzt
+				const conflict = e instanceof ApiError && e.status === 409;
+				const wait = auth || conflict ? 60_000 : backoffMs(attempt, 1000, 60_000);
 				this.log.error(
 					auth
 						? 'Anmeldung abgelehnt – API-Key bzw. Berechtigung aidev.runner.connect prüfen'
-						: 'Anmeldung bei Atrium fehlgeschlagen',
+						: conflict
+							? 'Anmeldung abgelehnt – API-Key wird schon von einem anderen Runner verwendet (je Runner ein eigener API-Key)'
+							: 'Anmeldung bei Atrium fehlgeschlagen',
 					errorMessage(e)
 				);
+				this.atriumState = {
+					ok: false,
+					error: this.o.redactor.redact(`Anmeldung fehlgeschlagen: ${errorMessage(e)}`).slice(0, 300),
+					at: new Date().toISOString()
+				};
+				void this.writeState({ onlyIfChanged: true });
 				await sleep(wait, this.stop.signal);
 			}
 		}
@@ -263,17 +317,23 @@ export class Runner {
 	private async sendHeartbeat(opts: { timeoutMs?: number } = {}): Promise<void> {
 		try {
 			const handover = this.executor.handoverReason;
+			// Frist bis zur Abschlussmeldung: Atrium verkürzt die Lease darauf und plant ohne Meldung sofort neu ein
+			const graceSec = handover && this.handoverDeadline
+				? Math.min(300, Math.max(1, Math.ceil((this.handoverDeadline - Date.now()) / 1000)))
+				: null;
 			const r = await this.api.heartbeat(
 				{
 					slotsUsed: this.executor.slotsUsed,
 					runIds: this.executor.runIds(),
 					...(this.draining ? { draining: true } : {}),
 					...(handover ? { handover } : {}),
+					...(graceSec ? { handoverGraceSec: graceSec } : {}),
 					accounts: this.heartbeatAccounts()
 				},
 				opts
 			);
 			this.lastHeartbeatAt = new Date().toISOString();
+			this.atriumState = { ok: true, error: null, at: this.lastHeartbeatAt };
 			if (r.status !== this.status) this.log.info(`Status in Atrium: ${r.status}`);
 			this.status = r.status;
 			for (const id of r.cancel) {
@@ -284,6 +344,7 @@ export class Runner {
 			this.sentLimits.clear();
 			if (e instanceof ApiError && (e.status === 404 || e.status === 409)) this.needsRegister = true;
 			this.log.warn('Heartbeat fehlgeschlagen', errorMessage(e));
+			this.atriumState = { ok: false, error: this.o.redactor.redact(errorMessage(e)).slice(0, 300), at: new Date().toISOString() };
 		} finally {
 			void this.writeState();
 		}
@@ -303,6 +364,7 @@ export class Runner {
 		if (this.handoverRun) return this.handoverRun;
 		const budget = Math.min((this.o.config.handoverSec ?? 20) * 1000, graceMs ?? Number.POSITIVE_INFINITY);
 		const deadline = Date.now() + Math.max(1000, budget);
+		this.handoverDeadline = deadline;
 		const started = Date.now();
 		this.handoverRun = (async () => {
 			const runs = this.executor.slotsUsed;
@@ -413,9 +475,9 @@ export class Runner {
 		}
 	}
 
-	/** Zustand für `atrium-runner status` schreiben (best effort) */
-	async writeState(): Promise<void> {
-		const state: RunnerStateFile = {
+	/** Zustand für `atrium-runner status` und die PC-Oberfläche schreiben (best effort) */
+	async writeState(opts: { onlyIfChanged?: boolean } = {}): Promise<void> {
+		const body = {
 			pid: process.pid,
 			name: this.o.config.name,
 			version: RUNNER_VERSION,
@@ -423,12 +485,32 @@ export class Runner {
 			status: this.status,
 			runnerId: this.runnerId,
 			paused: this.executor.handoverReason,
+			pausedByUser: this.paused,
 			runs: this.executor.runIds(),
 			lastHeartbeatAt: this.lastHeartbeatAt,
 			startedAt: this.startedAt,
 			power: this.powerName,
-			updatedAt: new Date().toISOString()
+			atriumUrl: this.o.config.atriumUrl,
+			atrium: this.atriumState,
+			maxSlots: this.o.config.maxSlots,
+			details: this.executor.runSummaries(),
+			accounts: this.o.config.accounts.map((a) => {
+				const st = this.accounts.get(a.key);
+				return {
+					key: a.key,
+					provider: a.provider,
+					label: a.label ?? '',
+					ok: st?.ok ?? false,
+					loggedIn: st?.loggedIn ?? false,
+					version: st?.version ?? '',
+					message: this.o.redactor.redact(st?.message ?? '').slice(0, 300)
+				};
+			})
 		};
+		const sig = JSON.stringify(body);
+		if (opts.onlyIfChanged && sig === this.lastStateSig) return;
+		this.lastStateSig = sig;
+		const state: RunnerStateFile = { ...body, updatedAt: new Date().toISOString() };
 		try {
 			await writeFile(stateFile(this.o.config.workDir), JSON.stringify(state, null, 2));
 		} catch {
@@ -517,6 +599,10 @@ export class Runner {
 	/** Start: Fähigkeiten prüfen, anmelden, Strom und Heartbeat starten. Löst sich beim Beenden auf. */
 	async start(): Promise<void> {
 		await mkdir(this.o.config.workDir, { recursive: true });
+		this.instanceId = await loadInstanceId(this.o.config.workDir).catch((e: unknown) => {
+			this.log.warn('Installations-Kennung nicht lesbar', errorMessage(e));
+			return null;
+		});
 		const [git, ghOk, ptyOk] = await Promise.all([hasCommand('git'), hasCommand('gh'), this.pty.available()]);
 		this.capabilities = { question: true, branchDelivery: true, prUpdate: true, limitReport: true, attachments: true, handoff: true, fencing: true, wip: true, branchCleanup: git && ghOk, git, gh: ghOk, pty: ptyOk, os: `${os.platform()}-${os.arch()}`.slice(0, 40) };
 		if (!git) this.log.error('git wurde nicht gefunden – Läufe sind nicht möglich');
@@ -549,6 +635,10 @@ export class Runner {
 		this.timers.push(control);
 		await this.startPower();
 		await this.writeState();
+		// PC-Oberfläche: Tätigkeit der Läufe zeitnah sichtbar (nur bei Änderungen schreiben)
+		const stateTimer = setInterval(() => void this.writeState({ onlyIfChanged: true }), this.o.stateWriteMs ?? 3000);
+		stateTimer.unref();
+		this.timers.push(stateTimer);
 
 		if (!(await this.register())) return;
 		this.stream = runCommandStream(

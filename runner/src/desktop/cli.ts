@@ -8,6 +8,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { controlDir, stateFile, type RunnerStateFile } from '../runner.ts';
 import { RUNNER_VERSION } from '../version.ts';
+import { quitRunningApp } from '../app/instance.ts';
 import { isolationHint, personalDataFindings } from './isolation.ts';
 import { desktopPaths } from './paths.ts';
 import { serviceManager, ServiceError, type ServiceSpec } from './service.ts';
@@ -45,15 +46,20 @@ export function desktopConfigPath(explicit?: string): string {
 	return path.resolve(explicit ?? process.env.RUNNER_CONFIG ?? desktopPaths().configFile);
 }
 
-/** Arbeitsverzeichnis aus der Konfigurationsdatei (ohne Prüfung der übrigen Werte) */
-export function workDirOf(configFile: string): string {
+/**
+ * Arbeitsverzeichnis aus der Konfigurationsdatei (ohne Prüfung der übrigen Werte) – dieselbe Regel wie
+ * `loadConfig`: `WORK_DIR`, sonst `workDir` der Datei, sonst `./.work`, jeweils relativ zum Ordner der Datei.
+ * Ohne lesbare Datei: Standard des PC-Runners.
+ */
+export function workDirOf(configFile: string, env: NodeJS.ProcessEnv = process.env): string {
+	let raw: { workDir?: unknown };
 	try {
-		const raw = JSON.parse(readFileSync(configFile, 'utf8')) as { workDir?: string };
-		if (raw.workDir) return path.resolve(path.dirname(configFile), raw.workDir);
+		raw = JSON.parse(readFileSync(configFile, 'utf8')) as { workDir?: unknown };
 	} catch {
-		// keine oder ungültige Datei
+		return path.resolve(env.WORK_DIR ?? desktopPaths().workDir);
 	}
-	return path.resolve(process.env.WORK_DIR ?? desktopPaths().workDir);
+	const fromFile = typeof raw.workDir === 'string' && raw.workDir ? raw.workDir : undefined;
+	return path.resolve(path.dirname(configFile), env.WORK_DIR ?? fromFile ?? './.work');
 }
 
 /** Konfigurationsvorlage anlegen (nie überschreiben); Rechte 0600 */
@@ -75,7 +81,7 @@ export async function initConfig(configFile: string, io: CliIo = stdio): Promise
 	return true;
 }
 
-async function writeControl(workDir: string, name: 'handover' | 'pause' | 'stop'): Promise<void> {
+export async function writeControl(workDir: string, name: 'handover' | 'pause' | 'stop'): Promise<void> {
 	const dir = controlDir(workDir);
 	await mkdir(dir, { recursive: true });
 	await writeFile(path.join(dir, name), new Date().toISOString());
@@ -89,7 +95,7 @@ export async function readState(workDir: string): Promise<RunnerStateFile | null
 	}
 }
 
-function alive(pid: number): boolean {
+export function alive(pid: number): boolean {
 	try {
 		process.kill(pid, 0);
 		return true;
@@ -99,7 +105,7 @@ function alive(pid: number): boolean {
 }
 
 /** Geordnet stoppen: Steuerdatei `stop`, bis zu `timeoutMs` auf das Ende warten */
-async function stopViaControl(workDir: string, timeoutMs: number): Promise<boolean> {
+export async function stopViaControl(workDir: string, timeoutMs: number): Promise<boolean> {
 	const state = await readState(workDir);
 	if (!state || !alive(state.pid)) return true;
 	await writeControl(workDir, 'stop');
@@ -157,6 +163,8 @@ Hinweis: ${hint}
 			case 'uninstall': {
 				const m = svc();
 				await stopViaControl(workDir, 30_000);
+				// Oberfläche/Tray beenden (sonst bleibt das Programm in Benutzung)
+				if (await quitRunningApp(paths.dataDir)) io.out('Oberfläche beendet');
 				await m.uninstall();
 				io.out(`Autostart entfernt (${m.name})`);
 				if (rest.includes('--purge')) {
