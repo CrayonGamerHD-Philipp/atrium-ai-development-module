@@ -2,6 +2,9 @@ import { describe, it, expect } from 'vitest';
 import {
 	HARD_LIMIT_5H,
 	HARD_LIMIT_WEEK,
+	LOST_CONNECTION_MALUS,
+	PREFERRED_RUNNER_BONUS,
+	SESSION_BONUS,
 	WEEK_MS,
 	accountAvailable,
 	limitUtilization,
@@ -389,6 +392,80 @@ describe('planAssignments', () => {
 		expect(r2).toEqual(r1);
 		const reversed = { ...snapshot, tasks: [...snapshot.tasks].reverse() };
 		expect(planAssignments(reversed)).toEqual(r1);
+	});
+});
+
+describe('Verbindungsverlust: Runner/Konten weich meiden', () => {
+	it('Abzug übersteigt Sitzungsbonus und bevorzugten Runner', () => {
+		expect(LOST_CONNECTION_MALUS).toBeGreaterThan(SESSION_BONUS + PREFERRED_RUNNER_BONUS);
+	});
+	it('Abzug wird höchstens einmal angewandt', () => {
+		const base = scoreAccount(task(), account(), ROUTING, NOW)!.score;
+		const both = scoreAccount(
+			task({ avoidRunnerIds: ['runner-1'], avoidAccountIds: ['acc-a'] }),
+			account(),
+			ROUTING,
+			NOW
+		)!;
+		expect(both.score).toBeCloseTo(base - LOST_CONNECTION_MALUS);
+		const byAccount = scoreAccount(task({ avoidAccountIds: ['acc-a'] }), account(), ROUTING, NOW)!;
+		expect(byAccount.score).toBeCloseTo(base - LOST_CONNECTION_MALUS);
+	});
+	it('anderer Runner geht vor, auch wenn der gemiedene Sitzung und bevorzugter Runner ist', () => {
+		// Gemiedenes Konto ist sonst klar besser: Sitzung, bevorzugter Runner, höheres Gewicht, keine Auslastung
+		const lost = account({ id: 'acc-a', runnerId: 'r1' });
+		const other = account({
+			id: 'acc-b',
+			runnerId: 'r2',
+			provider: 'codex',
+			budget5h: 100,
+			used5h: 80,
+			running: 1
+		});
+		const t = task({ sessionAccountId: 'acc-a', avoidRunnerIds: ['r1'] });
+		const res = planAssignments(
+			plan({
+				accounts: [lost, other],
+				tasks: [t],
+				projects: [project({ preferredRunnerId: 'r1' })]
+			})
+		);
+		expect(res.map((r) => [r.accountId, r.runnerId])).toEqual([['acc-b', 'r2']]);
+	});
+	it('anderes Konto auf demselben Runner geht vor, wenn nur das Konto gemieden wird', () => {
+		const lost = account({ id: 'acc-a', runnerId: 'r1' });
+		const other = account({ id: 'acc-b', runnerId: 'r1', provider: 'codex' });
+		const res = planAssignments(
+			plan({
+				accounts: [lost, other],
+				tasks: [task({ sessionAccountId: 'acc-a', avoidAccountIds: ['acc-a'] })],
+				projects: [project({ preferredRunnerId: 'r1' })]
+			})
+		);
+		expect(res.map((r) => r.accountId)).toEqual(['acc-b']);
+	});
+	it('nur das gemiedene Konto verfügbar → wird trotzdem zugeteilt', () => {
+		const lost = account({ id: 'acc-a', runnerId: 'r1' });
+		const offline = account({ id: 'acc-b', runnerId: 'r2', runnerOnline: false });
+		const t = task({ avoidRunnerIds: ['r1'], avoidAccountIds: ['acc-a'] });
+		expect(scoreAccount(t, lost, ROUTING, NOW)).not.toBeNull();
+		const res = planAssignments(plan({ accounts: [lost, offline], tasks: [t] }));
+		expect(res.map((r) => [r.taskId, r.accountId, r.runnerId])).toEqual([['t1', 'acc-a', 'r1']]);
+	});
+	it('ohne die Felder (oder leer) ändert sich nichts', () => {
+		const a = account({ id: 'acc-a', runnerId: 'r1' });
+		const b = account({ id: 'acc-b', runnerId: 'r2', provider: 'codex' });
+		const t = task({ sessionAccountId: 'acc-a' });
+		const base = scoreAccount(t, a, ROUTING, NOW, 'r1')!.score;
+		expect(base).toBeCloseTo(0.9 + SESSION_BONUS + PREFERRED_RUNNER_BONUS);
+		const empty = { ...t, avoidRunnerIds: [], avoidAccountIds: [] };
+		expect(scoreAccount(empty, a, ROUTING, NOW, 'r1')!.score).toBe(base);
+		// Fremde IDs wirken nicht
+		const foreign = { ...t, avoidRunnerIds: ['r9'], avoidAccountIds: ['acc-z'] };
+		expect(scoreAccount(foreign, a, ROUTING, NOW, 'r1')!.score).toBe(base);
+		const projects = [project({ preferredRunnerId: 'r1' })];
+		const res = planAssignments(plan({ accounts: [a, b], tasks: [t], projects }));
+		expect(res.map((r) => r.accountId)).toEqual(['acc-a']);
 	});
 });
 
