@@ -6,6 +6,11 @@
  * technischen Kontos mit Recht `aidev.runner.connect`):
  * - Runner → Atrium: JSON-POSTs (`/runner/...`), Antwort `{ data: … }` wie jede Atrium-API.
  * - Atrium → Runner: Server-Sent Events `GET /runner/stream` mit `RunnerCommand`-Ereignissen (`data: <json>`).
+ *
+ * Runner-Arten (`registerInput.kind`): `server` = dauerhafter Dienst, `desktop` = Runner auf dem PC eines Nutzers
+ * (Vorrang vor Server-Runnern). Vor Standby/Herunterfahren übergibt ein Desktop-Runner seine Läufe: Zwischenstand als
+ * WIP-Commit auf dem Arbeits-Branch, Abschluss als `cancelled` mit `finishInput.handoff`; Atrium plant neu ein.
+ * Alle Felder dazu sind optional (ältere Runner bzw. ältere Atrium-Versionen arbeiten unverändert).
  */
 import { z } from 'zod';
 
@@ -68,6 +73,14 @@ export type LimitSnapshot = z.infer<typeof limitSnapshotSchema>;
 
 // ---------------------------------------------------------------- Registrierung / Heartbeat
 
+/**
+ * Art eines Runners: `server` = dauerhafter Dienst, `desktop` = Runner auf dem PC eines Nutzers, der in den Standby
+ * gehen oder heruntergefahren werden kann (Vorrang vor Server-Runnern, übergibt Läufe per `finishInput.handoff`).
+ */
+export const RUNNER_KINDS = ['server', 'desktop'] as const;
+export const runnerKindSchema = z.enum(RUNNER_KINDS);
+export type RunnerKind = z.infer<typeof runnerKindSchema>;
+
 export const runnerAccountSchema = z.object({
 	/** Eindeutig je Runner, z. B. `claude-main` (Konfiguration des Runners) */
 	key: z
@@ -87,6 +100,8 @@ export const registerInput = z.object({
 	name: z.string().min(1).max(80),
 	version: shortText(40),
 	maxSlots: z.number().int().min(0).max(64),
+	/** Art des Runners; fehlt das Feld (ältere Runner), gilt `server`. */
+	kind: runnerKindSchema.optional(),
 	capabilities: z.object({
 		question: z.boolean().optional(),
 		/** Kann Anhänge für einen Lauf herunterladen und bereitstellen */
@@ -99,6 +114,11 @@ export const registerInput = z.object({
 		limitReport: z.boolean().optional(),
 		/** Versteht RPC `git.branch-delete` (Atrium sendet ihn nur an solche Runner) */
 		branchCleanup: z.boolean().optional(),
+		/**
+		 * Kann Läufe vor Standby/Herunterfahren mit Zwischenstand übergeben (`finishInput.handoff`; den WIP-Commit
+		 * pusht er nur, wenn Atrium `registerResult.features.handoff` meldet)
+		 */
+		handoff: z.boolean().optional(),
 		git: z.boolean(),
 		gh: z.boolean(),
 		pty: z.boolean(),
@@ -117,7 +137,19 @@ export type RegisterInput = z.infer<typeof registerInput>;
 export const registerResult = z.object({
 	runnerId: id,
 	status: z.enum(['pending', 'approved', 'disabled']),
-	heartbeatSec: z.number().int()
+	heartbeatSec: z.number().int(),
+	/**
+	 * Für diesen Runner wirksame Lease laufender Läufe (Sekunden), z. B. kürzer für Desktop-Runner. Fehlt das Feld
+	 * (älteres Atrium), gilt wie bisher `offer.leaseSec`.
+	 */
+	leaseSec: z.number().int().optional(),
+	/** Vom Atrium verstandene Protokoll-Erweiterungen; fehlt das Feld (älteres Atrium), gilt keine als verstanden. */
+	features: z
+		.object({
+			/** Atrium versteht `finishInput.handoff` – nur dann pusht der Runner einen Zwischenstand. */
+			handoff: z.boolean().optional()
+		})
+		.optional()
 });
 export type RegisterResult = z.infer<typeof registerResult>;
 
@@ -488,33 +520,69 @@ export const ERROR_KINDS = [
 	'internal'
 ] as const;
 
-export const finishInput = z.object({
-	status: z.enum(['succeeded', 'failed', 'limited', 'cancelled']),
-	sessionId: shortText(200).nullable().default(null),
-	headSha: z
-		.string()
-		.regex(/^[0-9a-f]{7,40}$/)
-		.nullable()
-		.default(null),
-	branch: shortText(200).nullable().default(null),
-	commits: z.array(commitInfoSchema).max(200).default([]),
-	pr: z
-		.object({ number: z.number().int().positive(), url: z.string().url().max(500) })
-		.nullable()
-		.default(null),
-	/** Direkt gepusht (`direct`) bzw. sofort gemergt */
-	merged: z.boolean().default(false),
-	/** Der Ergebnis-Branch wurde erfolgreich gepusht. */
-	branchPushed: z.boolean().default(false),
-	/** Letzte Antwort des Agents (Zusammenfassung, bei Recherche das Ergebnis) */
-	summary: shortText(40_000).nullable().default(null),
-	/** Nur bei `expectPlan`: geparster Plan (Atrium prüft erneut gegen `planSchema`) */
-	plan: z.unknown().optional(),
-	errorKind: z.enum(ERROR_KINDS).nullable().default(null),
-	errorMessage: shortText(4000).nullable().default(null),
-	/** Konflikt-Dateien (bei `errorKind: 'conflict'`) */
-	conflictFiles: z.array(shortText(500)).max(200).default([])
+const shaSchema = z.string().regex(/^[0-9a-f]{7,40}$/);
+
+/** Anlass einer Übergabe: `suspend` = Standby/Ruhezustand, `shutdown` = Herunterfahren bzw. Beenden des Runners */
+export const HANDOFF_REASONS = ['suspend', 'shutdown'] as const;
+export const handoffReasonSchema = z.enum(HANDOFF_REASONS);
+export type HandoffReason = z.infer<typeof handoffReasonSchema>;
+
+/**
+ * Übergabe eines Laufs vor Standby/Herunterfahren (nur mit `status: 'cancelled'`). `wipPushed`: der Zwischenstand
+ * liegt als WIP-Commit `headSha` auf dem Arbeits-Branch (`finishInput.branch`); ein anderer Runner setzt dort fort.
+ */
+export const handoffSchema = z.object({
+	reason: handoffReasonSchema,
+	wipPushed: z.boolean(),
+	headSha: shaSchema.nullable().default(null),
+	/** Kurzer Hinweis zum Zwischenstand (z. B. was zuletzt lief) */
+	note: shortText(4000).nullable().default(null)
 });
+export type Handoff = z.infer<typeof handoffSchema>;
+
+/**
+ * Abschluss eines Laufs. Die Regel „`handoff` nur mit `status: 'cancelled'`" prüft ein `superRefine` (Zod 4:
+ * bleibt ein `ZodObject`, `.shape` funktioniert weiter).
+ */
+export const finishInput = z
+	.object({
+		status: z.enum(['succeeded', 'failed', 'limited', 'cancelled']),
+		sessionId: shortText(200).nullable().default(null),
+		headSha: shaSchema.nullable().default(null),
+		branch: shortText(200).nullable().default(null),
+		commits: z.array(commitInfoSchema).max(200).default([]),
+		pr: z
+			.object({ number: z.number().int().positive(), url: z.string().url().max(500) })
+			.nullable()
+			.default(null),
+		/** Direkt gepusht (`direct`) bzw. sofort gemergt */
+		merged: z.boolean().default(false),
+		/** Der Ergebnis-Branch wurde erfolgreich gepusht. */
+		branchPushed: z.boolean().default(false),
+		/** Letzte Antwort des Agents (Zusammenfassung, bei Recherche das Ergebnis) */
+		summary: shortText(40_000).nullable().default(null),
+		/** Nur bei `expectPlan`: geparster Plan (Atrium prüft erneut gegen `planSchema`) */
+		plan: z.unknown().optional(),
+		errorKind: z.enum(ERROR_KINDS).nullable().default(null),
+		errorMessage: shortText(4000).nullable().default(null),
+		/** Konflikt-Dateien (bei `errorKind: 'conflict'`) */
+		conflictFiles: z.array(shortText(500)).max(200).default([]),
+		/**
+		 * Lauf wurde wegen Standby/Herunterfahren abgebrochen und übergeben (nur mit `status: 'cancelled'`, nur von
+		 * Runnern mit `capabilities.handoff`). Ältere Atrium-Versionen verwerfen das Feld und werten den Lauf als
+		 * gewöhnlichen Abbruch.
+		 */
+		handoff: handoffSchema.optional()
+	})
+	.superRefine((v, ctx) => {
+		if (v.handoff && v.status !== 'cancelled') {
+			ctx.addIssue({
+				code: 'custom',
+				path: ['handoff'],
+				message: "handoff nur zusammen mit status 'cancelled'"
+			});
+		}
+	});
 export type FinishInput = z.infer<typeof finishInput>;
 
 export const rejectInput = z.object({ reason: shortText(500) });
