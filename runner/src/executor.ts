@@ -17,6 +17,7 @@ import {
 	assertPullUpdatable,
 	commentOnPull,
 	commitAll,
+	commitWip,
 	commitInfos,
 	countCommits,
 	DeliveryError,
@@ -27,6 +28,7 @@ import {
 	ensurePullRequest,
 	fetchPullContext,
 	headSha,
+	operationInProgress,
 	pullCommentBody,
 	pullUrl,
 	pushBranch,
@@ -35,6 +37,7 @@ import {
 } from './git/delivery.ts';
 import { assertRefName, GitError } from './git/git.ts';
 import type { Workspace } from './git/workspace.ts';
+import { handoffInfo, handoffMessage, handoffNote, wipEligible, type HandoffReason } from './handoff.ts';
 import type { Logger } from './log.ts';
 import { silentLogger } from './log.ts';
 import { extractPlan } from './plan.ts';
@@ -60,7 +63,15 @@ export class RunError extends Error {
 	}
 }
 
-type AbortReason = 'cancel' | 'timeout' | 'shutdown' | 'limit';
+type AbortReason = 'cancel' | 'timeout' | 'shutdown' | 'limit' | 'handoff';
+
+/** Übergabe eines Laufs (Standby/Herunterfahren), gesetzt von `Executor.handoff` */
+interface RunHandoff {
+	reason: HandoffReason;
+	pushWip: boolean;
+	/** Löst bei Ablauf der Frist aus (bricht die git-Aufrufe des Zwischenstands ab) */
+	signal: AbortSignal;
+}
 
 interface ActiveRun {
 	offer: RunOffer;
@@ -68,6 +79,21 @@ interface ActiveRun {
 	reason: AbortReason | null;
 	cancelMessage: string;
 	done: Promise<void>;
+	handoff?: RunHandoff;
+	/** `finish` wurde (vom Lauf selbst oder als Ersatzmeldung der Übergabe) abgeschickt */
+	finishSent?: boolean;
+	/** … und ist beantwortet bzw. endgültig fehlgeschlagen */
+	finishSettled?: boolean;
+	/** Zuletzt bekannte Sitzung, letzter Commit und letzte Antwort des Agents (für die Ersatzmeldung/Notiz) */
+	sessionId?: string | null;
+	headSha?: string | null;
+	lastText?: string | null;
+}
+
+/** Sperre der Auslieferung (`holdDelivery`) */
+interface DeliveryHold {
+	promise: Promise<void>;
+	release: () => void;
 }
 
 export interface AccountState {
@@ -99,6 +125,10 @@ export class Executor {
 	/** Kürzlich bearbeitete Läufe (doppelte Angebote über `/pending` ignorieren) */
 	private readonly seen = new Map<string, number>();
 	private stopping = false;
+	/** Nach einer Übergabe keine Angebote annehmen, bis `resumeOffers` */
+	private offersPaused = false;
+	/** Gesperrte Auslieferung (nach dem Aufwachen aus dem Standby) */
+	private hold: DeliveryHold | null = null;
 	private readonly log: Logger;
 	/** Zuletzt beobachteter Limit-Stand je Konto und Fenster */
 	readonly limits: LimitStore;
@@ -138,6 +168,7 @@ export class Executor {
 		};
 
 		if (this.stopping) return reject('Runner wird beendet');
+		if (this.offersPaused) return reject('Runner übergibt seine Läufe (Standby/Herunterfahren)');
 		if (this.running.size >= this.o.config.maxSlots) return reject('Keine freien Slots');
 		const acct = this.o.accounts().get(offer.account.key);
 		if (!acct || acct.config.provider !== offer.account.provider)
@@ -222,8 +253,160 @@ export class Executor {
 			}
 			run.ctrl.abort();
 		}
+		// Abgebrochene Läufe pushen nach der Sperre nicht mehr; sie sollen nur noch ihr `finish` senden
+		this.releaseDelivery();
 		const all = Promise.all([...this.running.values()].map((r) => r.done));
 		await Promise.race([all, new Promise((r) => setTimeout(r, timeoutMs).unref())]);
+	}
+
+	/**
+	 * Laufende Läufe an Atrium übergeben (PC geht in den Standby bzw. wird heruntergefahren): keine neuen Angebote
+	 * bis `resumeOffers`, alle Läufe sofort abbrechen, bei `pushWip` je schreibendem Lauf den Zwischenstand
+	 * committen und ohne Force pushen, dann `finish` `cancelled` (mit `handoff` nur bei `pushWip`). Alles parallel
+	 * und hart begrenzt durch `deadlineMs`; danach werden verbleibende Läufe nur noch als `cancelled` gemeldet.
+	 * Liefert die Zahl der übergebenen Läufe und löst sich nie mit einem Fehler auf. Worktrees bleiben erhalten.
+	 */
+	async handoff(reason: HandoffReason, opts: { deadlineMs: number; pushWip: boolean }): Promise<number> {
+		this.offersPaused = true;
+		const runs = [...this.running.values()];
+		try {
+			const total = Number.isFinite(opts.deadlineMs) ? Math.max(0, opts.deadlineMs) : 0;
+			const end = Date.now() + total;
+			// Reserve für die Ersatzmeldungen nach Ablauf der Arbeitsfrist
+			const workEnd = end - Math.min(1500, Math.floor(total / 4));
+			const signal = AbortSignal.timeout(Math.max(1, workEnd - Date.now()));
+			const message = handoffMessage(reason);
+			for (const run of runs) {
+				if (!run.reason) {
+					run.reason = 'handoff';
+					run.cancelMessage = message;
+					run.handoff = { reason, pushWip: opts.pushWip, signal };
+				}
+				run.ctrl.abort();
+			}
+			if (runs.length) this.log.info(`Übergabe (${reason}): ${runs.length} Lauf/Läufe werden abgebrochen`);
+			const settled = () => runs.every((r) => r.finishSettled || !this.running.has(r.offer.runId));
+			await waitUntil(settled, workEnd);
+			for (const run of runs) {
+				if (run.finishSent || !this.running.has(run.offer.runId)) continue;
+				this.log.warn(`Übergabe: Frist für Lauf ${run.offer.runId} abgelaufen – nur noch als cancelled gemeldet`);
+				void this.sendFinish(run, this.fallbackFinish(run));
+			}
+			await waitUntil(settled, end);
+		} catch (e) {
+			this.log.error('Übergabe: interner Fehler', errorMessage(e));
+		}
+		return runs.length;
+	}
+
+	/** Nach einer Übergabe wieder Angebote annehmen (der Runner läuft nach dem Standby weiter) */
+	resumeOffers(): void {
+		this.offersPaused = false;
+	}
+
+	/**
+	 * Ab jetzt keine Commits, Tests, Pushes, PR-Aktionen, Merges und `finish` – die Läufe warten an einem gemeinsamen
+	 * Gate (nach dem Aufwachen gehören sie womöglich schon einem anderen Runner). Agent-Prozesse laufen weiter.
+	 */
+	holdDelivery(): void {
+		if (this.hold) return;
+		let release: () => void = () => undefined;
+		const promise = new Promise<void>((resolve) => (release = resolve));
+		this.hold = { promise, release };
+	}
+
+	/** Auslieferung wieder erlauben; inzwischen abgebrochene Läufe enden ohne Push als `cancelled` */
+	releaseDelivery(): void {
+		const h = this.hold;
+		this.hold = null;
+		h?.release();
+	}
+
+	/** Ist die Auslieferung gesperrt? */
+	get deliveryHeld(): boolean {
+		return this.hold !== null;
+	}
+
+	/** Am Gate warten, solange die Auslieferung gesperrt ist (bzw. bis `signal` auslöst) */
+	private async waitForDelivery(signal?: AbortSignal): Promise<void> {
+		while (this.hold && !signal?.aborted) await raceAbort(this.hold.promise, signal);
+	}
+
+	/** `finish` genau einmal senden (Lauf selbst oder Ersatzmeldung der Übergabe) */
+	private async sendFinish(run: ActiveRun, finish: FinishInput): Promise<boolean> {
+		if (run.finishSent) return false;
+		run.finishSent = true;
+		try {
+			await this.o.api.finish(run.offer.runId, finish);
+			return true;
+		} catch (e) {
+			this.log.error(`Abschlussmeldung für ${run.offer.runId} fehlgeschlagen`, errorMessage(e));
+			return false;
+		} finally {
+			run.finishSettled = true;
+		}
+	}
+
+	/** Ersatzmeldung, wenn ein Lauf die Frist der Übergabe nicht einhält: nur `cancelled`, nichts gepusht */
+	private fallbackFinish(run: ActiveRun): FinishInput {
+		const { offer } = run;
+		const sha = run.headSha && /^[0-9a-f]{7,40}$/.test(run.headSha) ? run.headSha : null;
+		const h = run.reason === 'handoff' ? run.handoff : undefined;
+		return {
+			status: 'cancelled',
+			sessionId: run.sessionId ? run.sessionId.slice(0, 200) : null,
+			headSha: sha,
+			branch: h && wipEligible(offer) ? offer.branch : null,
+			commits: [],
+			pr: null,
+			merged: false,
+			branchPushed: false,
+			summary: null,
+			errorKind: 'cancelled',
+			errorMessage: (run.cancelMessage || 'Abgebrochen').slice(0, 4000),
+			conflictFiles: [],
+			...(h?.pushWip ? { handoff: handoffInfo(h.reason, false, null, handoffNote(run.lastText, this.o.redactor)) } : {})
+		};
+	}
+
+	/**
+	 * Zwischenstand eines übergebenen Laufs committen und ohne Force auf `origin/<branch>` pushen (kein testCmd, keine
+	 * Hooks). Wirft nie; bei Fehlern oder abgelaufener Frist `pushed: false`.
+	 */
+	private async pushWip(
+		run: ActiveRun,
+		dir: string,
+		prepared: { startSha: string; remoteSha: string | null } | null,
+		emit: (k: RunEventKind, p: Record<string, unknown>) => void
+	): Promise<{ pushed: boolean; headSha: string | null }> {
+		const { offer } = run;
+		const h = run.handoff;
+		const ws = this.o.workspace;
+		let sha: string | null = null;
+		if (!h) return { pushed: false, headSha: null };
+		const signal = h.signal;
+		const stale = () => signal.aborted || run.finishSent === true;
+		const head = async () => (await ws.run(dir, ['rev-parse', 'HEAD'], { signal })).stdout.trim() || null;
+		try {
+			sha = await head();
+			if (!h.pushWip || !prepared || !wipEligible(offer) || stale()) return { pushed: false, headSha: sha };
+			if (await operationInProgress(ws, dir, signal)) {
+				emit('error', { text: 'Übergabe: Merge/Rebase im Worktree unterbrochen – kein Zwischenstand gepusht' });
+				return { pushed: false, headSha: sha };
+			}
+			const exclude = offer.attachments?.length ? [ATTACHMENTS_DIR] : [];
+			if (await commitWip(ws, dir, { taskId: offer.taskId, reason: h.reason, exclude, signal }))
+				emit('git', { action: 'commit', detail: 'Zwischenstand vor Übergabe committet' });
+			sha = await head();
+			const ahead = await ws.run(dir, ['rev-list', '--count', `${prepared.startSha}..HEAD`], { signal });
+			if (!(Number(ahead.stdout.trim()) > 0) || stale()) return { pushed: false, headSha: sha };
+			const repo = { repoOwner: offer.project.repoOwner, repoName: offer.project.repoName };
+			await pushBranch(ws, repo, dir, offer.branch, prepared.remoteSha, emit, { allowForce: false, signal });
+			return { pushed: true, headSha: sha };
+		} catch (e) {
+			emit('error', { text: `Übergabe: Zwischenstand nicht gepusht – ${signal.aborted ? 'Frist abgelaufen' : errorMessage(e)}` });
+			return { pushed: false, headSha: sha };
+		}
 	}
 
 	/** Wartet, bis alle laufenden Läufe beendet sind (Tests) */
@@ -301,7 +484,14 @@ export class Executor {
 		};
 
 		let wtDir: string | null = null;
+		let prepared: { dir: string; startSha: string; remoteSha: string | null } | null = null;
 		let pull: PullContext | null = null;
+		run.sessionId = sessionId;
+		/** Gate vor jedem Auslieferungsschritt (`holdDelivery`); danach auf Abbruch prüfen */
+		const gate = async () => {
+			await this.waitForDelivery(signal);
+			checkAbort();
+		};
 		try {
 			emit('status', { text: 'Repository wird vorbereitet' });
 			// 0. Bestehender PR (pr-update): prüfen, bevor etwas geändert wird; Kontext für den Agent.
@@ -311,8 +501,10 @@ export class Executor {
 			else if (offer.delivery.mode === 'integrate' && offer.delivery.pullNumber !== undefined)
 				await this.loadPull(offer, offer.delivery.pullNumber, offer.delivery.integrationBranch, emit);
 			// 1. Worktree
-			const prepared = await this.prepareWorktree(offer, emit);
+			prepared = await this.prepareWorktree(offer, emit);
 			wtDir = prepared.dir;
+			const startSha = prepared.startSha;
+			const remoteSha = prepared.remoteSha;
 			checkAbort();
 
 			const baseEnv = accountEnv(acct, process.env, {
@@ -357,7 +549,7 @@ export class Executor {
 			let limit: AgentLimit | null = null;
 			for await (const ev of proc.events) {
 				if (ev.kind === 'usage') usage = ev.usage;
-				else if (ev.kind === 'session') sessionId = ev.id;
+				else if (ev.kind === 'session') sessionId = run.sessionId = ev.id;
 				else if (ev.kind === 'limits') {
 					streamLimits = true;
 					this.limits.update(acct.key, ev.windows, 'stream');
@@ -369,11 +561,16 @@ export class Executor {
 						if (!run.reason) run.reason = 'limit';
 						proc.kill();
 					}
-				} else emit(ev.kind, ev.payload);
+				} else {
+					if (ev.kind === 'text' && typeof ev.payload.text === 'string' && ev.payload.text.trim())
+						run.lastText = ev.payload.text;
+					emit(ev.kind, ev.payload);
+				}
 			}
 			const result: AgentResult = await proc.done;
 			if (result.usage) usage = result.usage;
-			if (result.sessionId) sessionId = result.sessionId;
+			if (result.sessionId) sessionId = run.sessionId = result.sessionId;
+			if (result.lastText) run.lastText = result.lastText;
 			limit = limit ?? result.limit;
 			if (limit) {
 				await postLimit(limit);
@@ -405,11 +602,12 @@ export class Executor {
 			}
 
 			// 5. Schreibend: Commit
+			await gate();
 			// Anhangsablage nie in den Index aufnehmen (zusätzlich zu `info/exclude`)
 			const exclude = offer.attachments?.length ? [ATTACHMENTS_DIR] : [];
 			const committed = await commitAll(ws, wtDir, offer.title, offer.taskId, exclude);
 			if (committed) emit('git', { action: 'commit', detail: 'Änderungen committet' });
-			const newCommits = await countCommits(ws, wtDir, prepared.startSha);
+			const newCommits = await countCommits(ws, wtDir, startSha);
 			finish.branch = offer.branch;
 			finish.headSha = await headSha(ws, wtDir);
 			// Ein wiederaufgenommener oder zusammengeführter Branch kann bereits auszuliefernde Commits enthalten –
@@ -432,25 +630,28 @@ export class Executor {
 			const dir = wtDir;
 			const runTests = async (label: string, failure: string) => {
 				if (!offer.project.testCmd.trim()) return;
+				await gate();
 				emit('status', { text: label });
 				const r = await this.shell(offer.project.testCmd, dir, publicEnv(baseEnv), signal, timeoutMs, emit);
 				checkAbort();
 				if (r !== 0) {
-					finish.commits = await commitInfos(ws, dir, prepared.startSha);
+					finish.commits = await commitInfos(ws, dir, startSha);
 					throw new RunError('tests', `${failure} (Exit-Code ${r ?? 'unbekannt'}) – nichts gepusht`);
 				}
 			};
 			await runTests('Tests laufen (testCmd)', 'Tests fehlgeschlagen');
 
 			// Auslieferung
-			let commitBase = prepared.startSha;
+			let commitBase = startSha;
 			const d = offer.delivery;
 			const gitEmit = (k: RunEventKind, p: Record<string, unknown>) => emit(k, p);
+			await gate();
 			if (d.mode === 'branch') {
-				await pushBranch(ws, repo, wtDir, offer.branch, prepared.remoteSha, gitEmit);
+				await pushBranch(ws, repo, wtDir, offer.branch, remoteSha, gitEmit);
 				finish.branchPushed = true;
 			} else if (d.mode === 'pr') {
-				await pushBranch(ws, repo, wtDir, offer.branch, prepared.remoteSha, gitEmit);
+				await pushBranch(ws, repo, wtDir, offer.branch, remoteSha, gitEmit);
+				await gate();
 				const pr = await ensurePullRequest(
 					ws,
 					repo,
@@ -458,6 +659,7 @@ export class Executor {
 					gitEmit
 				);
 				finish.pr = pr;
+				if (d.autoMerge) await gate();
 				if (d.autoMerge) await enableAutoMerge(ws, repo, pr.number, gitEmit);
 			} else if (d.mode === 'pr-update') {
 				if (!integratedOnly) {
@@ -465,7 +667,7 @@ export class Executor {
 					const synced = await syncPullBranch(
 						ws,
 						repo,
-						{ dir: wtDir, branch: offer.branch, number: d.number, expectedRemote: prepared.remoteSha },
+						{ dir: wtDir, branch: offer.branch, number: d.number, expectedRemote: remoteSha },
 						gitEmit
 					);
 					commitBase = synced.base;
@@ -475,6 +677,7 @@ export class Executor {
 							'Tests laufen erneut (testCmd, nach Rebase auf parallel gepushte Commits)',
 							'Tests nach Rebase auf parallel gepushte Commits fehlgeschlagen'
 						);
+					await gate();
 					await pushBranch(ws, repo, wtDir, offer.branch, commitBase, gitEmit, { allowForce: false });
 				}
 				// Bei `integratedOnly` liegen die Änderungen der Teilaufträge bereits auf dem PR-Branch
@@ -493,13 +696,15 @@ export class Executor {
 						? 'Die Änderungen der Teilaufträge wurden bereits einzeln in den PR-Branch gemergt.'
 						: undefined
 				});
+				await gate();
 				await commentOnPull(ws, repo, d.number, redactor.redact(body), gitEmit);
 			} else if (d.mode === 'direct') {
 				commitBase = await deliverDirect(ws, repo, wtDir, offer.project.defaultBranch, gitEmit);
 				finish.merged = true;
 				finish.branch = offer.project.defaultBranch;
 			} else if (d.mode === 'integrate') {
-				await pushBranch(ws, repo, wtDir, offer.branch, prepared.remoteSha, gitEmit);
+				await pushBranch(ws, repo, wtDir, offer.branch, remoteSha, gitEmit);
+				await gate();
 				await deliverIntegrate(
 					ws,
 					repo,
@@ -527,7 +732,16 @@ export class Executor {
 			finish.conflictFiles = err.conflictFiles.slice(0, 200);
 			if (err.kind === 'internal') log.error('Interner Fehler', e instanceof Error ? (e.stack ?? e.message) : e);
 			emit('error', { text: finish.errorMessage });
-			if (wtDir && !finish.headSha) finish.headSha = await headSha(ws, wtDir).catch(() => null);
+			// Übergabe: Zwischenstand sichern (nur bei `pushWip` und schreibenden Läufen) und `handoff` melden
+			const h = run.reason === 'handoff' && err.kind === 'cancelled' ? run.handoff : undefined;
+			if (h) {
+				const wip = wtDir ? await this.pushWip(run, wtDir, prepared, emit) : { pushed: false, headSha: null };
+				if (wipEligible(offer)) finish.branch = offer.branch;
+				if (wip.headSha) finish.headSha = wip.headSha;
+				if (h.pushWip)
+					finish.handoff = handoffInfo(h.reason, wip.pushed, wip.headSha, handoffNote(run.lastText ?? finish.summary, redactor));
+			} else if (wtDir && !finish.headSha) finish.headSha = await headSha(ws, wtDir).catch(() => null);
+			run.headSha = finish.headSha;
 		} finally {
 			clearTimeout(timer);
 			await rm(tmpDir, { recursive: true, force: true }).catch(() => undefined);
@@ -552,12 +766,11 @@ export class Executor {
 					log.warn('Verbrauchsmeldung fehlgeschlagen', errorMessage(e));
 				}
 			}
-			try {
-				await api.finish(offer.runId, finish);
+			// Gesperrte Auslieferung: auch `finish` wartet (außer bei Übergabe und Beenden)
+			if (run.reason !== 'handoff' && run.reason !== 'shutdown') await this.waitForDelivery();
+			if (finish.status !== 'cancelled') delete finish.handoff;
+			if (await this.sendFinish(run, finish))
 				log.info(`Lauf beendet: ${finish.status}${finish.errorKind ? ` (${finish.errorKind})` : ''}`);
-			} catch (e) {
-				log.error('Abschlussmeldung fehlgeschlagen', errorMessage(e));
-			}
 		}
 	}
 
@@ -725,13 +938,33 @@ function toRunError(e: unknown, run: ActiveRun): RunError {
 			return new RunError('timeout', `Zeitlimit von ${run.offer.timeoutSec} s überschritten`);
 		return e;
 	}
-	if (run.reason === 'cancel' || run.reason === 'shutdown')
+	if (run.reason === 'cancel' || run.reason === 'shutdown' || run.reason === 'handoff')
 		return new RunError('cancelled', run.cancelMessage || 'Abgebrochen');
 	if (run.reason === 'timeout') return new RunError('timeout', `Zeitlimit von ${run.offer.timeoutSec} s überschritten`);
 	if (e instanceof DeliveryError) return new RunError(e.kind, e.message, e.conflictFiles);
 	if (e instanceof GitError) return new RunError('git', e.message);
 	if (e instanceof ApiError) return new RunError('internal', `Atrium: ${e.message}`);
 	return new RunError('internal', errorMessage(e));
+}
+
+/** Wartet auf `p` oder bis `signal` auslöst */
+function raceAbort(p: Promise<void>, signal?: AbortSignal): Promise<void> {
+	if (!signal) return p;
+	if (signal.aborted) return Promise.resolve();
+	return new Promise<void>((resolve) => {
+		const done = () => {
+			signal.removeEventListener('abort', done);
+			resolve();
+		};
+		signal.addEventListener('abort', done, { once: true });
+		void p.then(done);
+	});
+}
+
+/** Fragt `cond` ab, bis sie gilt oder der Zeitpunkt `until` erreicht ist */
+async function waitUntil(cond: () => boolean, until: number): Promise<void> {
+	while (!cond() && Date.now() < until)
+		await new Promise<void>((resolve) => setTimeout(resolve, Math.min(20, Math.max(1, until - Date.now()))).unref());
 }
 
 function statusText(f: FinishInput): string {
