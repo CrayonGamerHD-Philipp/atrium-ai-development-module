@@ -387,7 +387,7 @@ einige Minuten dauert.
 
 1. Version in `runner/package.json` **und** `modules/aidev/runner-release.ts` erhöhen (ein Test prüft die Gleichheit;
    `runner-release.ts` steuert den Hinweis „Update verfügbar“ auf der Runner-Seite).
-2. Commit auf `main`, dann Tag setzen und pushen: `git tag runner-v0.4.0 && git push origin runner-v0.4.0`.
+2. Commit auf `main`, dann Tag setzen und pushen: `git tag runner-v0.5.0 && git push origin runner-v0.5.0`.
    Tags mit `-beta`/`-rc` (z. B. `runner-v0.5.0-rc.1`) werden als Pre-Release veröffentlicht.
 3. `.github/workflows/release-runner.yml` läuft: CI (Lint, Typen, Tests von Modul und Runner) → Versionsprüfung (Tag ↔
    `package.json` ↔ `runner-release.ts`, sonst Abbruch) → Build auf nativen Runnern (Linux x64/arm64, macOS arm64/x64,

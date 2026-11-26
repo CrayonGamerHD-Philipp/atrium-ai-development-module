@@ -3,7 +3,7 @@
 	"id": "aidev",
 	"name": "KI-Entwicklung",
 	"description": "Vibe-Coding im Browser: GitHub-Projekte anlegen, Aufträge an Coding-Agents (Claude Code, Codex, Gemini, OpenAI-kompatibel) geben, die auf eigenen Runnern selbstständig arbeiten, committen und PRs öffnen – mit Live-Log, Diff, Editor und Terminal",
-	"version": "0.4.0",
+	"version": "0.5.0",
 	"core": ">=2.0.0-0 <3.0.0",
 	"dependencies": {},
 	"optionalDependencies": {},
