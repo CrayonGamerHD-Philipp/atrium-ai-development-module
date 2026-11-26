@@ -26,7 +26,12 @@ Browser ──REST + SSE──▶ Atrium (Modul aidev: Projekte, Warteschlange, 
   Auftragstexte (`prompts.ts`), Aktionsvorschläge der Agents (`actions.ts`) und die Oberfläche (`pages/`, `ui.ts`). Das
   Protokoll zum Runner steht in `protocol.ts`.
 - **`runner/`** ist ein eigenständiger Dienst (Docker), auf dem die Agents mit deinen Abo-Logins laufen. Es können mehrere
-  Runner sein, auf Servern oder deinem PC. Einrichtung: [`runner/README.md`](runner/README.md).
+  Runner sein, auf Servern oder nativ auf deinem PC (Linux, Windows, macOS; Installationsskripte unter
+  `runner/desktop/`). Einrichtung: [`runner/README.md`](runner/README.md).
+- Das **Protokoll** (`protocol.ts`, `PROTOCOL_VERSION` 1) ist abwärtskompatibel erweitert: `registerInput.kind`
+  (`server`/`desktop`), `capabilities.handoff`, in der Antwort `leaseSec` und `features.handoff` sowie
+  `finishInput.handoff` (`reason`, `wipPushed`, `headSha`, `note`; nur mit `status: 'cancelled'`). Alle Felder
+  sind optional; ältere Runner gelten als `server`, ältere Atrium-Versionen werten eine Übergabe als Abbruch.
 - Atrium selbst braucht weder git noch Agent-CLIs. Der Container bleibt gehärtet.
 
 ### Projekte anlegen
@@ -76,6 +81,15 @@ Die Projektübersicht (Startseite des Moduls) ist auch bei vielen Projekten schn
 Die Vorlieben lassen sich unter **Administration → KI-Verteilung** einstellen. Für jedes Konto gibt es Budgets
 (5 Stunden / Woche, werden bei Limits automatisch gelernt), gleichzeitige Läufe und eine Wartezeit nach einem Limit. Sie
 stehen unter **Administration → Runner & Konten**.
+
+**PC vor Server:** Runner auf dem eigenen PC (`kind: desktop`) bekommen Aufträge vor Server-Runnern (Vorrang
+automatisch 10 bzw. 0, je Runner unter **Runner & Konten** in der Spalte „Vorrang“ einstellbar). So entlastet der PC den Server,
+solange er läuft. Geht er in den Standby oder wird heruntergefahren, sichert der Runner den Zwischenstand als WIP-Commit
+auf dem Arbeits-Branch und übergibt den Lauf; Atrium plant ihn sofort ohne Zählung des Versuchs neu ein, und ein
+Server-Runner setzt auf demselben Branch fort. Für PC-Runner gilt eine kürzere Lease (45 s), deren Ablauf ebenfalls
+nicht als Versuch zählt. Nach dem Aufwachen pusht der PC nichts, bis er sich neu angemeldet hat. Dasselbe Abo auf
+PC und Server wird als zwei Konten getrennt geschätzt.
+Details: [`runner/README.md`](runner/README.md#runner-auf-dem-eigenen-pc).
 
 ### Commit-Policy je Projekt
 
@@ -214,7 +228,9 @@ Ein Runner darf auch mit laufenden Aufträgen neu gestartet werden. Geordnet bee
 Atrium plant sie ohne Zählung des Versuchs neu ein. Mit `DRAIN_SEC` wartet der Runner vorher, bis laufende Läufe fertig
 sind; in der Zeit steht er unter **Runner & Konten** als „Wird beendet“ und bekommt nichts Neues. Nach einem harten Ende
 meldet er bei der nächsten Anmeldung, dass er nichts mehr ausführt (`runIds`), und Atrium gibt die verwaisten Läufe
-sofort frei, statt die Lease (90 s) abzuwarten. Details: [`runner/README.md`](runner/README.md#neustart-während-laufender-aufträge).
+sofort frei, statt die Lease (90 s, PC-Runner 45 s) abzuwarten. Standby und Herunterfahren eines PC-Runners
+übergeben laufende Läufe an einen anderen Runner (siehe [Rollen und Verteilung](#rollen-und-verteilung)).
+Details: [`runner/README.md`](runner/README.md#neustart-während-laufender-aufträge).
 
 ## Entwicklung
 
@@ -255,7 +271,8 @@ anschließend unter **Runner & Konten** frei.
 ## Sicherheit
 
 - Die Agents laufen **ohne Rückfragen** (`--dangerously-skip-permissions`, `--yolo` …). Betreibe sie deshalb nur im
-  Runner-Container, nie auf dem Atrium-Host.
+  Runner-Container, nie auf dem Atrium-Host. Ein PC-Runner läuft ohne Container mit deinen Benutzerrechten, also nur
+  auf einem vertrauenswürdigen Rechner.
 - CLI-Logins, das GitHub-Token und API-Keys bleiben auf dem Runner. Atrium sieht sie nie. Ausgaben werden vor dem
   Hochladen bereinigt (`runner/src/redact.ts`).
 - Für die [Limit-Analyse](#limit-analyse) sendet der Runner nur Limit-Werte (Fenster, Prozent, Rücksetzzeit, Status).

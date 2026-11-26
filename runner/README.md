@@ -1,8 +1,8 @@
 # Atrium aidev-Runner
 
 Der Runner führt die Agent-Läufe des Atrium-Moduls **KI-Entwicklung** (`aidev`) aus. Atrium ist die Steuerzentrale;
-der Runner läuft getrennt davon (Docker-Container auf einem Server oder PC), verbindet sich **ausgehend** mit Atrium
-und braucht keine offenen Ports.
+der Runner läuft getrennt davon (Docker-Container auf einem Server oder nativ auf dem
+[eigenen PC](#runner-auf-dem-eigenen-pc)), verbindet sich **ausgehend** mit Atrium und braucht keine offenen Ports.
 
 - Anmeldung mit einem API-Key, Befehle per Server-Sent Events (`GET /runner/stream`), Rückmeldungen per JSON-POST.
 - Agents: **Claude Code** (`claude`), **Codex** (`codex`), **Gemini CLI** (`gemini`), **OpenAI-kompatible APIs**
@@ -40,7 +40,7 @@ Vorlage: [`runner.config.example.json`](runner.config.example.json)):
 | `LIMIT_PROBE` | aktive Limit-Abfrage ohne Lauf (`true`/`false`, Datei: `limitProbe`) | an für Claude-Konten mit OAuth-Login |
 | `LIMIT_PROBE_MIN` | Abstand der aktiven Limit-Abfrage in Minuten (1–1440, Datei: `limitProbeMin`) | `5` |
 | `DRAIN_SEC` | beim Beenden so viele Sekunden auf laufende Läufe warten (0–86400, Datei: `drainSec`), siehe [Neustart](#neustart-während-laufender-aufträge) | `0` |
-| `RUNNER_MODE` | `server` oder `desktop` (Runner auf dem eigenen PC, Datei: `mode`), siehe [Desktop-Modus](#desktop-modus-standby-und-herunterfahren) | `server` |
+| `RUNNER_MODE` | `server` oder `desktop` (Runner auf dem eigenen PC, Datei: `mode`), siehe [PC-Runner](#runner-auf-dem-eigenen-pc) | `server` |
 | `HANDOFF_SEC` | Frist für die Übergabe laufender Läufe im Modus desktop (1–60, Datei: `handoffSec`) | `8` |
 | `POWER_EVENTS` | Standby, Aufwachen und Herunterfahren beobachten (`true`/`false`, Datei: `powerEvents`) | an im Modus desktop |
 
@@ -152,33 +152,87 @@ Ein Neustart ist jederzeit möglich, kein Auftrag geht verloren:
 | geordnet, `DRAIN_SEC=0` (Standard) | sofort abgebrochen, als `cancelled` gemeldet, Atrium plant sie neu ein; bekommt der Auftrag dasselbe Konto wieder, setzt der Agent seine Sitzung fort | nein |
 | geordnet, `DRAIN_SEC>0` | der Runner meldet `draining` (Atrium zeigt „Wird beendet“ und bietet ihm nichts Neues an) und wartet bis zu `DRAIN_SEC` Sekunden, bis die Läufe fertig sind (inkl. Commit, Push, PR); danach Rest wie oben | nein |
 | hart (`kill -9`, Absturz, Stromausfall) | beim nächsten Start meldet der Runner seine (leeren) Läufe bei der Anmeldung (`runIds`); Atrium gibt die verwaisten sofort frei und plant sie neu ein | ja |
-| Runner kommt nicht wieder | nach Ablauf der Lease (90 s) gibt der Scheduler-Job die Läufe frei | ja |
+| Runner kommt nicht wieder | nach Ablauf der Lease (90 s, PC-Runner 45 s) gibt der Scheduler-Job die Läufe frei | ja (PC-Runner: nein) |
+| Standby (PC, `RUNNER_MODE=desktop`) | `draining`, Abbruch, WIP-Commit mit Push und `cancelled` mit `handoff` innerhalb von `HANDOFF_SEC`; Atrium plant sofort neu ein, ein Server-Runner setzt auf demselben Branch fort. Nach dem Aufwachen bleibt die Auslieferung bis nach Neuanmeldung und Heartbeat gesperrt, übernommene Läufe enden ohne Push | nein |
+| Herunterfahren (PC) | wie Standby, statt `DRAIN_SEC` abzuwarten; danach beendet sich der Runner | nein |
 
 Signale: Das erste `SIGTERM`/`SIGINT` startet das geordnete Beenden, ein zweites bricht die Wartefrist ab
 (laufende Läufe werden abgebrochen und neu eingeplant), ein drittes beendet sofort. Bei Docker muss
 `stop_grace_period` größer als `DRAIN_SEC` plus etwa 30 s sein, sonst beendet Docker den Runner hart.
 
-### Desktop-Modus: Standby und Herunterfahren
+## Runner auf dem eigenen PC
 
-Mit `RUNNER_MODE=desktop` (Installation siehe [`desktop/README.md`](desktop/README.md)) meldet sich der Runner
-als `kind: desktop` an. Geht der PC in den Standby, meldet er sofort `draining` (keine neuen Angebote), bricht laufende
-Läufe ab und übergibt sie innerhalb von `HANDOFF_SEC`: `finish` `cancelled` mit `handoff`, bei schreibenden Läufen
-vorher ein WIP-Commit samt Push (nur wenn Atrium `features.handoff` meldet). Ein Server-Runner übernimmt den Auftrag.
-Nach dem Aufwachen sperrt der Runner zuerst jede Auslieferung, meldet sich neu an (`runIds`), sendet einen Heartbeat
-(übernommene Läufe kommen als `cancel` zurück und enden ohne Push), gibt die Auslieferung wieder frei und verbindet den
-Befehlsstrom neu. Beim Herunterfahren bzw. beim ersten `SIGTERM`/`SIGINT` übergibt er statt mit `DRAIN_SEC` zu warten;
-das zweite Signal bricht die Übergabe ab, das dritte beendet sofort.
+Ein Runner kann zusätzlich auf dem eigenen PC laufen (Linux, Windows, macOS). Er meldet sich als `kind: desktop` an
+und bekommt Aufträge **vor** den Server-Runnern; das entlastet den Server. Geht der PC in den Standby oder wird er
+heruntergefahren, übergibt er laufende Läufe, und ein Server-Runner setzt auf demselben Branch fort. Aufträge laufen
+so auch weiter, wenn der PC aus ist.
 
-| Plattform | Erkennung | Zeit vor dem Standby |
-|---|---|---|
-| Linux (systemd-logind) | Delay-Inhibitor über `systemd-inhibit --mode=delay` (ohne Root), Signale `PrepareForSleep`/`PrepareForShutdown` über `gdbus monitor` (Rückfall `dbus-monitor`); der Inhibitor wird nach der Übergabe freigegeben und nach dem Aufwachen neu geholt | bis `InhibitDelayMaxSec` (Standard 5 s) |
-| Windows 10/11 | PowerShell-Kindprozess mit verborgenem Fenster (`WM_POWERBROADCAST`, `WM_QUERYENDSESSION`/`WM_ENDSESSION`); zusätzlich `SIGBREAK`/`SIGHUP` | ca. 2 s |
-| macOS | `osascript` (JXA) mit `NSWorkspaceWillSleep`/`DidWake`/`WillPowerOff`; läuft nur in einer grafischen Sitzung | nicht aufschiebbar |
-| alle | Rückfall: Uhrsprung (Timer feuert > 30 s zu spät) gilt als Aufwachen | – |
+**Voraussetzungen**
+
+- Node.js ab 24, npm, git, GitHub CLI (`gh`, angemeldet oder `GH_TOKEN`) und die gewünschten Agent-CLIs.
+- Der Runner läuft **nativ** im Benutzerkonto, nicht in Docker: Nur so erreicht er die Energieverwaltung des
+  Betriebssystems (logind, Fenstermeldungen, NSWorkspace) und kann den Standby kurz aufschieben. Docker Desktop läuft
+  unter Windows und macOS in einer VM, die vom Standby nichts mitbekommt. Folge: keine Container-Isolation, Agents und
+  Projektbefehle haben die Rechte des Benutzers (siehe [Sicherheit](#sicherheit)).
+- **Eigener technischer Benutzer und API-Key je Runner** (Schritt 1), nicht den Key des Servers wiederverwenden. So
+  lässt sich der PC-Runner getrennt freigeben, sperren und widerrufen.
+
+**Installation** mit den Skripten unter [`desktop/`](desktop/README.md): Vorlage
+[`runner.desktop.example.json`](desktop/runner.desktop.example.json) kopieren (`mode: desktop`, absolute Pfade), dann:
+
+| Plattform | Installation | Autostart | Entfernen |
+|---|---|---|---|
+| Linux | `desktop/install-linux.sh <config.json> [name]` | systemd-User-Unit `atrium-aidev-runner.service` | `desktop/uninstall-linux.sh` |
+| Windows | `desktop/install-windows.ps1 -Config <config.json> [-Name name]` | Aufgabenplanung beim Anmelden | `desktop/uninstall-windows.ps1` |
+| macOS | `desktop/install-macos.sh <config.json> [name]` (grafische Sitzung) | LaunchAgent `org.atrium.aidev-runner` | `desktop/uninstall-macos.sh` |
+
+Danach Konten anmelden (`node dist/main.js login <konto> --config <datei>`), prüfen (`… probe --config <datei>`) und
+den Runner in Atrium freigeben. Logs und Hinweise je Plattform stehen in [`desktop/README.md`](desktop/README.md).
+
+**Ablauf**
+
+- **Standby**: Der Runner meldet sofort `draining` (keine neuen Angebote) und bricht laufende Läufe ab. Innerhalb von
+  `HANDOFF_SEC` committet er bei schreibenden Läufen den Zwischenstand als `wip(aidev): Zwischenstand vor Übergabe`
+  (Trailer `Aidev-Task` und `Aidev-Handoff: suspend|shutdown`, ohne Hooks und ohne testCmd), pusht ihn ohne Force auf
+  den Arbeits-Branch und meldet `finish` `cancelled` mit `handoff`. Den WIP-Push gibt es nur, wenn Atrium bei der
+  Anmeldung `features.handoff` meldet, und nie bei Nur-Lese-Läufen, Fragen, `none`, `pr-update` oder auf dem
+  Haupt-Branch. Atrium plant den Auftrag sofort neu ein, ohne den Versuch zu zählen. Der nächste Lauf bekommt denselben
+  Branch und im Prompt einen Hinweis auf die Fortsetzung.
+- **Herunterfahren** (Ereignis des Systems oder erstes `SIGTERM`/`SIGINT`): Übergabe wie beim Standby, statt mit
+  `DRAIN_SEC` zu warten; danach beendet sich der Runner. Das zweite Signal bricht die Übergabe ab, das dritte beendet
+  sofort.
+- **Aufwachen** (Ereignis oder Uhrsprung): Zuerst sperrt der Runner jede Auslieferung (kein Push). Dann meldet er sich
+  neu an (`runIds`) und sendet einen Heartbeat; inzwischen übernommene Läufe kommen als `cancel` zurück und enden ohne
+  Push. Erst danach gibt er die Auslieferung frei, nimmt wieder Angebote an und verbindet den Befehlsstrom neu. Ein
+  verspäteter Abschluss eines schon übergebenen Laufs ändert in Atrium nichts.
+- **Lease**: Für PC-Runner gilt 45 s statt 90 s (`registerResult.leaseSec`; der Heartbeat wird auf höchstens ein
+  Drittel davon verkürzt). Läuft sie ab oder meldet sich der PC neu an, zählt der Versuch nicht („PC-Runner nicht
+  erreichbar (Standby?) – Lauf wird neu eingeplant“).
+
+**Vorrang**: automatisch PC 10, Server 0; höher bekommt Aufträge zuerst. Unter **Administration → Runner & Konten**
+lässt sich der Vorrang je Runner setzen (−100 bis 100, „automatisch“ = nach Art). Je Auftrag wählt der Scheduler die
+höchste Stufe mit einem geeigneten Konto, innerhalb der Stufe gilt die bisherige Bewertung. Ein laufender Server-Lauf
+wird nicht verdrängt.
+
+**Abos**: Konten gehören zu einem Runner. Ist dasselbe Abo auf PC und Server angemeldet, sind das in Atrium zwei Konten
+mit getrennten Budgets und getrennter Schätzung; dass sie dasselbe Kontingent teilen, weiß Atrium nicht. Budgets dann
+aufteilen oder das Abo nur auf einem Runner anmelden. Der vom Anbieter gemeldete [Limit-Stand](#limit-stand) zeigt
+dagegen für beide denselben Verbrauch.
+
+**Erkennung und Grenzen je Plattform**
+
+| Plattform | Erkennung | Zeit vor dem Standby | Grenzen |
+|---|---|---|---|
+| Linux (systemd-logind) | Delay-Inhibitor über `systemd-inhibit --mode=delay` (ohne Root), `PrepareForSleep`/`PrepareForShutdown` über `gdbus monitor` (Rückfall `dbus-monitor`); Freigabe nach der Übergabe, nach dem Aufwachen neu geholt | bis `InhibitDelayMaxSec` (Standard 5 s) | kürzer als `HANDOFF_SEC` (8 s); ohne logind nur der Rückfall |
+| Windows 10/11 | PowerShell-Kindprozess mit verborgenem Fenster (`WM_POWERBROADCAST`, `WM_QUERYENDSESSION`/`WM_ENDSESSION`); zusätzlich `SIGBREAK`/`SIGHUP` | ca. 2 s | beim Abmelden kann Windows den Prozess vor Ende der Übergabe beenden |
+| macOS | `osascript` (JXA) mit `NSWorkspaceWillSleep`/`DidWake`/`WillPowerOff` | nicht aufschiebbar | nur in einer grafischen Sitzung; die Übergabe vor dem Standby ist nicht garantiert, verlässlich ist nur die Bereinigung nach dem Aufwachen |
+| alle | Rückfall: Uhrsprung (Timer feuert > 30 s zu spät) gilt als Aufwachen | – | Standby unter 30 s nur über die Plattform erkennbar |
 
 Fehlt ein Werkzeug, schreibt der Runner eine Warnung und erkennt nur noch das Aufwachen über den Uhrsprung. Der Hook vor
-dem Standby beschleunigt nur: Reicht die Zeit nicht (Windows, macOS, Linux über 5 s), wird der Rest nach dem Aufwachen
-bereinigt; bei Akku leer oder Stromausfall gibt Atrium die Läufe nach Ablauf der Lease frei.
+dem Standby beschleunigt nur: Reicht die Zeit nicht, wird der Rest nach dem Aufwachen bereinigt. Bei leerem Akku,
+Stromausfall oder Netzverlust gibt Atrium die Läufe nach Ablauf der Lease frei; nicht gepushte lokale Änderungen gehen
+dann verloren. Bricht der Nutzer ein Herunterfahren ab, hat sich der Runner schon beendet und startet erst mit der
+nächsten Anmeldung wieder. Die Erkennung ist bisher nur mit simulierten Prozessen getestet, nicht auf echten PCs.
 
 ## Annahmen zu den CLIs
 
@@ -254,9 +308,12 @@ der Codex-Sitzungsdateien bleiben auf dem Runner. Die aktive Abfrage spricht nur
 ## Sicherheit
 
 - **Agents laufen ohne Rückfragen** (`--dangerously-skip-permissions`, `--dangerously-bypass-approvals-and-sandbox`,
-  `--yolo`). Den Runner deshalb **nur im Container** betreiben: Benutzer ohne Root (UID 10002), `cap_drop: ALL`,
+  `--yolo`). Den Server-Runner deshalb **nur im Container** betreiben: Benutzer ohne Root (UID 10002), `cap_drop: ALL`,
   `no-new-privileges`, eigenes Netz, optional Egress-Allowlist (nur GitHub, Atrium, KI-Anbieter). Niemals auf dem
   Atrium-Host.
+- **PC-Runner** laufen ohne Container mit den Rechten des Benutzers: Agents und Projektbefehle können auf dessen
+  Dateien zugreifen. Nur auf einem vertrauenswürdigen Rechner, mit eigenem API-Key und einem Token mit möglichst
+  wenigen Rechten betreiben (siehe [Runner auf dem eigenen PC](#runner-auf-dem-eigenen-pc)).
 - **GitHub**: fine-grained Personal Access Token **nur für die gewählten Repos** (Contents, Pull requests, ggf.
   Workflows: Read & write). Auf dem Haupt-Branch **Branch-Protection** aktivieren (Reviews/Checks), dann kann auch ein
   fehlerhafter Agent nichts direkt zerstören. Force-Pushes macht der Runner nur `--force-with-lease` auf eigene

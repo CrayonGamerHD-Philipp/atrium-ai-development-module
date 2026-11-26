@@ -9,6 +9,7 @@ still apply: `.core/.claude/CLAUDE.md` and `.core/.claude/rules/*.md` (especiall
   `schemas.ts` (permissions, DTOs, endpoint table), `scheduler.ts` + `prompts.ts` + `actions.ts` (pure logic; `actions.ts` = agent action proposals from the `aidev-actions` block), `*.endpoints.ts`/`*.service.ts`,
   `live.ts` (SSE hubs), `jobs.ts`, `migrations/`, `pages/` + `ui.ts` (interface), `tests/`.
 - `runner/` – standalone Node service (Docker) with git, gh, and the agent CLIs; not loaded by Atrium.
+- `runner/desktop/` – install/uninstall scripts and example config for the native PC runner (`mode: desktop`, Linux/macOS/Windows).
 
 ## Commands
 | Command | Purpose |
