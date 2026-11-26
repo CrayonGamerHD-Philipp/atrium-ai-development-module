@@ -43,6 +43,13 @@ const ACTIVE = ['offered', 'running'];
 
 /** Lauf dieses Runners (fremde/unbekannte → 404) */
 export async function ownRun(tx: Tx, runnerId: string, runId: string): Promise<Row> {
+	const candidate = await oneOf(
+		tx,
+		sql`SELECT task_id FROM run WHERE id = ${runId} AND runner_id = ${runnerId}`
+	);
+	if (!candidate) throw errors.notFound('Lauf nicht gefunden');
+	// Zustandswechsel sperren immer zuerst den Auftrag und danach den Lauf.
+	await getTask(tx, String(candidate.task_id), true);
 	const run = await oneOf(
 		tx,
 		sql`SELECT * FROM run WHERE id = ${runId} AND runner_id = ${runnerId} FOR UPDATE`

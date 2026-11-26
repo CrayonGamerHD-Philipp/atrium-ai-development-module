@@ -93,6 +93,7 @@ export async function registerRunner(
 		);
 	}
 	const runnerId = String(runner!.id);
+	if (input.runIds) await releaseOrphanedRuns(tx, fx, runnerId, input.runIds);
 	const keys = input.accounts.map((a) => a.key);
 	for (const a of input.accounts) {
 		await tx.execute(
@@ -110,7 +111,6 @@ export async function registerRunner(
 				WHERE runner_id = ${runnerId} AND key NOT IN (${inList(keys)})`
 			: sql`UPDATE provider_account SET logged_in = false WHERE runner_id = ${runnerId}`
 	);
-	if (input.runIds) await releaseOrphanedRuns(tx, fx, runnerId, input.runIds);
 	fx.overview = true;
 	fx.dispatch = true;
 	return {
@@ -134,12 +134,20 @@ async function releaseOrphanedRuns(
 	runnerId: string,
 	active: string[]
 ): Promise<number> {
+	const tasks = await rowsOf(
+		tx,
+		sql`SELECT id FROM task WHERE id IN (SELECT task_id FROM run WHERE runner_id = ${runnerId}
+			AND status = 'running' ${active.length ? sql`AND id NOT IN (${inList(active)})` : sql``})
+			ORDER BY id FOR UPDATE`
+	);
+	if (!tasks.length) return 0;
+	const taskIds = tasks.map((task) => String(task.id));
 	const runs = await rowsOf(
 		tx,
 		active.length
-			? sql`SELECT * FROM run WHERE runner_id = ${runnerId} AND status = 'running'
+			? sql`SELECT * FROM run WHERE runner_id = ${runnerId} AND task_id IN (${inList(taskIds)}) AND status = 'running'
 					AND id NOT IN (${inList(active)}) ORDER BY created_at FOR UPDATE`
-			: sql`SELECT * FROM run WHERE runner_id = ${runnerId} AND status = 'running'
+			: sql`SELECT * FROM run WHERE runner_id = ${runnerId} AND task_id IN (${inList(taskIds)}) AND status = 'running'
 					ORDER BY created_at FOR UPDATE`
 	);
 	for (const run of runs) {
@@ -164,16 +172,6 @@ export async function heartbeat(
 				slots_used = ${input.slotsUsed}, draining = ${input.draining === true}
 			WHERE id = ${runnerId}`
 	);
-	for (const a of input.accounts) {
-		const account = await oneOf(
-			tx,
-			sql`UPDATE provider_account SET logged_in = ${a.loggedIn}
-				WHERE runner_id = ${runnerId} AND key = ${a.key}
-				RETURNING id`
-		);
-		// Limit-Stand nur von Runnern, die ihn melden (ältere Runner: Feld fehlt → nichts ändern)
-		if (account && a.limits) await storeLimitSnapshot(tx, String(account.id), a.limits);
-	}
 	const reported = [...new Set(input.runIds)];
 	let keep = new Set<string>();
 	if (reported.length && status !== 'disabled') {
@@ -193,6 +191,16 @@ export async function heartbeat(
 				AND status = 'offered'`
 		);
 		for (const r of offered) keep.add(String(r.id));
+	}
+	for (const a of input.accounts) {
+		const account = await oneOf(
+			tx,
+			sql`UPDATE provider_account SET logged_in = ${a.loggedIn}
+				WHERE runner_id = ${runnerId} AND key = ${a.key}
+				RETURNING id`
+		);
+		// Limit-Stand nur von Runnern, die ihn melden (ältere Runner: Feld fehlt → nichts ändern)
+		if (account && a.limits) await storeLimitSnapshot(tx, String(account.id), a.limits);
 	}
 	fx.overview = true;
 	fx.dispatch = true;
@@ -227,9 +235,17 @@ export async function runnerDisconnected(runnerId: string): Promise<void> {
  * Versuchs (der Runner bekommt `cancel`), die Aufträge werden neu eingeplant.
  */
 export async function releaseRunnerRuns(tx: Tx, fx: Effects, runnerId: string, reason: string) {
+	const tasks = await rowsOf(
+		tx,
+		sql`SELECT id FROM task WHERE id IN (SELECT task_id FROM run WHERE runner_id = ${runnerId}
+			AND status IN ('offered', 'running')) ORDER BY id FOR UPDATE`
+	);
+	if (!tasks.length) return 0;
+	const taskIds = tasks.map((task) => String(task.id));
 	const runs = await rowsOf(
 		tx,
-		sql`SELECT * FROM run WHERE runner_id = ${runnerId} AND status IN ('offered', 'running') FOR UPDATE`
+		sql`SELECT * FROM run WHERE runner_id = ${runnerId} AND task_id IN (${inList(taskIds)})
+			AND status IN ('offered', 'running') FOR UPDATE`
 	);
 	for (const run of runs) await loseRun(tx, fx, run, reason, false);
 	return runs.length;

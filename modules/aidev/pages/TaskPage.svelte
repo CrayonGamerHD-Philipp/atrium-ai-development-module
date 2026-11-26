@@ -73,7 +73,7 @@
 	import RunLog from './task/RunLog.svelte';
 	import RestartDialog from './task/RestartDialog.svelte';
 	import TaskEditDialog from './task/TaskEditDialog.svelte';
-	import { connectionLostHint, offerRestartAtLostRun } from './task/connection';
+	import { connectionLostHint, newestRunsFirst, offerRestartAtLostRun } from './task/connection';
 
 	let { params }: ModulePageProps = $props();
 	const projectId = $derived(params.id ?? '');
@@ -125,11 +125,7 @@
 	}
 
 	const task = $derived(detail?.task ?? null);
-	const runs = $derived(
-		[...(detail?.runs ?? [])].sort(
-			(a, b) => b.attempt - a.attempt || b.createdAt.localeCompare(a.createdAt)
-		)
-	);
+	const runs = $derived(newestRunsFirst(detail?.runs ?? []));
 	const selectedRun = $derived(runs.find((r) => r.id === selectedRunId) ?? runs[0] ?? null);
 	const selectedEvents = $derived(selectedRun ? (events[selectedRun.id] ?? []) : []);
 	const running = $derived(selectedRun?.status === 'running' || selectedRun?.status === 'offered');
@@ -178,7 +174,7 @@
 		try {
 			const d = await getTask(id);
 			detail = d;
-			const latest = [...d.runs].sort((a, b) => b.attempt - a.attempt)[0];
+			const latest = newestRunsFirst(d.runs)[0];
 			if (latest && (followLatest || !selectedRunId)) selectedRunId = latest.id;
 			if (selectedRunId) void loadEvents(selectedRunId);
 		} catch (e) {
