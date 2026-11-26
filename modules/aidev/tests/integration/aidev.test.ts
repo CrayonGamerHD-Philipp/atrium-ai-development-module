@@ -95,35 +95,36 @@ const register = (
 	extraCapabilities: Record<string, boolean> = {},
 	extra: Record<string, unknown> = {}
 ) =>
-	call<{ runnerId: string; status: string; heartbeatSec: number }>(
-		who,
-		'POST',
-		'/runner/register',
-		{
-			protocol: 1,
-			name: `Runner ${who}`,
-			version: '0.1.0',
-			maxSlots,
-			capabilities: {
-				question: true,
-				branchDelivery: true,
-				prUpdate: true,
-				git: true,
-				gh: true,
-				pty: true,
-				os: 'linux',
-				...extraCapabilities
-			},
-			accounts: accounts.map((key) => ({
-				key,
-				provider: 'fake',
-				label: key,
-				loggedIn: true,
-				models: []
-			})),
-			...extra
-		}
-	);
+	call<{
+		runnerId: string;
+		status: string;
+		heartbeatSec: number;
+		leaseSec?: number;
+		features?: { handoff?: boolean };
+	}>(who, 'POST', '/runner/register', {
+		protocol: 1,
+		name: `Runner ${who}`,
+		version: '0.1.0',
+		maxSlots,
+		capabilities: {
+			question: true,
+			branchDelivery: true,
+			prUpdate: true,
+			git: true,
+			gh: true,
+			pty: true,
+			os: 'linux',
+			...extraCapabilities
+		},
+		accounts: accounts.map((key) => ({
+			key,
+			provider: 'fake',
+			label: key,
+			loggedIn: true,
+			models: []
+		})),
+		...extra
+	});
 
 const heartbeat = (who: string, runIds: string[] = []) =>
 	call<{ status: string; cancel: string[] }>(who, 'POST', '/runner/heartbeat', {

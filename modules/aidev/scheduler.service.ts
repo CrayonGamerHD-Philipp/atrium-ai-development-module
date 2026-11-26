@@ -15,6 +15,12 @@
  *   Integrations-Branch (Teilaufträge zweigen von ihm ab und werden hineingemergt), das Ausliefern pusht in den PR.
  *   Teilaufträge erhalten dafür `integrate` mit `pullNumber` (PR-Prüfung, keine Neuanlage des Branchs, nur Runner
  *   mit `prUpdate`); das Ausliefern erhält `pr-update` mit `integrated`, sobald Teilaufträge Commits gemergt haben.
+ * - Übergabe (PC-Runner, `finishInput.handoff`): Das erste Angebot speichert `task.branch`, jeder weitere Lauf (für
+ *   alle Auslieferungen) bekommt denselben Branch und setzt auf `origin/<branch>` mit dem WIP-Commit fort;
+ *   `promptContext` ergänzt dann den Fortsetzungshinweis.
+ *
+ * Runner-Vorrang: `loadAccountViews` liefert je Konto `runnerPriority` (Art/Vorgabe des Runners), `planAssignments`
+ * bevorzugt die höchste Stufe. Lease je Runner-Art: `leaseSecOf` (PC-Runner kürzer; Ablauf zählt dort nicht).
  */
 import { sql } from 'drizzle-orm';
 import { inList, logBestEffort, num, rowsOf, str, toIso, type Row } from '$lib/sdk/server';
