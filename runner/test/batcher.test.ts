@@ -114,6 +114,59 @@ describe('AtriumClient', () => {
 		expect(n).toBe(1);
 	});
 
+	it('Zeitlimit gilt auch für den Antwortkörper: ausbleibender Body hängt nicht, neuer Versuch folgt', async () => {
+		let n = 0;
+		let aborted = 0;
+		const fetchFn = (async (_url: string, init: RequestInit) => {
+			n++;
+			if (n === 1) {
+				// Kopf kommt, Körper nie (der Strom endet erst beim Abbruch – oder gar nicht)
+				init.signal?.addEventListener('abort', () => aborted++);
+				return new Response(new ReadableStream({ start() {} }), { status: 200 });
+			}
+			return new Response(JSON.stringify({ data: { ok: 2 } }), { status: 200 });
+		}) as unknown as typeof fetch;
+		const c = new AtriumClient({ atriumUrl: 'http://atrium.test', apiKey: 'key-12345678', fetch: fetchFn, backoffBaseMs: 1 });
+		const t0 = Date.now();
+		expect(await c.request('POST', '/runner/heartbeat', {}, { attempts: 2, timeoutMs: 80 })).toEqual({ ok: 2 });
+		expect(n).toBe(2);
+		expect(aborted).toBe(1);
+		expect(Date.now() - t0).toBeLessThan(2000);
+	});
+
+	it('Zeitlimit beim Körper ohne weiteren Versuch → Fehler statt Hängen', async () => {
+		const fetchFn = (async () => new Response(new ReadableStream({ start() {} }), { status: 200 })) as unknown as typeof fetch;
+		const c = new AtriumClient({ atriumUrl: 'http://atrium.test', apiKey: 'key-12345678', fetch: fetchFn, backoffBaseMs: 1 });
+		await expect(c.request('POST', '/runner/heartbeat', {}, { attempts: 1, timeoutMs: 50 })).rejects.toThrow(/Zeitüberschreitung/);
+	});
+
+	it('maxRetryWaitMs begrenzt retry-after (Heartbeat überschreitet die Lease nicht)', async () => {
+		let n = 0;
+		const fetchFn = (async () => {
+			n++;
+			if (n === 1) return new Response('{}', { status: 429, headers: { 'retry-after': '300' } });
+			return new Response(JSON.stringify({ data: { ok: 3 } }), { status: 200 });
+		}) as unknown as typeof fetch;
+		const c = new AtriumClient({ atriumUrl: 'http://atrium.test', apiKey: 'key-12345678', fetch: fetchFn, backoffBaseMs: 1 });
+		const t0 = Date.now();
+		expect(await c.request('POST', '/runner/heartbeat', {}, { attempts: 2, maxRetryWaitMs: 20 })).toEqual({ ok: 3 });
+		expect(Date.now() - t0).toBeLessThan(2000);
+	});
+
+	it('Heartbeat: Zeitlimits und Wartezeit bleiben unter der Lease (90 s)', async () => {
+		const { HEARTBEAT_TIMEOUT_MS, HEARTBEAT_MAX_RETRY_WAIT_MS } = await import('../src/client.ts');
+		// 15 s Pause + zwei Versuche + eine Wartezeit
+		expect(15_000 + 2 * HEARTBEAT_TIMEOUT_MS + HEARTBEAT_MAX_RETRY_WAIT_MS).toBeLessThan(90_000);
+		const seen: RequestInit[] = [];
+		const fetchFn = (async (_url: string, init: RequestInit) => {
+			seen.push(init);
+			return new Response(JSON.stringify({ data: { status: 'approved', cancel: [] } }), { status: 200 });
+		}) as unknown as typeof fetch;
+		const api = new RunnerApi(new AtriumClient({ atriumUrl: 'http://atrium.test', apiKey: 'key-12345678', fetch: fetchFn }));
+		await expect(api.heartbeat({ slotsUsed: 0, runIds: [], accounts: [] })).resolves.toMatchObject({ status: 'approved' });
+		expect(seen).toHaveLength(1);
+	});
+
 	it('liest /pending tolerant', () => {
 		const offer = { type: 'cancel', runId: RUN, reason: '' };
 		expect(parsePending([offer, { type: 'unbekannt' }])).toHaveLength(1);

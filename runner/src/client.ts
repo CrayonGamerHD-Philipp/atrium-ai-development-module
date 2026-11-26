@@ -50,7 +50,10 @@ export interface RequestOptions {
 	/** Höchstzahl der Versuche (Standard 5) */
 	attempts?: number;
 	signal?: AbortSignal;
+	/** Zeitlimit je Versuch für Antwortkopf *und* -körper (Standard 30 s) */
 	timeoutMs?: number;
+	/** Obergrenze der Wartezeit vor einem neuen Versuch (auch bei `retry-after`), z. B. für Heartbeats */
+	maxRetryWaitMs?: number;
 }
 
 export type FetchFn = typeof fetch;
@@ -111,22 +114,37 @@ export class AtriumClient {
 			let waitMs = backoffMs(attempt, this.backoffBaseMs);
 			try {
 				const ctrl = new AbortController();
-				const timer = setTimeout(() => ctrl.abort(), opts.timeoutMs ?? 30_000);
+				const timeoutMs = opts.timeoutMs ?? 30_000;
 				const onAbort = () => ctrl.abort();
 				opts.signal?.addEventListener('abort', onAbort, { once: true });
+				// Das Zeitlimit gilt bis der Körper vollständig gelesen ist: Bleibt er nach dem Kopf aus, darf die
+				// Anfrage nicht unbegrenzt hängen (sonst blockiert ein Heartbeat die serielle Schleife, die Lease läuft ab).
+				let timer: ReturnType<typeof setTimeout> | undefined;
+				const timedOut = new Promise<never>((_, reject) => {
+					timer = setTimeout(() => {
+						ctrl.abort();
+						reject(new Error(`Zeitüberschreitung nach ${timeoutMs} ms`));
+					}, timeoutMs);
+				});
 				let res: Response;
+				let text: string;
 				try {
-					res = await this.fetchFn(this.base + path, {
-						method,
-						headers: this.headers(body !== undefined),
-						body: body !== undefined ? JSON.stringify(body) : undefined,
-						signal: ctrl.signal
-					});
+					const exchange = (async () => {
+						const r = await this.fetchFn(this.base + path, {
+							method,
+							headers: this.headers(body !== undefined),
+							body: body !== undefined ? JSON.stringify(body) : undefined,
+							signal: ctrl.signal
+						});
+						return { r, t: await r.text() };
+					})();
+					// eine nach dem Zeitlimit noch eintreffende Ablehnung nicht unbehandelt lassen
+					exchange.catch(() => undefined);
+					({ r: res, t: text } = await Promise.race([exchange, timedOut]));
 				} finally {
 					clearTimeout(timer);
 					opts.signal?.removeEventListener('abort', onAbort);
 				}
-				const text = await res.text();
 				let json: unknown = null;
 				if (text) {
 					try {
@@ -154,6 +172,7 @@ export class AtriumClient {
 				if (res.status === 429) {
 					waitMs = parseRetryAfter(res.headers.get('retry-after')) ?? Math.max(waitMs, 2000);
 				}
+				if (opts.maxRetryWaitMs !== undefined) waitMs = Math.min(waitMs, opts.maxRetryWaitMs);
 			} catch (e) {
 				if (e instanceof ApiError && e.permanent) throw e;
 				lastErr = e;
@@ -275,6 +294,11 @@ async function readLimited(res: Response, maxBytes: number): Promise<Buffer> {
 	return Buffer.concat(chunks, total);
 }
 
+/** Zeitlimit je Heartbeat-Versuch */
+export const HEARTBEAT_TIMEOUT_MS = 20_000;
+/** Höchste Wartezeit zwischen zwei Heartbeat-Versuchen (auch bei `retry-after`) */
+export const HEARTBEAT_MAX_RETRY_WAIT_MS = 10_000;
+
 /** Typisierte Endpunkte des Runner-Protokolls */
 export class RunnerApi {
 	constructor(readonly client: AtriumClient) {}
@@ -284,7 +308,12 @@ export class RunnerApi {
 		return registerResult.parse(data);
 	}
 	async heartbeat(input: HeartbeatInput): Promise<HeartbeatResult> {
-		const data = await this.client.request('POST', '/runner/heartbeat', input, { attempts: 2 });
+		// Beide Versuche samt Wartezeit bleiben deutlich unter der Lease (90 s): 2 × 20 s + höchstens 10 s
+		const data = await this.client.request('POST', '/runner/heartbeat', input, {
+			attempts: 2,
+			timeoutMs: HEARTBEAT_TIMEOUT_MS,
+			maxRetryWaitMs: HEARTBEAT_MAX_RETRY_WAIT_MS
+		});
 		return heartbeatResult.parse(data);
 	}
 	/** Verpasste Befehle (Angebote) nach einem Neuverbinden */
