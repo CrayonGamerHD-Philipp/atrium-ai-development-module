@@ -32,3 +32,9 @@ export function offerRestartAtLostRun(
 ): boolean {
 	return canRetry && latest && !!taskStatus && !AUTO.includes(taskStatus);
 }
+/** Neueste Läufe zuerst, unabhängig von der beim Neustart zurückgesetzten Versuchsnummer. */
+export function newestRunsFirst<T extends { createdAt: string; id: string }>(runs: T[]): T[] {
+	return [...runs].sort(
+		(a, b) => b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id)
+	);
+}
