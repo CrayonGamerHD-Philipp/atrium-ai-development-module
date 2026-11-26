@@ -28,6 +28,11 @@ export const OFFER_LEASE_SEC = 60;
 export const HEARTBEAT_SEC = 15;
 /** Ohne Heartbeat seit dieser Zeit gilt ein Runner als offline */
 export const RUNNER_STALE_SEC = 60;
+/**
+ * Höchstzahl aufeinanderfolgender Verbindungsverluste eines Auftrags seit dem letzten Neustart, danach `failed`.
+ * Schützt vor einer Endlosschleife, wenn ein Auftrag den Runner wiederholt abstürzen lässt.
+ */
+export const MAX_CONNECTION_RETRIES = 20;
 /** Höchstzahl gleichzeitiger Live-Verbindungen je Person und Hub */
 export const MAX_STREAMS_PER_USER = 20;
 

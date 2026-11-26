@@ -40,7 +40,7 @@ import {
 	type RunOffer
 } from './protocol';
 import { publish } from './publish.service';
-import { loseRun } from './runs.service';
+import { connectionLossTargets, loseRun } from './runs.service';
 import { planAssignments, type ProjectState, type TaskCandidate } from './scheduler';
 import { effectiveRole, getTask, planOf, resolveInfoOf, topBranchOf } from './tasks.service';
 import { loadAccountViews } from './usage.service';
@@ -409,6 +409,15 @@ async function dispatchIn(tx: Tx, fx: Effects, settings: AidevSettings): Promise
 	const without = (caps: Set<string> | null) =>
 		caps ? accounts.filter((a) => !caps.has(a.state.runnerId)).map((a) => a.state.id) : [];
 	const byId = new Map(rows.map((r) => [String(r.id), r]));
+	// Verbindungsverluste seit dem letzten Neustart: diese Runner/Konten weich abziehen (anderer Agent bevorzugt)
+	const lostTo = await connectionLossTargets(
+		tx,
+		rows.map((r) => String(r.id))
+	);
+	const avoid = (id: string) => {
+		const t = lostTo.get(id);
+		return { avoidRunnerIds: t?.runnerIds ?? [], avoidAccountIds: t?.accountIds ?? [] };
+	};
 	const tasks: TaskCandidate[] = rows.map((r) => ({
 		id: String(r.id),
 		projectId: String(r.project_id),
@@ -424,7 +433,8 @@ async function dispatchIn(tx: Tx, fx: Effects, settings: AidevSettings): Promise
 			...(withFiles.has(String(r.id)) ? without(attachmentRunners) : [])
 		],
 		sessionAccountId: str(r.session_account_id),
-		estimatedUnits: settings.limits.estimatedUnitsPerRun
+		estimatedUnits: settings.limits.estimatedUnitsPerRun,
+		...avoid(String(r.id))
 	}));
 	const assignments = planAssignments({
 		tasks,
@@ -545,15 +555,14 @@ export async function schedulerTick(): Promise<string> {
 				ORDER BY created_at FOR UPDATE`
 		);
 		for (const run of expired) {
-			await loseRun(
-				tx,
-				fx,
-				run,
-				run.status === 'offered'
-					? 'Angebot nicht rechtzeitig angenommen'
-					: 'Runner meldet sich nicht mehr (Lease abgelaufen)',
-				run.status === 'running'
-			);
+			// nie angenommen → ungezählt zurück; lief bereits → Verbindungsverlust (automatisch neu eingeplant)
+			if (run.status === 'offered') {
+				await loseRun(tx, fx, run, 'Angebot nicht rechtzeitig angenommen', false);
+			} else {
+				await loseRun(tx, fx, run, 'Runner meldet sich nicht mehr (Lease abgelaufen)', false, {
+					connection: true
+				});
+			}
 		}
 		const stale = await rowsOf(
 			tx,
