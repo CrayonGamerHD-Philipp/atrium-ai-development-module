@@ -20,6 +20,7 @@ import { sql } from 'drizzle-orm';
 import { inList, logBestEffort, num, rowsOf, str, toIso, type Row } from '$lib/sdk/server';
 import {
 	clip,
+	jsonOf,
 	loadSettings,
 	mdb,
 	oneOf,
@@ -44,7 +45,7 @@ import { loseRun } from './runs.service';
 import { planAssignments, type ProjectState, type TaskCandidate } from './scheduler';
 import { effectiveRole, getTask, planOf, resolveInfoOf, topBranchOf } from './tasks.service';
 import { loadAccountViews } from './usage.service';
-import { LEASE_SEC, OFFER_LEASE_SEC, RUNNER_STALE_SEC } from './db';
+import { leaseSecOf, OFFER_LEASE_SEC, RUNNER_STALE_SEC } from './db';
 
 // ---------------------------------------------------------------- Branches, Auslieferung, Prompt
 
@@ -157,6 +158,18 @@ async function promptContext(tx: Tx, task: Row, project: Row, role: Role): Promi
 	);
 	const parent = task.parent_id ? await getTask(tx, String(task.parent_id)) : null;
 	const readOnly = READ_ONLY_ROLES.includes(role);
+	// letzter abgeschlossener Lauf mit Übergabe und gepushtem Zwischenstand → Fortsetzungshinweis
+	const lastRun = await oneOf(
+		tx,
+		sql`SELECT handoff, branch FROM run WHERE task_id = ${task.id} AND status NOT IN ('offered', 'running')
+			ORDER BY created_at DESC, id DESC LIMIT 1`
+	);
+	const handoff = jsonOf<{
+		reason?: unknown;
+		wipPushed?: unknown;
+		headSha?: unknown;
+		note?: unknown;
+	} | null>(lastRun?.handoff, null);
 	// Aktionsvorschläge nur für Chat-Fragen und eigenständige Arbeitsaufträge (keine Teilaufträge, keine Orchestrierung)
 	const allowActions =
 		task.chat_question === true ||
@@ -204,6 +217,15 @@ async function promptContext(tx: Tx, task: Row, project: Row, role: Role): Promi
 		parent: parent ? { title: String(parent.title), prompt: String(parent.prompt) } : null,
 		conflictFiles: resolveInfoOf(task)?.conflictFiles ?? [],
 		previousError: str(task.error_message),
+		handoff:
+			handoff && handoff.wipPushed === true && !readOnly
+				? {
+						reason: handoff.reason === 'shutdown' ? 'shutdown' : 'suspend',
+						headSha: typeof handoff.headSha === 'string' ? handoff.headSha : null,
+						note: typeof handoff.note === 'string' ? handoff.note : null,
+						branch: str(lastRun?.branch)
+					}
+				: null,
 		allowActions,
 		projectTasks: projectTasks.map((r) => ({
 			id: String(r.id),
@@ -224,6 +246,9 @@ export async function buildOffer(
 	const project = await oneOf(tx, sql`SELECT * FROM project WHERE id = ${run.project_id}`);
 	const account = run.account_id
 		? await oneOf(tx, sql`SELECT key, provider FROM provider_account WHERE id = ${run.account_id}`)
+		: null;
+	const runner = run.runner_id
+		? await oneOf(tx, sql`SELECT kind FROM runner WHERE id = ${run.runner_id}`)
 		: null;
 	if (!task || !project || !account) return null;
 	const role = effectiveRole(task);
@@ -271,7 +296,7 @@ export async function buildOffer(
 		// ältere Angebote ohne Anhänge enthalten das Feld nicht
 		...(files.length ? { attachments: files.map(attachmentOffer) } : {}),
 		delivery: ctx.delivery,
-		leaseSec: LEASE_SEC,
+		leaseSec: leaseSecOf(runner?.kind),
 		timeoutSec: settings.limits.runTimeoutMin * 60
 	};
 }
@@ -535,24 +560,32 @@ export function startScheduler(): void {
 
 // ---------------------------------------------------------------- Sicherheitsnetz (Job)
 
-/** Abgelaufene Leases → `lost`, Runner ohne Heartbeat → offline, danach Dispatch */
+/**
+ * Abgelaufene Leases → `lost` (bei PC-Runnern ohne Zählung des Versuchs), Runner ohne Heartbeat → offline,
+ * danach Dispatch
+ */
 export async function schedulerTick(): Promise<string> {
 	const fx = newEffects();
 	const { lost, offline } = await mdb().transaction(async (tx) => {
 		const expired = await rowsOf(
 			tx,
-			sql`SELECT * FROM run WHERE status IN ('offered', 'running') AND lease_expires_at < now()
-				ORDER BY created_at FOR UPDATE`
+			sql`SELECT r.*, rn.kind AS runner_kind FROM run r LEFT JOIN runner rn ON rn.id = r.runner_id
+				WHERE r.status IN ('offered', 'running') AND r.lease_expires_at < now()
+				ORDER BY r.created_at FOR UPDATE OF r`
 		);
 		for (const run of expired) {
+			// PC-Runner (Standby ohne Übergabe): Versuch zählt nicht, ein Server-Runner übernimmt
+			const desktop = run.runner_kind === 'desktop';
 			await loseRun(
 				tx,
 				fx,
 				run,
 				run.status === 'offered'
 					? 'Angebot nicht rechtzeitig angenommen'
-					: 'Runner meldet sich nicht mehr (Lease abgelaufen)',
-				run.status === 'running'
+					: desktop
+						? 'PC-Runner nicht erreichbar (Standby?) – Lauf wird neu eingeplant'
+						: 'Runner meldet sich nicht mehr (Lease abgelaufen)',
+				run.status === 'running' && !desktop
 			);
 		}
 		const stale = await rowsOf(
