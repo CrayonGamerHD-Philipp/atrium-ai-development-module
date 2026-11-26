@@ -228,14 +228,16 @@ jobs:
           WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
         run: |
           Compress-Archive -Path $env:NAME -DestinationPath "$env:NAME.zip"
-          $iscc = Get-Command iscc.exe -ErrorAction SilentlyContinue
+          # Pfad als Text: Get-Command liefert .Source, Get-Item nur .FullName
+          $iscc = (Get-Command iscc.exe -ErrorAction SilentlyContinue).Source
           if (-not $iscc) {
             $default = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
             if (-not (Test-Path $default)) { choco install innosetup --no-progress -y | Out-Null }
-            $iscc = Get-Item $default
+            if (-not (Test-Path $default)) { Write-Error "Inno Setup nicht gefunden ($default)"; exit 1 }
+            $iscc = $default
           }
           $arch = if ('${{ matrix.target }}' -eq 'windows-arm64') { 'arm64' } else { 'x64' }
-          & $iscc.Source "/DAppVersion=$env:VERSION" "/DArch=$arch" "/DSourceDir=$PWD\$env:NAME" "/DOutputDir=$PWD" ..\packaging\windows\atrium-runner.iss
+          & $iscc "/DAppVersion=$env:VERSION" "/DArch=$arch" "/DSourceDir=$PWD\$env:NAME" "/DOutputDir=$PWD" ..\packaging\windows\atrium-runner.iss
           if ($LASTEXITCODE -ne 0) { exit 1 }
           if ($env:WINDOWS_CERT_PFX_BASE64) {
             $pfx = Join-Path $env:RUNNER_TEMP 'cert.pfx'

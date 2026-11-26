@@ -37,7 +37,8 @@ export function installHint(tool: string, platform: NodeJS.Platform = process.pl
 }
 
 async function version(command: string): Promise<{ ok: boolean; version: string }> {
-	const r = await exec(command, ['--version'], { timeoutMs: 15_000, shell: process.platform === 'win32' });
+	// ohne Shell: `exec` mit `shell: true` verwirft die Argumente; `.cmd`-Shims löst cross-spawn auch so auf
+	const r = await exec(command, ['--version'], { timeoutMs: 15_000 });
 	if (r.spawnError || r.code !== 0) return { ok: false, version: '' };
 	return { ok: true, version: (r.stdout || r.stderr).trim().split('\n')[0]?.slice(0, 120) ?? '' };
 }
