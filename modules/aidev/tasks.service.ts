@@ -7,6 +7,15 @@
  *   Teilaufträge werden daher immer `queued` angelegt; offene Abhängigkeiten prüft allein der Scheduler.
  * - Vergabe zählt den Versuch (`attempts + 1`); der Auftrag bleibt `queued`, bis der Runner annimmt (`running`).
  *   Abgelehnte, nie angenommene, abgebrochene und durch Limits beendete Läufe zählen nicht (Rückbuchung).
+ * - Verbindungsverlust (Lease eines laufenden Laufs abgelaufen, Runner meldet sich nach Neustart/Absturz ohne den
+ *   Lauf an): Lauf `lost` mit `error_kind = 'connection'`, der Versuch zählt nicht, der Auftrag wird wieder
+ *   `queued` („Verbindung zum Runner verloren – …“). Der Scheduler zieht Runner und Konten dieser Verluste weich ab
+ *   (`avoidRunnerIds`/`avoidAccountIds`), ein anderer Agent wird also bevorzugt. Nach `MAX_CONNECTION_RETRIES`
+ *   Verlusten in Folge (seit dem letzten Neustart, bis zum ersten gestarteten Lauf mit anderem Ausgang) → `failed`
+ *   mit Hinweis auf „Neu starten“. Gesperrte/entfernte Runner geben ihre Läufe dagegen ungezählt frei.
+ * - „Neu starten“ (`restartTask`): Versuche = 0, Ausschlüsse leer, `started_at` geleert (die erste Annahme setzt
+ *   ihn neu) – damit zählen ältere Verbindungsverluste nicht mehr. Wartende, blockierte und laufende Aufträge
+ *   brechen dabei ihre eigenen aktiven Läufe ab.
  *
  * Orchestrierung (Rolle `orchestrate`, „Planen & aufteilen“)
  * 1. Planungslauf (nur lesen, `expectPlan`). Erfolg → Plan aus `finish.plan` bzw. `extractPlan(summary)` gegen
@@ -878,7 +887,7 @@ export async function restartTask(
 	const ancestors = opts.reopenParents ? await reopenableAncestors(tx, task) : [];
 	if (!opts.reopenParents) await assertParentAllowsRestart(tx, task);
 	if (WAITING.includes(String(task.status) as TaskStatus)) {
-		// wartender/blockierter (z. B. hängengebliebener) Auftrag: eigene Läufe abbrechen statt ablehnen
+		// wartender/blockierter/laufender (z. B. hängengebliebener) Auftrag: eigene Läufe abbrechen statt ablehnen
 		await cancelActiveRuns(tx, fx, [String(task.id)], 'Auftrag neu gestartet', true);
 	} else if (await hasActiveRun(tx, String(task.id))) {
 		throw errors.conflict('Der Auftrag hat noch einen aktiven Lauf');
@@ -890,7 +899,9 @@ export async function restartTask(
 	}
 	let count = ancestors.length + (await reopenAncestors(tx, fx, task, ancestors));
 	await tx.execute(
-		sql`UPDATE task SET excluded_account_ids = '[]'::jsonb, attempts = 0 WHERE id = ${task.id}`
+		// `started_at` leeren: Verbindungsverluste vor dem Neustart zählen nicht mehr (`connectionLossStreak`)
+		sql`UPDATE task SET excluded_account_ids = '[]'::jsonb, attempts = 0, started_at = NULL
+			WHERE id = ${task.id}`
 	);
 	if (plan && subtasks === 'all') {
 		if (descendants.length) {
@@ -947,9 +958,12 @@ export async function restartTask(
 	return count;
 }
 
-/** Wartende Zustände: der Neustart bricht die eigenen aktiven Läufe ab, statt mit 409 abzulehnen */
-const WAITING: TaskStatus[] = ['queued', 'blocked'];
-/** Manuell neu startbar (`POST /tasks/:id/retry`), auch wartende/blockierte (hängengebliebene) Aufträge */
+/** Wartende/laufende Zustände: der Neustart bricht die eigenen aktiven Läufe ab, statt mit 409 abzulehnen */
+const WAITING: TaskStatus[] = ['queued', 'blocked', 'running'];
+/**
+ * Manuell neu startbar (`POST /tasks/:id/retry`), auch wartende/blockierte/laufende (z. B. hängengebliebene oder
+ * nach Verbindungsverlust wartende) Aufträge
+ */
 export const RESTARTABLE: TaskStatus[] = [
 	'failed',
 	'cancelled',
@@ -957,11 +971,15 @@ export const RESTARTABLE: TaskStatus[] = [
 	'done',
 	'review',
 	'queued',
-	'blocked'
+	'blocked',
+	'running'
 ];
 /** @deprecated Bitte `RESTARTABLE` verwenden (gleiche Liste) */
 export const RETRYABLE: TaskStatus[] = RESTARTABLE;
-/** Antwort setzt diese Zustände fort (Sitzung wird fortgesetzt) */
+/**
+ * Antwort setzt diese Zustände fort (Sitzung wird fortgesetzt). Wartende/laufende Aufträge bewusst nicht – sie
+ * bekommen die Nachricht beim nächsten Lauf, eine Antwort bricht keinen Lauf ab.
+ */
 export const REPLY_RESTARTS: TaskStatus[] = [
 	'failed',
 	'cancelled',
