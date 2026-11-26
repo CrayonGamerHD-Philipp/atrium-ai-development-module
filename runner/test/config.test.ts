@@ -47,6 +47,33 @@ describe('loadConfig', () => {
 		expect(() => loadConfig({ env: { ...env, LIMIT_PROBE_MIN: '0' }, cwd: runnerDir })).toThrow('LIMIT_PROBE_MIN');
 	});
 
+	it('liest Modus, Übergabefrist und Energie-Ereignisse', () => {
+		const d = loadConfig({ env, cwd: runnerDir });
+		expect(d).toMatchObject({ mode: 'server', handoffSec: 8, powerEvents: false });
+		const desk = loadConfig({ env: { ...env, RUNNER_MODE: 'Desktop', HANDOFF_SEC: '5' }, cwd: runnerDir });
+		expect(desk).toMatchObject({ mode: 'desktop', handoffSec: 5, powerEvents: true });
+		expect(loadConfig({ env: { ...env, RUNNER_MODE: 'desktop', POWER_EVENTS: 'off' }, cwd: runnerDir }).powerEvents).toBe(false);
+		expect(loadConfig({ env: { ...env, POWER_EVENTS: '1' }, cwd: runnerDir }).powerEvents).toBe(true);
+		// Datei: Beispiel für den Desktop-Runner setzt mode und handoffSec
+		const file = loadConfig({ env, cwd: path.join(runnerDir, 'desktop'), configPath: 'runner.desktop.example.json' });
+		expect(file).toMatchObject({ mode: 'desktop', handoffSec: 8, powerEvents: true });
+		// Umgebung hat Vorrang vor der Datei
+		expect(
+			loadConfig({ env: { ...env, RUNNER_MODE: 'server' }, cwd: path.join(runnerDir, 'desktop'), configPath: 'runner.desktop.example.json' }).mode
+		).toBe('server');
+		expect(() => loadConfig({ env: { ...env, RUNNER_MODE: 'laptop' }, cwd: runnerDir })).toThrow(
+			'RUNNER_MODE: muss server oder desktop sein'
+		);
+		expect(() => loadConfig({ env: { ...env, HANDOFF_SEC: '0' }, cwd: runnerDir })).toThrow(
+			'HANDOFF_SEC: muss eine ganze Zahl zwischen 1 und 60 sein'
+		);
+		expect(() => loadConfig({ env: { ...env, HANDOFF_SEC: '61' }, cwd: runnerDir })).toThrow('HANDOFF_SEC');
+		expect(() => loadConfig({ env: { ...env, HANDOFF_SEC: 'bald' }, cwd: runnerDir })).toThrow('HANDOFF_SEC');
+		expect(() => loadConfig({ env: { ...env, POWER_EVENTS: 'manchmal' }, cwd: runnerDir })).toThrow(
+			'POWER_EVENTS: muss true/false'
+		);
+	});
+
 	it('meldet verständliche Fehler', () => {
 		expect(() => loadConfig({ env: { MAX_SLOTS: 'viele' }, cwd: runnerDir })).toThrow(ConfigError);
 		try {

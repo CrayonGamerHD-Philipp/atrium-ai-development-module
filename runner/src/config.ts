@@ -72,9 +72,15 @@ const fileSchema = z
 		limitProbe: z.boolean().optional(),
 		limitProbeMin: z.number().optional(),
 		drainSec: z.number().int().optional(),
+		mode: z.string().optional(),
+		handoffSec: z.number().int().optional(),
+		powerEvents: z.boolean().optional(),
 		accounts: z.array(z.unknown()).optional()
 	})
 	.strict();
+
+export const RUNNER_MODES = ['server', 'desktop'] as const;
+export type RunnerMode = (typeof RUNNER_MODES)[number];
 
 export interface RunnerConfig {
 	atriumUrl: string;
@@ -99,6 +105,15 @@ export interface RunnerConfig {
 	 * (Standard 0 = sofort abbrechen und neu einplanen lassen). Während der Frist nimmt der Runner nichts Neues an.
 	 */
 	drainSec?: number;
+	/**
+	 * Art des Runners: `server` (Standard, dauerhafter Dienst) oder `desktop` (PC eines Nutzers: übergibt laufende
+	 * Läufe vor Standby/Herunterfahren an Atrium). Nicht gesetzt = `server`.
+	 */
+	mode?: RunnerMode;
+	/** Frist für die Übergabe laufender Läufe in Sekunden (1–60, Standard 8) */
+	handoffSec?: number;
+	/** Standby, Aufwachen und Herunterfahren beobachten (Standard: an im Modus `desktop`, sonst aus) */
+	powerEvents?: boolean;
 	/** Pfad der gelesenen Konfigurationsdatei (falls vorhanden) */
 	configFile: string | null;
 }
@@ -123,6 +138,9 @@ const finalSchema = z.object({
 	limitProbe: z.boolean().optional(),
 	limitProbeMin: z.number().int().min(1).max(1440),
 	drainSec: z.number().int().min(0).max(86_400),
+	mode: z.enum(RUNNER_MODES),
+	handoffSec: z.number().int().min(1).max(60),
+	powerEvents: z.boolean(),
 	accounts: z.array(accountConfigSchema).max(50)
 });
 
@@ -137,7 +155,10 @@ const LABELS: Record<string, string> = {
 	gitAuthorEmail: 'GIT_AUTHOR_EMAIL',
 	limitProbe: 'LIMIT_PROBE',
 	limitProbeMin: 'LIMIT_PROBE_MIN',
-	drainSec: 'DRAIN_SEC'
+	drainSec: 'DRAIN_SEC',
+	mode: 'RUNNER_MODE',
+	handoffSec: 'HANDOFF_SEC',
+	powerEvents: 'POWER_EVENTS'
 };
 
 /** Schalter aus einer Umgebungsvariable (`1`/`true`/`on` bzw. `0`/`false`/`off`); ungültig → `invalid` */
@@ -199,9 +220,15 @@ export function loadConfig(o: LoadOptions = {}): RunnerConfig {
 	const limitProbeMin = /^\d+$/.test(probeMinRaw.trim()) ? Number(probeMinRaw) : Number.NaN;
 	const drainRaw = env.DRAIN_SEC ?? (file.drainSec !== undefined ? String(file.drainSec) : '0');
 	const drainSec = /^\d+$/.test(drainRaw.trim()) ? Number(drainRaw) : Number.NaN;
+	const handoffRaw = env.HANDOFF_SEC ?? (file.handoffSec !== undefined ? String(file.handoffSec) : '8');
+	const handoffSec = /^\d+$/.test(handoffRaw.trim()) ? Number(handoffRaw) : Number.NaN;
+	const mode = (env.RUNNER_MODE?.trim() || file.mode || 'server').toLowerCase();
 	const probeEnv = envBool(env.LIMIT_PROBE);
 	if (probeEnv === 'invalid')
 		throw new ConfigError('Konfiguration ungültig:\n  - LIMIT_PROBE: muss true/false (bzw. 1/0) sein');
+	const powerEnv = envBool(env.POWER_EVENTS);
+	if (powerEnv === 'invalid')
+		throw new ConfigError('Konfiguration ungültig:\n  - POWER_EVENTS: muss true/false (bzw. 1/0) sein');
 	const baseDir = configFile ? path.dirname(configFile) : cwd;
 	const url = env.ATRIUM_URL ?? file.atriumUrl;
 
@@ -218,6 +245,9 @@ export function loadConfig(o: LoadOptions = {}): RunnerConfig {
 		limitProbe: probeEnv ?? file.limitProbe,
 		limitProbeMin,
 		drainSec,
+		mode,
+		handoffSec,
+		powerEvents: powerEnv ?? file.powerEvents ?? mode === 'desktop',
 		accounts
 	};
 	const parsed = finalSchema.safeParse(candidate);
@@ -231,6 +261,8 @@ export function loadConfig(o: LoadOptions = {}): RunnerConfig {
 			if (head === 'maxSlots') return '  - MAX_SLOTS: muss eine ganze Zahl zwischen 0 und 64 sein';
 			if (head === 'limitProbeMin') return '  - LIMIT_PROBE_MIN: muss eine ganze Zahl zwischen 1 und 1440 sein';
 			if (head === 'drainSec') return '  - DRAIN_SEC: muss eine ganze Zahl zwischen 0 und 86400 sein';
+			if (head === 'mode') return '  - RUNNER_MODE: muss server oder desktop sein';
+			if (head === 'handoffSec') return '  - HANDOFF_SEC: muss eine ganze Zahl zwischen 1 und 60 sein';
 			return `  - ${LABELS[String(head)] ?? String(head)}: ${i.message}`;
 		});
 		throw new ConfigError(`Konfiguration ungültig:\n${lines.join('\n')}`);
