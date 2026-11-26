@@ -13,6 +13,7 @@ import type { Logger } from './log.ts';
 import { silentLogger } from './log.ts';
 import { defaultAdapters, type AdapterRegistry } from './providers/index.ts';
 import { LimitStore } from './providers/limit-snapshot.ts';
+import { PowerMonitor, type PowerEvent, type PowerMonitorLike } from './power.ts';
 import {
 	PROTOCOL_VERSION,
 	type HeartbeatInput,
@@ -40,6 +41,29 @@ export interface RunnerOptions {
 	reprobeMs?: number;
 	cleanupMs?: number;
 	backoffBaseMs?: number;
+	/** Energie-Ereignisse im Modus desktop (Tests ersetzen den Monitor; Standard: `PowerMonitor`) */
+	powerMonitor?: PowerMonitorLike;
+	/** Nach einem Herunterfahren aus einem Energie-Ereignis aufrufen (`main.ts`: Prozess beenden) */
+	onPowerShutdown?: () => void;
+}
+
+/** Wartet auf `p`, höchstens `ms` (bzw. bis `signal` auslöst); Fehler werden verschluckt */
+async function within(p: Promise<unknown>, ms: number, signal?: AbortSignal): Promise<void> {
+	let t: NodeJS.Timeout | undefined;
+	let onAbort: (() => void) | undefined;
+	const stop = new Promise<void>((resolve) => {
+		t = setTimeout(resolve, Math.max(0, ms));
+		t.unref();
+		onAbort = () => resolve();
+		if (signal?.aborted) resolve();
+		signal?.addEventListener('abort', onAbort, { once: true });
+	});
+	try {
+		await Promise.race([p.then(() => undefined, () => undefined), stop]);
+	} finally {
+		clearTimeout(t);
+		if (onAbort) signal?.removeEventListener('abort', onAbort);
+	}
 }
 
 /** Konten prüfen (CLI vorhanden, angemeldet) */
@@ -94,10 +118,19 @@ export class Runner {
 	private heartbeatSec = 15;
 	private stream: ReturnType<typeof runCommandStream> | null = null;
 	private timers: NodeJS.Timeout[] = [];
-	private capabilities = { question: true, branchDelivery: true, prUpdate: true, limitReport: true, attachments: true, branchCleanup: false, git: false, gh: false, pty: false, os: `${process.platform}-${process.arch}` };
+	private capabilities = { question: true, branchDelivery: true, prUpdate: true, limitReport: true, attachments: true, branchCleanup: false, handoff: true, git: false, gh: false, pty: false, os: `${process.platform}-${process.arch}` };
 	private needsRegister = false;
 	/** Beenden mit Frist läuft: keine neuen Angebote (`heartbeat.draining`) */
 	private draining = false;
+	/** Atrium versteht `finishInput.handoff` (`registerResult.features.handoff`) – nur dann WIP pushen */
+	private featureHandoff = false;
+	/** Von Atrium gemeldete Lease laufender Läufe (`registerResult.leaseSec`) */
+	private leaseSec: number | null = null;
+	/** Energie-Ereignisse (nur Modus desktop) */
+	private power: PowerMonitorLike | null = null;
+	/** Energie-Ereignisse nacheinander verarbeiten */
+	private powerQueue: Promise<void> = Promise.resolve();
+	private shutdownPromise: Promise<void> | null = null;
 
 	constructor(private readonly o: RunnerOptions) {
 		this.log = o.log ?? silentLogger;
@@ -142,12 +175,28 @@ export class Runner {
 		return this.stop.signal;
 	}
 
+	/** Modus aus der Konfiguration (Standard `server`) */
+	get mode(): 'server' | 'desktop' {
+		return this.o.config.mode ?? 'server';
+	}
+
+	/** Meldet Atrium `features.handoff` (WIP-Push bei der Übergabe)? */
+	get handoffSupported(): boolean {
+		return this.featureHandoff;
+	}
+
+	/** Frist der Übergabe in Millisekunden */
+	private get handoffMs(): number {
+		return (this.o.config.handoffSec ?? 8) * 1000;
+	}
+
 	private registerInput(): RegisterInput {
 		return {
 			protocol: PROTOCOL_VERSION,
 			name: this.o.config.name,
 			version: RUNNER_VERSION,
 			maxSlots: this.o.config.maxSlots,
+			kind: this.mode,
 			capabilities: this.capabilities,
 			accounts: this.o.config.accounts.map((a) => {
 				const s = this.accounts.get(a.key);
@@ -171,6 +220,10 @@ export class Runner {
 				const r = await this.api.register(this.registerInput(), this.stop.signal);
 				this.status = r.status;
 				this.heartbeatSec = Math.min(300, Math.max(5, r.heartbeatSec || 15));
+				this.featureHandoff = r.features?.handoff === true;
+				this.leaseSec = r.leaseSec && r.leaseSec > 0 ? r.leaseSec : null;
+				// Kurze Lease (z. B. Desktop-Runner): mindestens drei Heartbeats je Lease
+				if (this.leaseSec) this.heartbeatSec = Math.min(this.heartbeatSec, Math.max(5, Math.floor(this.leaseSec / 3)));
 				this.log.info(`Bei Atrium angemeldet (Runner ${r.runnerId}, Status ${r.status})`);
 				if (r.status === 'pending')
 					this.log.info('Runner wartet auf Freigabe in Atrium (Administration → Runner & Konten)');
@@ -291,7 +344,7 @@ export class Runner {
 	async start(): Promise<void> {
 		await mkdir(this.o.config.workDir, { recursive: true });
 		const [git, ghOk, ptyOk] = await Promise.all([hasCommand('git'), hasCommand('gh'), this.pty.available()]);
-		this.capabilities = { question: true, branchDelivery: true, prUpdate: true, limitReport: true, attachments: true, branchCleanup: git && ghOk, git, gh: ghOk, pty: ptyOk, os: `${os.platform()}-${os.arch()}`.slice(0, 40) };
+		this.capabilities = { question: true, branchDelivery: true, prUpdate: true, limitReport: true, attachments: true, branchCleanup: git && ghOk, handoff: true, git, gh: ghOk, pty: ptyOk, os: `${os.platform()}-${os.arch()}`.slice(0, 40) };
 		if (!git) this.log.error('git wurde nicht gefunden – Läufe sind nicht möglich');
 		if (!ghOk) this.log.warn('gh wurde nicht gefunden – PRs und PR-Übersicht sind nicht möglich');
 		if (!ptyOk) this.log.info('node-pty nicht verfügbar – Terminals sind deaktiviert');
@@ -317,6 +370,7 @@ export class Runner {
 		}
 
 		if (!(await this.register())) return;
+		this.startPower();
 		this.stream = runCommandStream(
 			this.client,
 			{
@@ -328,6 +382,87 @@ export class Runner {
 			{ log: this.log.child('sse') }
 		);
 		await Promise.all([this.stream.done, this.heartbeatLoop()]);
+	}
+
+	/** Im Modus desktop Energie-Ereignisse beobachten (`powerEvents`, Standard an) */
+	private startPower(): void {
+		if (this.mode !== 'desktop') {
+			if (this.o.config.powerEvents) this.log.info('POWER_EVENTS wirkt nur im Modus desktop');
+			return;
+		}
+		if (this.o.config.powerEvents === false && !this.o.powerMonitor) {
+			this.log.info('Desktop-Modus ohne Energie-Ereignisse (POWER_EVENTS=false) – Übergabe nur beim Beenden');
+			return;
+		}
+		const monitor =
+			this.o.powerMonitor ?? new PowerMonitor({ log: this.log.child('power'), waitMs: this.handoffMs });
+		monitor.onEvent((e) => void this.handlePowerEvent(e));
+		this.power = monitor;
+		monitor.start();
+		if (monitor instanceof PowerMonitor) this.log.info(`Energie-Ereignisse: ${monitor.methods.join(', ')}`);
+	}
+
+	/**
+	 * Energie-Ereignis verarbeiten (nacheinander; `resume` sperrt die Auslieferung sofort). Löst sich auf, wenn
+	 * das Ereignis fertig verarbeitet ist.
+	 */
+	handlePowerEvent(e: PowerEvent): Promise<void> {
+		if (this.stop.signal.aborted || this.shutdownPromise) return Promise.resolve();
+		// Nach dem Aufwachen gehören laufende Läufe womöglich schon einem anderen Runner: sofort sperren
+		if (e.kind === 'resume') this.executor.holdDelivery();
+		const job = async () => {
+			try {
+				if (e.kind === 'suspend') await this.onSuspend();
+				else if (e.kind === 'resume') await this.onResume(e);
+				else await this.onPowerShutdown();
+			} catch (err) {
+				this.log.error(`Energie-Ereignis ${e.kind} fehlgeschlagen`, errorMessage(err));
+			}
+		};
+		const p = this.powerQueue.then(job);
+		this.powerQueue = p;
+		return p;
+	}
+
+	/** Standby: Atrium „draining“ melden, Läufe übergeben, dann den Standby freigeben */
+	private async onSuspend(): Promise<void> {
+		const started = Date.now();
+		const n = this.executor.slotsUsed;
+		this.log.info(`PC geht in den Standby – ${n ? `übergebe ${n} laufende Läufe` : 'keine laufenden Läufe'}`);
+		this.draining = true;
+		// Zuerst die kurze Meldung an Atrium (keine neuen Angebote), begrenzt, damit die Übergabe Zeit behält
+		await within(this.sendHeartbeat(), Math.min(1_500, this.handoffMs / 3));
+		const left = Math.max(1_000, this.handoffMs - (Date.now() - started));
+		const handed = await this.executor.handoff('suspend', { deadlineMs: left, pushWip: this.featureHandoff });
+		if (handed) this.log.info(`${handed} Läufe an Atrium übergeben`);
+		this.power?.ack();
+	}
+
+	/**
+	 * Aufgewacht (bzw. Uhrsprung): Auslieferung gesperrt halten, sofort neu anmelden (Atrium gibt Läufe frei, die
+	 * hier fehlen) und einen Heartbeat senden (`cancel` bricht inzwischen übernommene Läufe ab). Danach wieder
+	 * ausliefern, Angebote annehmen und den Befehlsstrom neu verbinden.
+	 */
+	private async onResume(e: PowerEvent): Promise<void> {
+		this.log.info(`Aufgewacht (${e.source}${e.detail ? `, ${e.detail}` : ''}) – melde mich neu an`);
+		this.executor.holdDelivery();
+		try {
+			await this.register();
+			if (this.stop.signal.aborted) return;
+			await this.sendHeartbeat();
+		} finally {
+			this.executor.releaseDelivery();
+			this.executor.resumeOffers();
+			this.draining = false;
+			this.stream?.reconnect();
+		}
+	}
+
+	/** Herunterfahren aus einem Energie-Ereignis: übergeben und beenden */
+	private async onPowerShutdown(): Promise<void> {
+		this.log.info('PC wird heruntergefahren');
+		await this.shutdown();
+		this.o.onPowerShutdown?.();
 	}
 
 	private async cleanup(): Promise<void> {
@@ -344,11 +479,32 @@ export class Runner {
 	 * Läufe bis dahin fertig werden; Atrium bietet dem Runner in der Zeit nichts mehr an. `skipDrain` (z. B. zweites
 	 * Signal) bricht die Frist ab. Danach werden noch laufende Läufe mit `cancelled` abgeschlossen und neu eingeplant.
 	 */
-	async shutdown(opts: { drainSec?: number; skipDrain?: AbortSignal } = {}): Promise<void> {
+	shutdown(opts: { drainSec?: number; skipDrain?: AbortSignal } = {}): Promise<void> {
+		this.shutdownPromise ??= this.doShutdown(opts);
+		return this.shutdownPromise;
+	}
+
+	private async doShutdown(opts: { drainSec?: number; skipDrain?: AbortSignal }): Promise<void> {
 		const drainSec = opts.drainSec ?? this.o.config.drainSec ?? 0;
 		this.log.info('Runner wird beendet …');
 		this.pty.closeAll();
-		if (drainSec > 0 && this.executor.slotsUsed > 0 && !opts.skipDrain?.aborted) {
+		if (this.mode === 'desktop') {
+			// Desktop: statt auf Läufe zu warten, sofort an Atrium übergeben (ein Server-Runner übernimmt)
+			const n = this.executor.slotsUsed;
+			if (n > 0 && !opts.skipDrain?.aborted) {
+				const started = Date.now();
+				this.draining = true;
+				this.log.info(`Übergebe ${n} laufende Läufe an Atrium (Frist ${this.handoffMs / 1000} s, erneutes Signal bricht ab)`);
+				await within(this.sendHeartbeat(), Math.min(1_500, this.handoffMs / 3), opts.skipDrain);
+				const left = Math.max(1_000, this.handoffMs - (Date.now() - started));
+				await within(
+					this.executor.handoff('shutdown', { deadlineMs: left, pushWip: this.featureHandoff }),
+					left + 1_000,
+					opts.skipDrain
+				);
+			}
+			this.power?.ack();
+		} else if (drainSec > 0 && this.executor.slotsUsed > 0 && !opts.skipDrain?.aborted) {
 			this.draining = true;
 			this.log.info(
 				`Warte bis zu ${drainSec} s auf ${this.executor.slotsUsed} laufende Läufe (erneutes Signal bricht sie sofort ab)`
@@ -362,6 +518,7 @@ export class Runner {
 		}
 		for (const t of this.timers) clearInterval(t);
 		await this.executor.shutdown();
+		this.power?.stop();
 		this.stop.abort();
 	}
 }
