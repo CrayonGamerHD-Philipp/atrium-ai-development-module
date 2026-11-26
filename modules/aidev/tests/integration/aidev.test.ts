@@ -2,6 +2,8 @@
  * Modul `aidev`: Runner-Protokoll und Steuerzentrale gegen PGlite.
  * Anmelden → Freigabe → Projekt + Auftrag → Angebot (pending) → Annahme → Ereignisse (doppelte seq ignoriert) →
  * Verbrauch → Abschluss mit PR (Auftrag `review`, pull_request); Lease-Ablauf → Job → neu eingeplant;
+ * Verbindungsverlust (Lease, Neuanmeldung ohne den Lauf) → ungezählt neu, anderer Runner bevorzugt, Grenze
+ * `MAX_CONNECTION_RETRIES`, Neustart laufender Aufträge; gesperrter Runner unverändert;
  * Limit → Wartezeit → zweites Konto übernimmt; Orchestrierung → Teilaufträge mit Abhängigkeiten → Ausliefern;
  * Zyklus im Plan abgelehnt; Konflikt → Konfliktlösung; Rechte; Aktionsvorschläge im Chat (übernehmen/verwerfen, replyTo); bestehenden PR bearbeiten (`targetPr`, pr-update);
  * PR-Sync löscht Branches gemergter `aidev/`-PRs (nur Runner mit `branchCleanup`; keine Forks, nichts Genutztes,
@@ -33,7 +35,13 @@ import {
 import aidevModule from '$modules/aidev/module';
 import { attachmentCleanup } from '$modules/aidev/jobs';
 import { closeAllLive } from '$modules/aidev/live';
+import { MAX_CONNECTION_RETRIES } from '$modules/aidev/db';
 import { dispatch, startScheduler, whenDispatchIdle } from '$modules/aidev/scheduler.service';
+import {
+	CONNECTION_LOST,
+	CONNECTION_LOST_FAILED_MESSAGE,
+	CONNECTION_LOST_MESSAGE
+} from '$modules/aidev/runs.service';
 import type { RunOffer, RunnerCommand } from '$modules/aidev/protocol';
 import {
 	ATTACHMENT_MAX_BYTES,
@@ -158,6 +166,31 @@ async function createTask(body: Record<string, unknown>): Promise<TaskDto> {
 const finish = (runId: string, body: Record<string, unknown>, who = 'runner') =>
 	call<{ ok: boolean; taskStatus: string }>(who, 'POST', `/runner/runs/${runId}/finish`, body);
 
+/** Verbindungsverlust simulieren: Lease des laufenden Laufs abgelaufen → Scheduler-Job (plant direkt neu ein) */
+async function expireLease(runId: string) {
+	await q(sql`UPDATE run SET lease_expires_at = now() - interval '1 second' WHERE id = ${runId}`);
+	await runJobNow(systemContext('test'), 'aidev.scheduler');
+	await whenDispatchIdle();
+}
+
+const runRow = async (runId: string) =>
+	(
+		await q<{
+			status: string;
+			error_kind: string | null;
+			error_message: string | null;
+			runner_id: string | null;
+		}>(sql`SELECT status, error_kind, error_message, runner_id FROM run WHERE id = ${runId}`)
+	)[0]!;
+
+/** Laufende Läufe eines Runners außer `except` (für die Neuanmeldung mit `runIds`) */
+const runningExcept = async (rid: string, except: string) =>
+	(
+		await q<{ id: string }>(
+			sql`SELECT id FROM run WHERE runner_id = ${rid} AND status = 'running' AND id <> ${except}`
+		)
+	).map((r) => String(r.id));
+
 /** SSE-Verbindung öffnen und Ereignisse mitschreiben */
 async function openStream<E extends { type: string }>(key: string, path: string) {
 	resetAllForTests();
@@ -270,6 +303,7 @@ beforeAll(async () => {
 	});
 	await technicalKey('runner', runnerRole, ['aidev.runner.connect']);
 	await technicalKey('runner2', runnerRole, ['aidev.runner.connect']);
+	await technicalKey('runner3', runnerRole, ['aidev.runner.connect']);
 	const plainRole = await createRole(admin, { name: 'Ohne KI', permissions: ['core.api.manage'] });
 	await technicalKey('viewer', plainRole, ['core.api.manage']);
 	const creatorRole = await createRole(admin, {
@@ -482,9 +516,10 @@ describe('aidev', () => {
 		await whenDispatchIdle();
 		const detail = await task(t.id);
 		const lost = detail.runs.find((r) => r.id === offer.runId)!;
-		expect(lost.status).toBe('lost');
-		expect(detail.task.attempts).toBe(2);
-		expect(detail.runs[0]).toMatchObject({ status: 'offered', attempt: 2 });
+		expect(lost).toMatchObject({ status: 'lost', errorKind: 'connection' });
+		// Verbindungsverlust zählt nicht: der neue Lauf ist wieder Versuch 1
+		expect(detail.task.attempts).toBe(1);
+		expect(detail.runs[0]).toMatchObject({ status: 'offered', attempt: 1 });
 		// aufräumen: Abbruch beendet das Angebot sofort
 		const cancelled = ok<TaskDto>(await call('admin', 'POST', `/tasks/${t.id}/cancel`), 201);
 		expect(cancelled.status).toBe('cancelled');
@@ -826,13 +861,15 @@ describe('aidev', () => {
 		const audit = audits.rows.find((r) => r.action === 'aidev.task.restarted');
 		expect(audit?.metadata).toEqual({ projectId, subtasks: 'failed', reset: 0 });
 
-		// (c) laufend → 409
+		// (c) laufend → neu starten → Lauf abgebrochen, Auftrag wartet wieder
 		const o2 = await offerFor(t.id);
 		ok(await call('runner', 'POST', `/runner/runs/${o2.runId}/accept`), 201);
 		expect((await task(t.id)).task.status).toBe('running');
-		const busy = await call('admin', 'POST', `/tasks/${t.id}/retry`);
-		expect(busy.status).toBe(409);
-		ok(await finish(o2.runId, { status: 'succeeded', summary: 'fertig' }), 201);
+		const busy = ok<TaskDto>(await call('admin', 'POST', `/tasks/${t.id}/retry`), 201);
+		expect(busy).toMatchObject({ status: 'queued', attempts: 0 });
+		const o3 = await offerFor(t.id);
+		ok(await call('runner', 'POST', `/runner/runs/${o3.runId}/accept`), 201);
+		ok(await finish(o3.runId, { status: 'succeeded', summary: 'fertig' }), 201);
 		expect((await task(t.id)).task.status).toBe('done');
 
 		// (f) fremder Auftrag ohne task.manage → 403
@@ -986,10 +1023,9 @@ describe('aidev', () => {
 		const fresh = await offerFor(t.id);
 		expect(fresh.runId).not.toBe(stuck.runId);
 
-		// (c) laufender Auftrag bleibt gesperrt (409)
+		// (c) laufender Auftrag (Neustart laufender Aufträge: eigener Test „Neu starten: laufender Auftrag …“)
 		ok(await call('runner', 'POST', `/runner/runs/${fresh.runId}/accept`), 201);
 		expect((await task(t.id)).task.status).toBe('running');
-		expect((await call('admin', 'POST', `/tasks/${t.id}/retry`)).status).toBe(409);
 
 		// hängengebliebener laufender Lauf an einem wartenden Auftrag → Lauf beendet, Reservierung als Schätzung
 		await q(sql`UPDATE task SET status = 'queued' WHERE id = ${t.id}`);
@@ -1050,17 +1086,200 @@ describe('aidev', () => {
 		expect(child).toMatchObject({ status: 'queued', attempts: 0 });
 		expect((await task(parent.id)).task.status).toBe('blocked');
 
-		// abarbeiten und ausliefern
-		for (const c of [a!, b!]) {
-			const o = await offerFor(c.id);
-			ok(await call('runner', 'POST', `/runner/runs/${o.runId}/accept`), 201);
-			ok(await finish(o.runId, { status: 'succeeded', summary: `Ergebnis ${c.title}` }), 201);
+		// abarbeiten (Reihenfolge wie angeboten – A und B haben dieselbe Erstellungszeit) und ausliefern
+		const open = new Set([a!.id, b!.id]);
+		while (open.size) {
+			const o = (await offers()).find((x) => open.has(x.taskId));
+			expect(o, 'kein Angebot für die Teilaufträge').toBeTruthy();
+			ok(await call('runner', 'POST', `/runner/runs/${o!.runId}/accept`), 201);
+			ok(await finish(o!.runId, { status: 'succeeded', summary: 'Ergebnis' }), 201);
+			open.delete(o!.taskId);
 		}
 		const deliver = await offerFor(parent.id);
 		ok(await call('runner', 'POST', `/runner/runs/${deliver.runId}/accept`), 201);
 		ok(await finish(deliver.runId, { status: 'succeeded', summary: 'ausgeliefert' }), 201);
 		d = await task(parent.id);
 		expect(d.task.status).toBe('done');
+	});
+
+	it('Verbindungsverlust: Lease abgelaufen → ungezählt neu eingeplant, auch bei einem Versuch', async () => {
+		const t = await createTask({ prompt: 'Verbindungsverlust Lease', maxAttempts: 1 });
+		const o1 = await offerFor(t.id);
+		ok(await call('runner', 'POST', `/runner/runs/${o1.runId}/accept`), 201);
+		expect((await task(t.id)).task).toMatchObject({ status: 'running', attempts: 1 });
+		await expireLease(o1.runId);
+		expect(await runRow(o1.runId)).toMatchObject({
+			status: 'lost',
+			error_kind: CONNECTION_LOST,
+			error_message: 'Runner meldet sich nicht mehr (Lease abgelaufen)'
+		});
+		// nicht `failed`, obwohl nur ein Versuch erlaubt ist; der neue Lauf ist wieder Versuch 1
+		const o2 = await offerFor(t.id);
+		expect(o2.runId).not.toBe(o1.runId);
+		const d = await task(t.id);
+		expect(d.task).toMatchObject({
+			status: 'queued',
+			attempts: 1,
+			errorMessage: CONNECTION_LOST_MESSAGE
+		});
+		expect(d.runs[0]).toMatchObject({ id: o2.runId, status: 'offered', attempt: 1 });
+		ok(await call('runner', 'POST', `/runner/runs/${o2.runId}/accept`), 201);
+		ok(await finish(o2.runId, { status: 'succeeded', summary: 'fertig' }), 201);
+		expect((await task(t.id)).task.status).toBe('done');
+	});
+
+	it('Verbindungsverlust: Runner meldet sich ohne den Lauf neu an → ungezählt neu eingeplant', async () => {
+		const t = await createTask({ prompt: 'Verbindungsverlust Neuanmeldung', maxAttempts: 1 });
+		const o1 = await offerFor(t.id);
+		ok(await call('runner', 'POST', `/runner/runs/${o1.runId}/accept`), 201);
+		const runIds = await runningExcept(runnerId, o1.runId);
+		ok(await register('runner', ['fake-a', 'fake-b'], 4, {}, { runIds }), 201);
+		await whenDispatchIdle();
+		expect(await runRow(o1.runId)).toMatchObject({
+			status: 'lost',
+			error_kind: CONNECTION_LOST,
+			error_message: 'Runner wurde neu gestartet – Lauf wird neu eingeplant'
+		});
+		const o2 = await offerFor(t.id);
+		const d = await task(t.id);
+		expect(d.task).toMatchObject({
+			status: 'queued',
+			attempts: 1,
+			errorMessage: CONNECTION_LOST_MESSAGE
+		});
+		expect(d.runs[0]).toMatchObject({ id: o2.runId, status: 'offered', attempt: 1 });
+		ok(await call('runner', 'POST', `/runner/runs/${o2.runId}/accept`), 201);
+		ok(await finish(o2.runId, { status: 'succeeded', summary: 'fertig' }), 201);
+		expect((await task(t.id)).task.status).toBe('done');
+	});
+
+	it(`Verbindungsverlust: nach ${MAX_CONNECTION_RETRIES} Verlusten in Folge failed, Neustart setzt den Zähler zurück`, async () => {
+		const t = await createTask({ prompt: 'Verbindungsverlust Grenze' });
+		for (let i = 1; i <= MAX_CONNECTION_RETRIES; i++) {
+			const o = await offerFor(t.id);
+			ok(await call('runner', 'POST', `/runner/runs/${o.runId}/accept`), 201);
+			await expireLease(o.runId);
+			const status = (await task(t.id)).task.status;
+			expect(status, `nach Verlust ${i}`).toBe(i < MAX_CONNECTION_RETRIES ? 'queued' : 'failed');
+		}
+		const d = await task(t.id);
+		expect(d.task).toMatchObject({
+			status: 'failed',
+			errorMessage: CONNECTION_LOST_FAILED_MESSAGE
+		});
+		expect(
+			d.runs.filter((r) => r.status === 'lost' && r.errorKind === CONNECTION_LOST)
+		).toHaveLength(MAX_CONNECTION_RETRIES);
+		expect((await offers()).some((o) => o.taskId === t.id)).toBe(false);
+
+		// manueller Neustart → Zähler beginnt neu: ein weiterer Verlust plant wieder ein
+		const restarted = ok<TaskDto>(await call('admin', 'POST', `/tasks/${t.id}/retry`), 201);
+		expect(restarted).toMatchObject({ status: 'queued', attempts: 0, errorMessage: null });
+		const o1 = await offerFor(t.id);
+		ok(await call('runner', 'POST', `/runner/runs/${o1.runId}/accept`), 201);
+		expect((await task(t.id)).task.status).toBe('running');
+		await expireLease(o1.runId);
+		expect((await task(t.id)).task).toMatchObject({
+			status: 'queued',
+			errorMessage: CONNECTION_LOST_MESSAGE
+		});
+		const o2 = await offerFor(t.id);
+		ok(await call('runner', 'POST', `/runner/runs/${o2.runId}/accept`), 201);
+		ok(await finish(o2.runId, { status: 'succeeded', summary: 'fertig' }), 201);
+		expect((await task(t.id)).task.status).toBe('done');
+	});
+
+	it('Neu starten: laufender Auftrag → aktiver Lauf abgebrochen, Auftrag neu angeboten', async () => {
+		const t = await createTask({ prompt: 'Neustart laufend' });
+		const o1 = await offerFor(t.id);
+		ok(await call('runner', 'POST', `/runner/runs/${o1.runId}/accept`), 201);
+		expect((await task(t.id)).task.status).toBe('running');
+		const restarted = ok<TaskDto>(await call('admin', 'POST', `/tasks/${t.id}/retry`), 201);
+		expect(restarted).toMatchObject({ status: 'queued', attempts: 0, errorMessage: null });
+		expect(await runRow(o1.runId)).toMatchObject({ status: 'cancelled', error_kind: 'cancelled' });
+		// der Runner bekommt den Abbruch auch über den Heartbeat
+		expect(ok(await heartbeat('runner', [o1.runId]), 201).cancel).toContain(o1.runId);
+		const o2 = await offerFor(t.id);
+		expect(o2.runId).not.toBe(o1.runId);
+		ok(await call('runner', 'POST', `/runner/runs/${o2.runId}/accept`), 201);
+		ok(await finish(o2.runId, { status: 'succeeded', summary: 'fertig' }), 201);
+		expect((await task(t.id)).task.status).toBe('done');
+	});
+
+	let otherRunnerId = '';
+
+	it('Verbindungsverlust: anderer Runner übernimmt, ohne Alternative wieder derselbe Runner', async () => {
+		otherRunnerId = ok(await register('runner3', ['fake-y']), 201).runnerId;
+		ok(
+			await call('admin', 'PATCH', `/runners/${otherRunnerId}`, { status: 'approved', maxSlots: 0 })
+		);
+		ok(await heartbeat('runner3'), 201);
+		try {
+			// (a) Lauf auf Runner A verloren → das Konto auf Runner B wird vorgezogen
+			const t = await createTask({ prompt: 'Agentenwechsel' });
+			const oa = await offerFor(t.id);
+			ok(await call('runner', 'POST', `/runner/runs/${oa.runId}/accept`), 201);
+			expect((await runRow(oa.runId)).runner_id).toBe(runnerId);
+			ok(await call('admin', 'PATCH', `/runners/${otherRunnerId}`, { maxSlots: 4 }));
+			await expireLease(oa.runId);
+			expect((await runRow(oa.runId)).error_kind).toBe(CONNECTION_LOST);
+			expect((await offers()).some((o) => o.taskId === t.id)).toBe(false);
+			const ob = await offerFor(t.id, 'runner3');
+			expect(ob.account.key).toBe('fake-y');
+			ok(await call('runner3', 'POST', `/runner/runs/${ob.runId}/accept`), 201);
+			ok(await finish(ob.runId, { status: 'succeeded', summary: 'fertig' }, 'runner3'), 201);
+			expect((await task(t.id)).task.status).toBe('done');
+
+			// (b) nur Runner A → nach dessen Rückkehr (Neuanmeldung ohne den Lauf) wieder A
+			ok(await call('admin', 'PATCH', `/runners/${otherRunnerId}`, { status: 'disabled' }));
+			const t2 = await createTask({ prompt: 'Ohne Alternative' });
+			const o1 = await offerFor(t2.id);
+			ok(await call('runner', 'POST', `/runner/runs/${o1.runId}/accept`), 201);
+			const runIds = await runningExcept(runnerId, o1.runId);
+			ok(await register('runner', ['fake-a', 'fake-b'], 4, {}, { runIds }), 201);
+			await whenDispatchIdle();
+			expect((await runRow(o1.runId)).error_kind).toBe(CONNECTION_LOST);
+			const o2 = await offerFor(t2.id);
+			expect((await runRow(o2.runId)).runner_id).toBe(runnerId);
+			ok(await call('runner', 'POST', `/runner/runs/${o2.runId}/accept`), 201);
+			ok(await finish(o2.runId, { status: 'succeeded', summary: 'fertig' }), 201);
+			expect((await task(t2.id)).task.status).toBe('done');
+		} finally {
+			ok(await call('admin', 'PATCH', `/runners/${otherRunnerId}`, { maxSlots: 0 }));
+		}
+	});
+
+	it('Gesperrter Runner gibt Läufe unverändert frei (kein Verbindungsverlust)', async () => {
+		ok(
+			await call('admin', 'PATCH', `/runners/${otherRunnerId}`, { status: 'approved', maxSlots: 4 })
+		);
+		ok(await heartbeat('runner3'), 201);
+		ok(await call('admin', 'PATCH', `/runners/${runnerId}`, { maxSlots: 0 }));
+		try {
+			const t = await createTask({ prompt: 'Runner gesperrt', maxAttempts: 1 });
+			const o = await offerFor(t.id, 'runner3');
+			ok(await call('runner3', 'POST', `/runner/runs/${o.runId}/accept`), 201);
+			ok(await call('admin', 'PATCH', `/runners/${otherRunnerId}`, { status: 'disabled' }));
+			await whenDispatchIdle();
+			expect(await runRow(o.runId)).toMatchObject({
+				status: 'lost',
+				error_kind: 'internal',
+				error_message: 'Runner wurde gesperrt'
+			});
+			// ungezählt zurück, ohne Hinweis auf einen automatischen Neustart
+			expect((await task(t.id)).task).toMatchObject({
+				status: 'queued',
+				attempts: 0,
+				errorMessage: 'Runner wurde gesperrt'
+			});
+			ok(await call('admin', 'PATCH', `/runners/${runnerId}`, { maxSlots: 4 }));
+			const again = await offerFor(t.id);
+			expect((await runRow(again.runId)).runner_id).toBe(runnerId);
+			ok(await call('admin', 'POST', `/tasks/${t.id}/cancel`), 201);
+		} finally {
+			ok(await call('admin', 'PATCH', `/runners/${runnerId}`, { maxSlots: 4 }));
+			ok(await call('admin', 'DELETE', `/runners/${otherRunnerId}`));
+		}
 	});
 
 	it('Rechte: Runner-Key, fremder Runner, Person ohne Projektrecht, fremde Aufträge', async () => {
